@@ -1,0 +1,460 @@
+From e7460ad7bb2d86866b00d48eeb24c44681e30fee Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 22:39:38 +0000
+Subject: [PATCH] Bare: make the status bar part of the dimmed backdrop behind
+ the sheet
+
+The decor shade used to dim the light chrome status-bar colour at 0.35
+while the page-card margin was the backdrop at full dim, so the status
+bar showed as a grey band above a black strip. The status bar, the 8dp
+gap under it and the backdrop behind the page card now share one
+colour from backdropColor(dim), the page card starts below the gap,
+and the status-bar icons follow that colour. Everything is restored on
+close.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 167 ++++++++++++++----
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 100 ++++++++++-
+ 2 files changed, 221 insertions(+), 46 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 861c3a82cd..5895b4b12b 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -82,6 +82,8 @@ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.R;
+ import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
++import org.chromium.components.browser_ui.styles.ChromeColors;
++import org.chromium.ui.util.ColorUtils;
+ import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
+ import org.chromium.chrome.browser.logo.BareAnimatedLogo;
+ import org.chromium.chrome.browser.tab.Tab;
+@@ -328,15 +330,21 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private float mSheetDragStartProgress;
+     private float mSheetDragStartY;
+     private @Nullable VelocityTracker mSheetTracker;
+-    // Tints the status bar with the sheet's scrim. Chrome's status bar is drawn by the browser, not
+-    // by this overlay, so the scrim alone would leave it bright.
++    // The status bar is part of the page-card backdrop while a bottom sheet is open.
++    // Chrome paints that bar itself, so the sheet tells it the backdrop colour.
+     private @Nullable Callback<Integer> mStatusBarScrimObserver;
+     private @ColorInt int mStatusBarScrimColor = Color.TRANSPARENT;
+     // Page under a bottom sheet: scaled, rounded, with a black surround behind it.
+     private @Nullable View mPageBackdrop;
+     private @Nullable View mPageShade;
+     private float mPageCornerRadius;
++    // Local y of the card's top, so the gap under the status bar is backdrop.
++    private int mPageTopInset;
++    private float mPageDim;
+     private boolean mPageCardArmed;
++    private boolean mStatusBarGuardOn;
++    private boolean mStatusBarApplying;
++    private ViewTreeObserver.@Nullable OnPreDrawListener mStatusBarGuard;
+     private boolean mPageCardPost;
+     private boolean mHaveSavedLightStatusBar;
+     private boolean mSavedLightStatusBar;
+@@ -346,8 +354,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             new ViewOutlineProvider() {
+                 @Override
+                 public void getOutline(View view, Outline outline) {
++                    int top =
++                            Math.min(
++                                    Math.max(mPageTopInset, 0),
++                                    Math.max(view.getHeight() - 1, 0));
+                     outline.setRoundRect(
+-                            0, 0, view.getWidth(), view.getHeight(), mPageCornerRadius);
++                            0, top, view.getWidth(), view.getHeight(), mPageCornerRadius);
+                 }
+             };
+ 
+@@ -498,6 +510,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return mBlurRadius;
+     }
+ 
++    int pageTopInsetForTesting() {
++        return mPageTopInset;
++    }
++
++    @ColorInt
++    int statusBarScrimColorForTesting() {
++        return mStatusBarScrimColor;
++    }
++
+     /** Whether a sideways drag on the address bar must not switch tabs. */
+     static boolean suppressesAddressBarTabSwipe() {
+         return sSuppressAddressBarTabSwipe;
+@@ -2112,10 +2133,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     // and on the band above the sheet, including through the status bar.
+                     scrim.setBackgroundColor(Color.BLACK);
+                     scrim.setAlpha(dim * PAGE_DIM_ALPHA);
+-                    // Leave the top band of the overlay to the shade so the two do not stack.
+-                    // In glass that band is inside the window, and the scrim has to cover it.
+-                    placeSheetScrim(scrim, !mGlass);
+-                    setStatusBarScrim(Color.TRANSPARENT);
++                    // The gap under the status bar is backdrop, not page. Keep the scrim
++                    // below it so the gap stays the same colour as the status bar.
++                    placeSheetScrim(scrim, true);
+                     applyPageCard(dim);
+                 }
+             } else {
+@@ -2184,6 +2204,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void applyPageCard(float dim) {
+         boolean on = dim > 0.001f;
+         if (!on && !mPageCardArmed) return;
++        if (on) rememberStatusBar();
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
+         if (page != null) {
+             if (on) {
+@@ -2193,6 +2214,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 page.setScaleX(scale);
+                 page.setScaleY(scale);
+                 mPageCornerRadius = dp(PAGE_CORNER_DP) * dim;
++                // Screen gap is the inset times scale. Round the inset up so the
++                // backdrop shows for the full 8dp under the status bar.
++                int gap = dp(SHEET_FULL_GAP_DP);
++                mPageTopInset = (int) Math.ceil(gap / Math.max(scale, 0.5f));
+                 page.setOutlineProvider(mPageOutline);
+                 page.setClipToOutline(true);
+                 page.invalidateOutline();
+@@ -2202,6 +2227,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 page.setPivotY(page.getHeight() * 0.5f);
+                 page.setScaleX(1f);
+                 page.setScaleY(1f);
++                mPageTopInset = 0;
+                 page.setClipToOutline(false);
+                 page.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+                 hidePageBackdrop();
+@@ -2209,13 +2235,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         } else if (!on) {
+             hidePageBackdrop();
+         }
+-        // The measured white band under the status bar is ~6.6dp. The full sheet already
+-        // stops SHEET_FULL_GAP_DP (8dp) short of the overlay top, so a shade of that depth
+-        // covers the band and does not cover the sheet or the origin pill.
+-        applyPageShade(on ? dim * PAGE_DIM_ALPHA : 0f, on && !mGlass);
+-        applyStatusBarForPageCard(on);
+-        if (on && mGlass) flattenGlassDecor();
++        // Status bar and the 8dp under it are the backdrop, one colour from y = 0.
++        mPageDim = on ? dim : 0f;
+         mPageCardArmed = on;
++        applyPageShade(mPageDim);
++        applyStatusBarForPageCard(on, mPageDim);
++        if (on && mGlass) flattenGlassDecor();
+     }
+ 
+     private void restorePageCard() {
+@@ -2224,6 +2249,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     private void releasePageCard() {
+         restorePageCard();
++        disarmStatusBarGuard();
+         detachView(mPageShade);
+         mPageShade = null;
+         detachView(mPageBackdrop);
+@@ -2252,7 +2278,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             ViewGroup.LayoutParams.MATCH_PARENT));
+             mPageBackdrop = backdrop;
+         }
+-        mPageBackdrop.setAlpha(dim);
++        mPageBackdrop.setBackgroundColor(backdropColor(dim));
++        mPageBackdrop.setAlpha(1f);
+         mPageBackdrop.setVisibility(View.VISIBLE);
+     }
+ 
+@@ -2262,8 +2289,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mPageBackdrop.setVisibility(View.GONE);
+     }
+ 
+-    private void applyPageShade(float alpha, boolean coverTopBand) {
+-        if (alpha <= 0.001f) {
++    private void applyPageShade(float dim) {
++        if (dim <= 0.001f) {
+             if (mPageShade != null) {
+                 mPageShade.setAlpha(0f);
+                 mPageShade.setVisibility(View.GONE);
+@@ -2292,14 +2319,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         int[] loc = new int[2];
+         root.getLocationOnScreen(loc);
+-        int extra = coverTopBand ? dp(SHEET_FULL_GAP_DP) : 0;
+-        int height = Math.max(0, loc[1]) + extra;
++        // Status bar, plus the 8dp gap the card leaves under it. One opaque colour.
++        int height = Math.max(0, loc[1]) + dp(SHEET_FULL_GAP_DP);
+         ViewGroup.LayoutParams lp = mPageShade.getLayoutParams();
+         if (lp.height != height) {
+             lp.height = height;
+             mPageShade.setLayoutParams(lp);
+         }
+-        mPageShade.setAlpha(alpha);
++        mPageShade.setBackgroundColor(backdropColor(dim));
++        mPageShade.setAlpha(1f);
+         mPageShade.setVisibility(height > 0 ? View.VISIBLE : View.GONE);
+         // bringChildToFront requests a layout. Only when something else has covered the shade.
+         if (height > 0 && decor.getChildAt(decor.getChildCount() - 1) != mPageShade) {
+@@ -2307,6 +2335,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+     }
+ 
++    /**
++     * Opaque black mixed over the chrome status-bar colour by {@code dim}. {@code dim} is 0
++     * closed and 1 from half-open up, the same curve as the page-card backdrop. At 1 this is
++     * black, so the bar matches the margin around the card.
++     */
++    private @ColorInt int backdropColor(float dim) {
++        float clamped = Math.max(0f, Math.min(1f, dim));
++        @ColorInt int base = mHaveSavedStatusBarColor ? mSavedStatusBarColor : Color.BLACK;
++        if (Color.alpha(base) != 255) {
++            base = ChromeColors.getDefaultThemeColor(mActivity, /* isIncognito= */ false);
++        }
++        return ColorUtils.overlayColor(base, Color.argb(Math.round(clamped * 255f), 0, 0, 0));
++    }
++
+     /** Re-reads progress after layout, so a view add is not done inside a layout pass. */
+     private void postPageCard(View host) {
+         if (mPageCardPost) return;
+@@ -2326,32 +2368,39 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     /**
+-     * The status bar stays transparent while the sheet is up, so the dim shows through it
+-     * instead of a separate scrim band. Icons switch to light over that dim, and both the
+-     * color and the icon appearance come back on close.
++     * Paints the status bar with the page-card backdrop and keeps the icons readable on it.
++     * Light icons come on once that colour is dark, and the saved colour and icons return on
++     * close. A pre-draw pass repeats this because StatusBarColorController can paint the chrome
++     * bar again after progress settles.
+      */
+-    private void applyStatusBarForPageCard(boolean dimmed) {
++    private void applyStatusBarForPageCard(boolean dimmed, float dim) {
++        if (mStatusBarApplying) return;
++        mStatusBarApplying = true;
++        try {
++            applyStatusBarForPageCardImpl(dimmed, dim);
++        } finally {
++            mStatusBarApplying = false;
++        }
++    }
++
++    private void applyStatusBarForPageCardImpl(boolean dimmed, float dim) {
+         Window window = mActivity.getWindow();
+         View decor = window.getDecorView();
+         WindowInsetsControllerCompat controller = new WindowInsetsControllerCompat(window, decor);
+         if (dimmed) {
+-            if (!mHaveSavedLightStatusBar) {
+-                mSavedLightStatusBar = controller.isAppearanceLightStatusBars();
+-                mHaveSavedLightStatusBar = true;
+-            }
+-            if (!mHaveSavedStatusBarColor) {
+-                mSavedStatusBarColor = window.getStatusBarColor();
+-                mHaveSavedStatusBarColor = true;
+-            }
+-            if (window.getStatusBarColor() != Color.TRANSPARENT) {
+-                window.setStatusBarColor(Color.TRANSPARENT);
+-            }
+-            // false: light icons over the dark dim. Skip the call when they are already light.
+-            if (controller.isAppearanceLightStatusBars()) {
+-                controller.setAppearanceLightStatusBars(false);
++            rememberStatusBar();
++            @ColorInt int color = backdropColor(dim);
++            setStatusBarScrim(color);
++            if (window.getStatusBarColor() != color) window.setStatusBarColor(color);
++            boolean wantLightIcons = ColorUtils.shouldUseLightForegroundOnBackground(color);
++            boolean wantAppearanceLight = !wantLightIcons;
++            if (controller.isAppearanceLightStatusBars() != wantAppearanceLight) {
++                controller.setAppearanceLightStatusBars(wantAppearanceLight);
+             }
++            armStatusBarGuard();
+             return;
+         }
++        setStatusBarScrim(Color.TRANSPARENT);
+         if (mHaveSavedLightStatusBar) {
+             controller.setAppearanceLightStatusBars(mSavedLightStatusBar);
+             mHaveSavedLightStatusBar = false;
+@@ -2360,6 +2409,50 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             window.setStatusBarColor(mSavedStatusBarColor);
+             mHaveSavedStatusBarColor = false;
+         }
++        disarmStatusBarGuard();
++    }
++
++    /** Saves the chrome bar once, before this sheet replaces it. */
++    private void rememberStatusBar() {
++        if (mHaveSavedStatusBarColor) return;
++        Window window = mActivity.getWindow();
++        WindowInsetsControllerCompat controller =
++                new WindowInsetsControllerCompat(window, window.getDecorView());
++        mSavedStatusBarColor = window.getStatusBarColor();
++        mHaveSavedStatusBarColor = true;
++        mSavedLightStatusBar = controller.isAppearanceLightStatusBars();
++        mHaveSavedLightStatusBar = true;
++    }
++
++    /** Puts the backdrop colour back if the status-bar controller painted over it. */
++    private void armStatusBarGuard() {
++        if (mStatusBarGuardOn) return;
++        View decor = mActivity.getWindow().getDecorView();
++        mStatusBarGuard =
++                new ViewTreeObserver.OnPreDrawListener() {
++                    @Override
++                    public boolean onPreDraw() {
++                        if (!mPageCardArmed) {
++                            disarmStatusBarGuard();
++                            return true;
++                        }
++                        applyStatusBarForPageCard(true, mPageDim);
++                        return true;
++                    }
++                };
++        decor.getViewTreeObserver().addOnPreDrawListener(mStatusBarGuard);
++        mStatusBarGuardOn = true;
++    }
++
++    private void disarmStatusBarGuard() {
++        if (!mStatusBarGuardOn) return;
++        View decor = mActivity.getWindow().getDecorView();
++        ViewTreeObserver observer = decor.getViewTreeObserver();
++        if (observer.isAlive() && mStatusBarGuard != null) {
++            observer.removeOnPreDrawListener(mStatusBarGuard);
++        }
++        mStatusBarGuardOn = false;
++        mStatusBarGuard = null;
+     }
+ 
+     /** The glass dialog must not paint a padded strip under the status bar. */
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 6c03994f9b..27bf7397cb 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -789,16 +789,13 @@ public class BareVerticalTabsDrawerUnitTest {
+         mDrawer.setStatusBarScrimObserver(colors::add);
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+-        // No separate status-bar scrim band. The page dim runs through a transparent bar.
+-        for (int color : colors) {
+-            assertEquals(android.graphics.Color.TRANSPARENT, color);
+-        }
++        // The bar is the backdrop. From half-open up that colour is black.
++        assertFalse(colors.isEmpty());
++        assertEquals(android.graphics.Color.BLACK, (int) colors.get(colors.size() - 1));
+ 
+         mDrawer.close();
+         mDrawer.finishAnimationForTesting();
+-        for (int color : colors) {
+-            assertEquals(android.graphics.Color.TRANSPARENT, color);
+-        }
++        assertEquals(android.graphics.Color.TRANSPARENT, (int) colors.get(colors.size() - 1));
+     }
+ 
+     @Test
+@@ -824,14 +821,18 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0, mDrawer.blurRadiusForTesting());
+         View shade = mActivity.getWindow().getDecorView().findViewWithTag("page_dim_shade");
+         assertNotNull(shade);
+-        assertEquals(0.35f, shade.getAlpha(), 0.02f);
++        assertEquals(1f, shade.getAlpha(), 0.02f);
++        assertEquals(
++                android.graphics.Color.BLACK,
++                ((android.graphics.drawable.ColorDrawable) shade.getBackground()).getColor());
+         int[] rootOnScreen = new int[2];
+         ((View) scrim.getParent()).getLocationOnScreen(rootOnScreen);
+         assertEquals(
+                 Math.max(0, rootOnScreen[1]) + sheetGap(), shade.getLayoutParams().height);
+         FrameLayout.LayoutParams scrimParams = (FrameLayout.LayoutParams) scrim.getLayoutParams();
+         assertEquals(sheetGap(), scrimParams.topMargin);
+-        assertEquals(android.graphics.Color.TRANSPARENT, mActivity.getWindow().getStatusBarColor());
++        assertEquals(android.graphics.Color.BLACK, mActivity.getWindow().getStatusBarColor());
++        assertTrue(mDrawer.pageTopInsetForTesting() >= sheetGap());
+         assertFalse(icons.isAppearanceLightStatusBars());
+         View backdrop = page.getParent() instanceof ViewGroup parent
+                 ? parent.findViewWithTag("page_card_backdrop")
+@@ -849,6 +850,87 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertTrue(icons.isAppearanceLightStatusBars());
+         assertEquals(0xFF112233, mActivity.getWindow().getStatusBarColor());
+         assertTrue(shade.getVisibility() == View.GONE || shade.getAlpha() == 0f);
++        assertEquals(0, mDrawer.pageTopInsetForTesting());
++    }
++
++    @Test
++    public void testTheStatusBarMatchesTheBackdropWhileTheSheetOpens() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        attachPage();
++        WindowInsetsControllerCompat icons =
++                new WindowInsetsControllerCompat(
++                        mActivity.getWindow(), mActivity.getWindow().getDecorView());
++        icons.setAppearanceLightStatusBars(true);
++        mActivity.getWindow().setStatusBarColor(0xFFFAF8FE);
++
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.10f);
++        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
++        assertEquals(0.10f, mDrawer.progressForTesting(), 0.02f);
++        // dim 0.2 still leaves a light bar, so the dark icons stay.
++        assertTrue(icons.isAppearanceLightStatusBars());
++        assertSameBackdropPaint();
++
++        // A draw drops the manual overlay height, so the range would collapse to 1.
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        layoutOverlay(root, 1080, 2000);
++        mDrawer.updateToolbarPull(range * 0.50f);
++        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
++        assertEquals(0.50f, mDrawer.progressForTesting(), 0.02f);
++        assertFalse(icons.isAppearanceLightStatusBars());
++        assertSameBackdropPaint();
++        assertEquals(android.graphics.Color.BLACK, mActivity.getWindow().getStatusBarColor());
++        assertTrue(mDrawer.pageTopInsetForTesting() >= sheetGap());
++
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
++        assertEquals(0xFFFAF8FE, mActivity.getWindow().getStatusBarColor());
++        assertTrue(icons.isAppearanceLightStatusBars());
++        assertEquals(0, mDrawer.pageTopInsetForTesting());
++    }
++
++    @Test
++    public void testGlassOnUsesTheSameStatusBarBackdrop() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        attachPage();
++        mActivity.getWindow().setStatusBarColor(0xFF0D0E12);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
++        assertSameBackdropPaint();
++        assertEquals(android.graphics.Color.BLACK, mActivity.getWindow().getStatusBarColor());
++        // Glass hosts the sheet in its own dialog, not on the activity content.
++        View actions = sheetActions(true);
++        View scrim = ((ViewGroup) actions.getParent().getParent()).getChildAt(0);
++        FrameLayout.LayoutParams scrimParams = (FrameLayout.LayoutParams) scrim.getLayoutParams();
++        assertEquals(sheetGap(), scrimParams.topMargin);
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        BareVerticalTabsDrawer.setGlassForTesting(false);
++    }
++
++    /** Shade, backdrop, window and the scrim observer all carry one colour. */
++    private void assertSameBackdropPaint() {
++        View shade = mActivity.getWindow().getDecorView().findViewWithTag("page_dim_shade");
++        assertNotNull(shade);
++        int paint =
++                ((android.graphics.drawable.ColorDrawable) shade.getBackground()).getColor();
++        View page = mActivity.findViewById(org.chromium.chrome.R.id.compositor_view_holder);
++        View backdrop =
++                page.getParent() instanceof ViewGroup parent
++                        ? parent.findViewWithTag("page_card_backdrop")
++                        : null;
++        assertNotNull(backdrop);
++        assertEquals(
++                paint, ((android.graphics.drawable.ColorDrawable) backdrop.getBackground()).getColor());
++        assertEquals(paint, mActivity.getWindow().getStatusBarColor());
++        assertEquals(paint, mDrawer.statusBarScrimColorForTesting());
++        assertEquals(1f, shade.getAlpha(), 0.001f);
++        assertEquals(1f, backdrop.getAlpha(), 0.001f);
+     }
+ 
+     @Test
+-- 
+2.34.1
+
