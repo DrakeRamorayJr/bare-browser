@@ -1,0 +1,335 @@
+From d1ae332b87d1fa2eb177646e5193bf6293c8f9dd Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:43:29 +0000
+Subject: [PATCH] Bare: no blur behind the tab sheet or side drawer
+
+Frosted glass no longer blurs the page behind the sheet: the window
+background blur radius is always 0 and FLAG_BLUR_BEHIND is cleared in
+every mode. Behind a bottom-bar sheet only the dim and the page-card
+scale-back remain. The glass sheet surface is now opaque and equal to
+the seam and toolbar colour, so the three read as one surface.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 81 +++++++++----------
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 69 ++++++++++++++--
+ 2 files changed, 98 insertions(+), 52 deletions(-)
+ mode change 100644 => 100755 chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index a05767e2cb..861c3a82cd 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -143,7 +143,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final float WIDTH_FRACTION = 0.85f;
+     private static final float MAX_WIDTH_DP = 400f;
+     private static final float PAGE_SHIFT_DP = 30f;
+-    private static final float GLASS_BLUR_DP = 22f;
+     private static final float GLASS_SCRIM = 0.45f;
+     // Bottom-sheet page card. 0 is closed, full at half-open, then held to full.
+     private static final float PAGE_DIM_ALPHA = 0.35f;
+@@ -189,6 +188,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private @Nullable Dialog mGlassWindow;
+     private boolean mGlass;
+     private int mBlurRadius = -1;
++    /** Window whose background blur was last forced off. Null when there is no glass window. */
++    private @Nullable Window mBlurClearedWindow;
+     private @Nullable View mScrim;
+     private @Nullable Panel mPanel;
+     private @Nullable RecyclerView mList;
+@@ -1486,8 +1487,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         mOverlayTop = top;
+         mOverlayBottom = bottom;
+-        // In glass, the sheet's window itself ends at the toolbars, so the system's blur and the
+-        // scrim stop there too, and the toolbars stay sharp, untinted and tappable.
++        // In glass, the sheet's window itself ends at the toolbars, so the scrim stops
++        // there too, and the toolbars stay sharp, untinted and tappable.
+         if (mGlass && isSheetChrome()) {
+             placeSheetGlassWindow(top, bottom);
+             top = 0;
+@@ -1655,17 +1656,17 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         applyActionsSurface();
+     }
+ 
+-    /** The sheet panel's fill: solid, or the same tint the panel uses when it is glass. */
++    /**
++     * Fill shared by the sheet, the seam and the toolbar. Opaque when glass is on too:
++     * a translucent tint composited over the page is a different tone from the opaque seam.
++     */
+     private @ColorInt int sheetSurfaceColor() {
+-        return mGlass ? color(0xA61C1A20, 0xB8F1EDF6) : color(0xFF1C1A20, 0xFFF1EDF6);
++        return color(0xFF1C1A20, 0xFFF1EDF6);
+     }
+ 
+-    /**
+-     * The RGB of {@link #sheetSurfaceColor()} with a full alpha. The seam and the toolbar
+-     * use this. A glass tint is translucent, and the page shows through it there.
+-     */
++    /** Same colour as {@link #sheetSurfaceColor()}, so the seam and the toolbar match the sheet. */
+     private @ColorInt int sheetJoinedSurfaceColor() {
+-        return sheetSurfaceColor() | 0xFF000000;
++        return sheetSurfaceColor();
+     }
+ 
+     /**
+@@ -1852,8 +1853,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     // Glass.
+ 
+     /**
+-     * Whether the drawer is drawn as frosted glass: the user has not turned it off, this is
+-     * Android 12 or newer, and the system allows blurring what is behind a window.
++     * Whether the drawer uses the frosted-glass window: the user has not turned it off, this is
++     * Android 12 or newer, and the system can composite that window. The page behind it is not
++     * blurred.
+      */
+     private boolean glassWanted() {
+         Boolean forTesting = sGlassForTesting;
+@@ -1868,8 +1870,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     /**
+-     * Puts the drawer in the activity, or, for glass, in a transparent window of its own that
+-     * the system blurs what is behind. Both keep the same views, so the motion is the same.
++     * Puts the drawer in the activity, or, for glass, in a transparent window of its own.
++     * The page behind that window stays sharp. Both keep the same views, so the motion is the same.
+      */
+     private void hostRoot(FrameLayout root, boolean glass) {
+         Panel panel = mPanel;
+@@ -1880,6 +1882,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (glass == mGlass && (glass ? mGlassWindow != null : root.getParent() != null)) {
+             if (glass && mGlassWindow != null) {
+                 shapeGlassWindow();
++                clearBlur();
+                 if (!mGlassWindow.isShowing()) mGlassWindow.show();
+             }
+             watchDialogLayout(glass && isSheetChrome());
+@@ -1948,15 +1951,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             ViewGroup.LayoutParams.MATCH_PARENT));
+         }
+         shapeGlassWindow();
+-        setBlur(mProgress);
++        clearBlur();
+         window.show();
+         watchDialogLayout(isSheetChrome());
+     }
+ 
+     /**
+      * The drawer's glass window covers the screen. The sheet's ends at the toolbars (see
+-     * applySheetInsets), so the bars are neither blurred nor dimmed and their taps reach the
+-     * activity: the window is not focusable, which also lets touches outside it through.
++     * applySheetInsets), so the scrim stops there too and the toolbars stay sharp, untinted
++     * and tappable. The window is not focusable, which also lets touches outside it through.
+      */
+     private void shapeGlassWindow() {
+         Dialog window = mGlassWindow;
+@@ -2017,18 +2020,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         w.setAttributes(attributes);
+     }
+ 
+-    /** How much of the blur is applied: 0 is none and 1 is full. */
+-    private void setBlur(float progress) {
+-        Dialog window = mGlassWindow;
+-        if (!mGlass || window == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return;
+-        Window w = window.getWindow();
+-        if (w == null) return;
+-        int radius = Math.round(dp(GLASS_BLUR_DP) * progress);
+-        if (radius == mBlurRadius) return;
+-        mBlurRadius = radius;
+-        w.setBackgroundBlurRadius(radius);
+-    }
+-
+     // Motion.
+ 
+     private void animateTo(float target, @Nullable Runnable onEnd) {
+@@ -2097,6 +2088,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** 0 is closed and 1 is open. Drives the scrim, the panel and the shift of the page. */
+     private void applyProgress(float progress) {
+         mProgress = Math.max(0f, Math.min(1f, progress));
++        clearBlur();
+         applyToolbarSurface();
+         applySeamFill();
+         layoutOriginPill();
+@@ -2108,12 +2100,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 float half = BareTabSheetSnap.HALF_RATIO;
+                 float dim = half <= 0f ? mProgress : Math.min(1f, mProgress / half);
+                 if (sheetFromTop()) {
+-                    // Top-bar mode is unchanged: the address bar stays bright, and so does
+-                    // the status bar above it. The page is not scaled.
++                    // The address bar stays bright, and so does the status bar above it.
++                    // The page is dimmed and not scaled.
+                     scrim.setBackgroundColor(SCRIM_COLOR);
+                     scrim.setAlpha(dim * (mGlass ? GLASS_SCRIM : 1f));
+                     placeSheetScrim(scrim, false);
+-                    setBlur(dim);
+                     setStatusBarScrim(Color.TRANSPARENT);
+                     restorePageCard();
+                 } else {
+@@ -2124,8 +2115,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     // Leave the top band of the overlay to the shade so the two do not stack.
+                     // In glass that band is inside the window, and the scrim has to cover it.
+                     placeSheetScrim(scrim, !mGlass);
+-                    if (mGlass) setBlur(dim);
+-                    else clearBlur();
+                     setStatusBarScrim(Color.TRANSPARENT);
+                     applyPageCard(dim);
+                 }
+@@ -2142,10 +2131,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
+         if (isSheetChrome()) {
+-            if (scrim == null) {
+-                if (mGlass) setBlur(0f);
+-                else clearBlur();
+-            }
+             if (panel != null) {
+                 panel.setTranslationX(0f);
+                 panel.setTranslationY(0f);
+@@ -2156,7 +2141,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             if (page != null) page.setTranslationX(0f);
+             return;
+         }
+-        setBlur(mProgress);
+         if (panel != null) {
+             panel.setTranslationY(0f);
+             panel.setTranslationX(
+@@ -2175,14 +2159,21 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         scrim.setLayoutParams(params);
+     }
+ 
+-    /** Glass is off, so the sheet must not leave a blur radius on its window. */
++    /**
++     * Keeps the page behind the sheet and the drawer sharp in every mode, glass on or off.
++     * The page is only dimmed, and a bottom-bar sheet also scales it.
++     */
+     private void clearBlur() {
+-        if (mBlurRadius == 0) return;
+-        mBlurRadius = 0;
+-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return;
+         Dialog dialog = mGlassWindow;
+         Window w = dialog != null ? dialog.getWindow() : null;
+-        if (w != null) w.setBackgroundBlurRadius(0);
++        if (mBlurRadius == 0 && w == mBlurClearedWindow) return;
++        mBlurRadius = 0;
++        mBlurClearedWindow = w;
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || w == null) return;
++        w.setBackgroundBlurRadius(0);
++        if ((w.getAttributes().flags & WindowManager.LayoutParams.FLAG_BLUR_BEHIND) != 0) {
++            w.clearFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
++        }
+     }
+ 
+     /**
+@@ -2386,7 +2377,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             decor.setPadding(0, 0, 0, 0);
+         }
+         if (w.getStatusBarColor() != Color.TRANSPARENT) w.setStatusBarColor(Color.TRANSPARENT);
+-        // The blur window stays a rectangle. A rounded clip would notch the sheet
++        // The glass window stays a rectangle. A rounded clip would notch the sheet
+         // above the seam and show the page in the bottom corners.
+         decor.setOutlineProvider(ViewOutlineProvider.BOUNDS);
+         if (decor.getClipToOutline()) decor.setClipToOutline(false);
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+old mode 100644
+new mode 100755
+index 046a2ff1f0..6c03994f9b
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1394,14 +1394,61 @@ public class BareVerticalTabsDrawerUnitTest {
+                 (FrameLayout.LayoutParams) ((View) panel.getParent()).getLayoutParams();
+         assertEquals(0, rootParams.topMargin);
+         assertEquals(0, rootParams.bottomMargin);
+-        // The sheet is see-through, for the blur behind it.
++        // One opaque surface with the seam. The page behind the window is not blurred.
+         GradientDrawable background = (GradientDrawable) panel.getBackground();
+-        assertTrue((background.getColor().getDefaultColor() >>> 24) < 0xFF);
++        assertEquals(0xFFF1EDF6, background.getColor().getDefaultColor());
++        assertEquals(0, mDrawer.blurRadiusForTesting());
++        assertEquals(0, attributes.flags & WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
+         mDrawer.close();
+         mDrawer.finishAnimationForTesting();
+         mDrawer.destroy();
+     }
+ 
++    @Test
++    public void testNothingBlursThePageInAnyMode() {
++        try {
++            for (boolean glass : new boolean[] {false, true}) {
++                assertBlurStaysOff(glass, BareTabsStyle.DRAWER, false, "drawer");
++                assertBlurStaysOff(glass, BareTabsStyle.SHEET, false, "bottom");
++                assertBlurStaysOff(glass, BareTabsStyle.SHEET, true, "top");
++            }
++        } finally {
++            setAddressBarOnTop(false);
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            if (mDrawer.isOpen()) {
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++            mDrawer.destroy();
++        }
++    }
++
++    private void assertBlurStaysOff(
++            boolean glass, String style, boolean addressOnTop, String mode) {
++        if (mDrawer.isOpen()) {
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++        }
++        BareVerticalTabsDrawer.setGlassForTesting(glass);
++        BareTabsStyle.setStyle(style);
++        setAddressBarOnTop(addressOnTop);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(mode + " open glass=" + glass, 0, mDrawer.blurRadiusForTesting());
++        if (glass) {
++            Dialog dialog = mDrawer.glassWindowForTesting();
++            assertNotNull(dialog);
++            assertEquals(
++                    0,
++                    dialog.getWindow().getAttributes().flags
++                            & WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
++        }
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(mode + " closed glass=" + glass, 0, mDrawer.blurRadiusForTesting());
++    }
++
+     @Test
+     public void testInGlassTheSideDrawersWindowStillCoversTheScreen() {
+         BareVerticalTabsDrawer.setGlassForTesting(true);
+@@ -1935,8 +1982,18 @@ public class BareVerticalTabsDrawerUnitTest {
+                     BareVerticalTabsDrawer.setGlassForTesting(glass);
+                     mDrawer.open();
+                     mDrawer.finishAnimationForTesting();
+-                    // Opaque RGB. A glass tint would show the page through the bar.
++                    // Sheet, seam and toolbar are one opaque colour, glass on or off.
+                     int expected = night ? 0xFF1C1A20 : 0xFFF1EDF6;
++                    View actions = sheetActions(glass);
++                    assertEquals(
++                            "panel night=" + night + " glass=" + glass,
++                            expected,
++                            drawableColor(((View) actions.getParent()).getBackground()));
++                    assertEquals(
++                            "actions night=" + night + " glass=" + glass,
++                            expected,
++                            drawableColor(actions.getBackground()));
++                    assertEquals(0, mDrawer.blurRadiusForTesting());
+                     assertEquals(
+                             "night=" + night + " glass=" + glass,
+                             expected,
+@@ -2031,10 +2088,8 @@ public class BareVerticalTabsDrawerUnitTest {
+                     mDrawer.open();
+                     mDrawer.finishAnimationForTesting();
+                     View actions = sheetActions(glass);
+-                    int expected =
+-                            glass
+-                                    ? (night ? 0xA61C1A20 : 0xB8F1EDF6)
+-                                    : (night ? 0xFF1C1A20 : 0xFFF1EDF6);
++                    int expected = night ? 0xFF1C1A20 : 0xFFF1EDF6;
++                    assertEquals(0, mDrawer.blurRadiusForTesting());
+                     assertEquals(
+                             "night=" + night + " glass=" + glass,
+                             expected,
+-- 
+2.34.1
+
