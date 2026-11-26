@@ -1,0 +1,853 @@
+From 8fa57c367de2b0da8535d5761e349c9576b4ce4c Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:08:44 +0000
+Subject: [PATCH] Offer a half and full snap for the tab sheet, with a
+ draggable handle.
+
+Opening the sheet now settles at a half-height stop so the page stays
+visible above it. A scrim sits over that page and closes the sheet when
+tapped. Dragging the handle moves the sheet with the finger; when the
+list is at the top, a downward over-pull does the same. On release the
+sheet snaps by position and fling velocity: up to full, down to half,
+or down from half to close. Full leaves a small gap below the status
+bar, as in the mockup.
+
+The side drawer is unchanged. The same list, drag-reorder and
+swipe-to-close are used in both styles. Animation uses a decelerate
+curve. The snap decision is in BareTabSheetSnap so it can be tested
+without the view.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ chrome/android/chrome_java_sources.gni        |   1 +
+ .../chrome/browser/bare/BareTabSheetSnap.java |  69 ++++
+ .../browser/bare/BareVerticalTabsDrawer.java  | 360 +++++++++++++++++-
+ chrome/android/junit/BUILD.gn                 |   1 +
+ .../bare/BareTabSheetSnapUnitTest.java        |  86 +++++
+ .../bare/BareVerticalTabsDrawerUnitTest.java  |  99 +++++
+ 6 files changed, 599 insertions(+), 17 deletions(-)
+ create mode 100644 chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetSnap.java
+ create mode 100644 chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetSnapUnitTest.java
+
+diff --git a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+index 73169ac8e1..5f3235bea9 100644
+--- a/chrome/android/chrome_java_sources.gni
++++ b/chrome/android/chrome_java_sources.gni
+@@ -302,6 +302,7 @@ chrome_java_sources = [
+   "java/src/org/chromium/chrome/browser/bare/BareGoldenGateView.java",
+   "java/src/org/chromium/chrome/browser/bare/BareLauncherIcon.java",
+   "java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java",
++  "java/src/org/chromium/chrome/browser/bare/BareTabSheetSnap.java",
+   "java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java",
+   "java/src/org/chromium/chrome/browser/bare/BareMinimalLeftButton.java",
+   "java/src/org/chromium/chrome/browser/bare/BareMinimalRightButton.java",
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetSnap.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetSnap.java
+new file mode 100644
+index 0000000000..3cf182a0c5
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetSnap.java
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.bare;
++
++/**
++ * Snap points for the tab sheet.
++ *
++ * <p>Progress is 0 when the sheet is hidden, {@link #HALF_RATIO} when it is half-open (the page
++ * stays visible above it), and 1 when it is full (a small gap remains below the status bar). A
++ * fling up settles at the next stop above the finger; a fling down settles at the next stop
++ * below it, and closes when that stop is hidden. A slow drag settles at the nearest stop.
++ *
++ * <p>The rules follow Material's BottomSheetBehavior (position plus velocity), but the sheet
++ * itself stays a custom view: this class has no dependency on BottomSheetBehavior.
++ */
++final class BareTabSheetSnap {
++    enum State {
++        HIDDEN,
++        HALF,
++        FULL
++    }
++
++    /** Fraction of the full height at which the sheet sits when half-open. */
++    static final float HALF_RATIO = 0.5f;
++
++    private BareTabSheetSnap() {}
++
++    static float progressOf(State state) {
++        switch (state) {
++            case FULL:
++                return 1f;
++            case HALF:
++                return HALF_RATIO;
++            case HIDDEN:
++            default:
++                return 0f;
++        }
++    }
++
++    /** The nearest of the three stops to {@code progress}. Ties prefer the more open stop. */
++    static State nearest(float progress) {
++        float hidden = Math.abs(progress - 0f);
++        float half = Math.abs(progress - HALF_RATIO);
++        float full = Math.abs(progress - 1f);
++        if (full <= half && full <= hidden) return State.FULL;
++        if (half <= hidden) return State.HALF;
++        return State.HIDDEN;
++    }
++
++    /**
++     * Where the sheet should settle after a drag.
++     *
++     * @param progress how open the sheet is now, from 0 (hidden) to 1 (full)
++     * @param velocityY pixels per second, in the same sense as translation Y: positive is a
++     *     downward fling, toward closed
++     * @param flingVelocity the smallest |velocityY| that counts as a fling, in the same units
++     */
++    static State snap(float progress, float velocityY, float flingVelocity) {
++        if (Math.abs(velocityY) >= flingVelocity) {
++            if (velocityY < 0f) {
++                return progress >= HALF_RATIO ? State.FULL : State.HALF;
++            }
++            return progress > HALF_RATIO ? State.HALF : State.HIDDEN;
++        }
++        return nearest(progress);
++    }
++}
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index b2f7b8f15d..92905a36be 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -51,6 +51,8 @@ import androidx.activity.ComponentActivity;
+ import androidx.activity.OnBackPressedCallback;
+ import androidx.annotation.ColorInt;
+ import androidx.core.graphics.Insets;
++import androidx.core.view.NestedScrollingParent3;
++import androidx.core.view.NestedScrollingParentHelper;
+ import androidx.core.view.ViewCompat;
+ import androidx.core.view.WindowInsetsCompat;
+ import androidx.recyclerview.widget.DefaultItemAnimator;
+@@ -95,12 +97,17 @@ import java.util.function.Supplier;
+  *
+  * <p>The Vertical tabs button opens it. Which chrome it uses is {@link BareTabsStyle}: the side
+  * drawer is the default; the sheet is opt-in. Both share this class's list, its reorder and its
+- * swipe-to-close. It is a view over the browser's own tab model: selecting, closing, adding and
+- * closing all go through the same operations the tab overview uses. It keeps no tabs of its own.
++ * swipe-to-close. In sheet mode the sheet opens to a half-height stop, and the handle (or an
++ * over-pull at the top of the list) moves it between hidden, half and full. It is a view over
++ * the browser's own tab model: selecting, closing, adding and closing all go through the same
++ * operations the tab overview uses. It keeps no tabs of its own.
+  */
+ @NullMarked
+ public final class BareVerticalTabsDrawer {
+     private static final long DURATION_MS = 380;
++    private static final long SHEET_DURATION_MS = 320;
++    private static final float SHEET_FULL_GAP_DP = 8f;
++    private static final float SHEET_FLING_DP_PER_S = 800f;
+     private static final float WIDTH_FRACTION = 0.85f;
+     private static final float MAX_WIDTH_DP = 400f;
+     private static final float PAGE_SHIFT_DP = 30f;
+@@ -144,6 +151,10 @@ public final class BareVerticalTabsDrawer {
+     private @Nullable TabModelSelector mObservedSelector;
+     private boolean mOpen;
+     private float mProgress;
++    private boolean mSheetHandleDragging;
++    private float mSheetDragStartProgress;
++    private float mSheetDragStartY;
++    private @Nullable VelocityTracker mSheetTracker;
+     private boolean mRefreshPosted;
+     // A model refresh arrived while a card was being dragged. Applied when the drag ends.
+     private boolean mRefreshPending;
+@@ -240,6 +251,19 @@ public final class BareVerticalTabsDrawer {
+         return mOpen;
+     }
+ 
++    float progressForTesting() {
++        return mProgress;
++    }
++
++    void finishAnimationForTesting() {
++        ValueAnimator animator = mAnimator;
++        if (animator != null) animator.end();
++    }
++
++    void finishSheetDragForTesting(float velocityY) {
++        finishSheetDrag(velocityY);
++    }
++
+     public void open() {
+         if (mOpen) return;
+         TabModelSelector selector = mSelectorSupplier.get();
+@@ -284,7 +308,11 @@ public final class BareVerticalTabsDrawer {
+                     applyProgress(mProgress);
+                 });
+         if (mBackCallback != null) mBackCallback.setEnabled(true);
+-        animateTo(1f, null);
++        animateTo(
++                isSheetChrome()
++                        ? BareTabSheetSnap.progressOf(BareTabSheetSnap.State.HALF)
++                        : 1f,
++                null);
+         Panel panel = mPanel;
+         if (panel != null) {
+             panel.announceForAccessibility(
+@@ -601,6 +629,28 @@ public final class BareVerticalTabsDrawer {
+ 
+         panel.setOnDismissListener(this::close);
+         panel.setDragListener(this::dragTo, this::finishDrag);
++        panel.setSheetHost(
++                new Panel.SheetHost() {
++                    @Override
++                    public boolean sheetActive() {
++                        return isSheetChrome();
++                    }
++
++                    @Override
++                    public boolean reorderActive() {
++                        return BareVerticalTabsDrawer.this.mDragging;
++                    }
++
++                    @Override
++                    public void dragSheetBy(float dyDown) {
++                        BareVerticalTabsDrawer.this.dragSheetBy(dyDown);
++                    }
++
++                    @Override
++                    public void finishSheetDrag(float velocityY) {
++                        BareVerticalTabsDrawer.this.finishSheetDrag(velocityY);
++                    }
++                });
+ 
+         root.setOnApplyWindowInsetsListener(
+                 (v, insets) -> {
+@@ -673,9 +723,19 @@ public final class BareVerticalTabsDrawer {
+             }
+             if (mSheetActions != null) {
+                 mSheetActions.setPadding(dp(16), dp(8), dp(8), dp(10));
++                mSheetActions.setBackgroundColor(color(0xFF1C1A20, 0xFFF1EDF6));
++            }
++            if (mList != null) {
++                mList.setPadding(0, 0, 0, 0);
++                mList.setClipToPadding(false);
+             }
+             return;
+         }
++        if (mSheetActions != null) mSheetActions.setTranslationY(0f);
++        if (mList != null) {
++            mList.setPadding(0, 0, 0, 0);
++            mList.setClipToPadding(false);
++        }
+         if (header != null) header.setPadding(dp(15), mTopInset + dp(12), dp(15), dp(6));
+         if (footer != null) footer.setPadding(0, 0, 0, mBottomInset);
+     }
+@@ -796,23 +856,21 @@ public final class BareVerticalTabsDrawer {
+         if (isSheetChrome()) {
+             int width = rootWidth > 0 ? rootWidth : params.width;
+             mPanelWidth = width;
+-            boolean changed =
+-                    params.width != ViewGroup.LayoutParams.MATCH_PARENT
+-                            || params.height != ViewGroup.LayoutParams.MATCH_PARENT
+-                            || params.gravity != Gravity.FILL;
+-            if (changed) {
++            // Height and gravity are owned by layoutSheetPanel, so a resize does not
++            // stretch the sheet back to the top mid-drag.
++            if (params.width != ViewGroup.LayoutParams.MATCH_PARENT) {
+                 params.width = ViewGroup.LayoutParams.MATCH_PARENT;
+-                params.height = ViewGroup.LayoutParams.MATCH_PARENT;
+-                params.gravity = Gravity.FILL;
+                 panel.setLayoutParams(params);
+             }
+             applySheetBackground();
+         } else {
+             mPanelWidth = Math.min(Math.round(rootWidth * WIDTH_FRACTION), dp(MAX_WIDTH_DP));
+             if (params.width != mPanelWidth
+-                    || params.height != ViewGroup.LayoutParams.MATCH_PARENT) {
++                    || params.height != ViewGroup.LayoutParams.MATCH_PARENT
++                    || params.bottomMargin != 0) {
+                 params.width = mPanelWidth;
+                 params.height = ViewGroup.LayoutParams.MATCH_PARENT;
++                params.bottomMargin = 0;
+                 panel.setLayoutParams(params);
+             }
+         }
+@@ -855,6 +913,7 @@ public final class BareVerticalTabsDrawer {
+         applySheetBackground();
+         applyChromeInsets();
+         updateSheetButtons();
++        bindSheetHandle();
+     }
+ 
+     /** Insets the overlay so it does not cover the real toolbar, which stays tappable. */
+@@ -868,6 +927,9 @@ public final class BareVerticalTabsDrawer {
+             int[] inset = toolbarInsets();
+             top = inset[0];
+             bottom = inset[1];
++            // A small gap below the status bar (or the top toolbar) so a sliver of the page
++            // stays visible when the sheet is full, as in the mockup.
++            top += top > 0 ? dp(SHEET_FULL_GAP_DP) : mTopInset + dp(SHEET_FULL_GAP_DP);
+         }
+         if (params.topMargin == top && params.bottomMargin == bottom) return;
+         params.topMargin = top;
+@@ -1130,8 +1192,14 @@ public final class BareVerticalTabsDrawer {
+     private void animateTo(float target, @Nullable Runnable onEnd) {
+         if (mAnimator != null) mAnimator.cancel();
+         ValueAnimator animator = ValueAnimator.ofFloat(mProgress, target);
+-        animator.setDuration(Math.round(DURATION_MS * Math.abs(target - mProgress)));
+-        animator.setInterpolator(new PathInterpolator(0.2f, 0.8f, 0.2f, 1f));
++        float distance = Math.abs(target - mProgress);
++        if (isSheetChrome()) {
++            animator.setDuration(Math.round(200 + (SHEET_DURATION_MS - 200) * distance));
++            animator.setInterpolator(new PathInterpolator(0.16f, 1f, 0.3f, 1f));
++        } else {
++            animator.setDuration(Math.round(DURATION_MS * distance));
++            animator.setInterpolator(new PathInterpolator(0.2f, 0.8f, 0.2f, 1f));
++        }
+         animator.addUpdateListener(a -> applyProgress((float) a.getAnimatedValue()));
+         animator.addListener(
+                 new AnimatorListenerAdapter() {
+@@ -1160,14 +1228,24 @@ public final class BareVerticalTabsDrawer {
+         mProgress = Math.max(0f, Math.min(1f, progress));
+         View scrim = mScrim;
+         Panel panel = mPanel;
+-        if (scrim != null) scrim.setAlpha(mProgress * (mGlass ? GLASS_SCRIM : 1f));
++        if (scrim != null) {
++            if (isSheetChrome()) {
++                // Dim the page from the first peek, and keep it dimmed from half onward.
++                float half = BareTabSheetSnap.HALF_RATIO;
++                float dim = half <= 0f ? mProgress : Math.min(1f, mProgress / half);
++                scrim.setAlpha(dim);
++            } else {
++                scrim.setAlpha(mProgress * (mGlass ? GLASS_SCRIM : 1f));
++            }
++        }
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
+         if (isSheetChrome()) {
+             setBlur(0f);
+             if (panel != null) {
+                 panel.setTranslationX(0f);
+-                int height = panel.getHeight() > 0 ? panel.getHeight() : 1;
+-                panel.setTranslationY((1f - mProgress) * height);
++                panel.setTranslationY(0f);
++                if (mSheetActions != null) mSheetActions.setTranslationY(0f);
++                layoutSheetPanel(panel);
+             }
+             // The sheet overlays the page; it does not push it aside the way the drawer does.
+             if (page != null) page.setTranslationX(0f);
+@@ -1212,6 +1290,114 @@ public final class BareVerticalTabsDrawer {
+         }
+     }
+ 
++    /**
++     * How far the sheet can travel from hidden to full. This is the height of the
++     * overlay, not the panel's current height, so a drag from half still covers
++     * the remaining distance to the top.
++     */
++    private int sheetRangeHeight() {
++        FrameLayout root = mRoot;
++        if (root != null && root.getHeight() > 0) return root.getHeight();
++        return 1;
++    }
++
++    /**
++     * Makes the sheet only as tall as its current progress and sits it on the
++     * bottom, so the actions stay on the toolbar and the list ends above them.
++     * The old translation plus a counter-move of the actions left the last cards
++     * under the row at half height.
++     */
++    private void layoutSheetPanel(Panel panel) {
++        int height = Math.max(1, Math.round(mProgress * sheetRangeHeight()));
++        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        if (params.width != ViewGroup.LayoutParams.MATCH_PARENT
++                || params.height != height
++                || params.gravity != Gravity.BOTTOM
++                || params.bottomMargin != 0) {
++            params.width = ViewGroup.LayoutParams.MATCH_PARENT;
++            params.height = height;
++            params.gravity = Gravity.BOTTOM;
++            params.bottomMargin = 0;
++            panel.setLayoutParams(params);
++        }
++    }
++
++    /** Lets the handle (and a downward over-pull at the top of the list) move the sheet. */
++    private void bindSheetHandle() {
++        View handleRow = mHandleRow;
++        if (handleRow == null) return;
++        if (!isSheetChrome()) {
++            handleRow.setOnTouchListener(null);
++            return;
++        }
++        handleRow.setOnTouchListener(this::onSheetHandleTouch);
++    }
++
++    private boolean onSheetHandleTouch(View view, MotionEvent ev) {
++        int slop = ViewConfiguration.get(view.getContext()).getScaledTouchSlop();
++        switch (ev.getActionMasked()) {
++            case MotionEvent.ACTION_DOWN:
++                mSheetHandleDragging = false;
++                mSheetDragStartY = ev.getRawY();
++                mSheetDragStartProgress = mProgress;
++                if (mSheetTracker != null) mSheetTracker.recycle();
++                mSheetTracker = VelocityTracker.obtain();
++                mSheetTracker.addMovement(ev);
++                return true;
++            case MotionEvent.ACTION_MOVE:
++                if (mSheetTracker != null) mSheetTracker.addMovement(ev);
++                float dy = ev.getRawY() - mSheetDragStartY;
++                if (!mSheetHandleDragging && Math.abs(dy) > slop) {
++                    mSheetHandleDragging = true;
++                    mSheetDragStartY = ev.getRawY();
++                    mSheetDragStartProgress = mProgress;
++                    if (mAnimator != null) mAnimator.cancel();
++                    if (view.getParent() != null) {
++                        view.getParent().requestDisallowInterceptTouchEvent(true);
++                    }
++                    dy = 0f;
++                }
++                if (mSheetHandleDragging) {
++                    applyProgress(mSheetDragStartProgress - dy / sheetRangeHeight());
++                }
++                return true;
++            case MotionEvent.ACTION_UP:
++            case MotionEvent.ACTION_CANCEL:
++                if (mSheetTracker != null) mSheetTracker.addMovement(ev);
++                if (mSheetHandleDragging) {
++                    float velocity = 0f;
++                    if (mSheetTracker != null) {
++                        mSheetTracker.computeCurrentVelocity(1000);
++                        velocity = mSheetTracker.getYVelocity();
++                    }
++                    finishSheetDrag(velocity);
++                }
++                mSheetHandleDragging = false;
++                if (mSheetTracker != null) {
++                    mSheetTracker.recycle();
++                    mSheetTracker = null;
++                }
++                return true;
++            default:
++                return false;
++        }
++    }
++
++    private void dragSheetBy(float dyDown) {
++        if (mAnimator != null) mAnimator.cancel();
++        applyProgress(mProgress - dyDown / sheetRangeHeight());
++    }
++
++    private void finishSheetDrag(float velocityY) {
++        BareTabSheetSnap.State next =
++                BareTabSheetSnap.snap(mProgress, velocityY, dp(SHEET_FLING_DP_PER_S));
++        if (next == BareTabSheetSnap.State.HIDDEN) {
++            close();
++        } else {
++            animateTo(BareTabSheetSnap.progressOf(next), null);
++        }
++    }
++
+     // Tabs.
+ 
+     private @Nullable TabModel currentModel() {
+@@ -2392,7 +2578,7 @@ public final class BareVerticalTabsDrawer {
+     }
+ 
+     /** The panel itself, which lets a deliberate swipe toward its edge drag it shut. */
+-    private static final class Panel extends LinearLayout {
++    private static final class Panel extends LinearLayout implements NestedScrollingParent3 {
+         interface Drag {
+             void onDrag(float dx);
+         }
+@@ -2401,19 +2587,37 @@ public final class BareVerticalTabsDrawer {
+             void onRelease(float dx, float velocityX);
+         }
+ 
++        interface SheetHost {
++            boolean sheetActive();
++
++            boolean reorderActive();
++
++            void dragSheetBy(float dyDown);
++
++            void finishSheetDrag(float velocityY);
++        }
++
+         private final int mSlop;
++        private final NestedScrollingParentHelper mNestedParent;
+         private int mSide = 1;
+         private float mDownX;
+         private float mDownY;
+         private boolean mDragging;
++        private boolean mSheetNestedDrag;
+         private @Nullable VelocityTracker mTracker;
+         private @Nullable Runnable mDismiss;
+         private @Nullable Drag mDrag;
+         private @Nullable Release mRelease;
++        private @Nullable SheetHost mSheetHost;
+ 
+         Panel(Context context) {
+             super(context);
+             mSlop = ViewConfiguration.get(context).getScaledTouchSlop();
++            mNestedParent = new NestedScrollingParentHelper(this);
++        }
++
++        void setSheetHost(@Nullable SheetHost host) {
++            mSheetHost = host;
+         }
+ 
+         void setOnDismissListener(Runnable dismiss) {
+@@ -2441,6 +2645,128 @@ public final class BareVerticalTabsDrawer {
+             mRelease = release;
+         }
+ 
++
++        @Override
++        public boolean dispatchTouchEvent(MotionEvent ev) {
++            if (mSheetHost != null && mSheetHost.sheetActive()) {
++                switch (ev.getActionMasked()) {
++                    case MotionEvent.ACTION_DOWN:
++                        if (mTracker != null) mTracker.recycle();
++                        mTracker = VelocityTracker.obtain();
++                        track(ev);
++                        break;
++                    case MotionEvent.ACTION_MOVE:
++                    case MotionEvent.ACTION_UP:
++                    case MotionEvent.ACTION_CANCEL:
++                        track(ev);
++                        break;
++                    default:
++                        break;
++                }
++            }
++            return super.dispatchTouchEvent(ev);
++        }
++
++        @Override
++        public boolean onStartNestedScroll(View child, View target, int axes, int type) {
++            return mSheetHost != null
++                    && mSheetHost.sheetActive()
++                    && !mSheetHost.reorderActive()
++                    && type == ViewCompat.TYPE_TOUCH
++                    && (axes & ViewCompat.SCROLL_AXIS_VERTICAL) != 0;
++        }
++
++        @Override
++        public boolean onStartNestedScroll(View child, View target, int axes) {
++            return onStartNestedScroll(child, target, axes, ViewCompat.TYPE_TOUCH);
++        }
++
++        @Override
++        public void onNestedScrollAccepted(View child, View target, int axes, int type) {
++            mNestedParent.onNestedScrollAccepted(child, target, axes, type);
++        }
++
++        @Override
++        public void onNestedScrollAccepted(View child, View target, int axes) {
++            onNestedScrollAccepted(child, target, axes, ViewCompat.TYPE_TOUCH);
++        }
++
++        @Override
++        public void onStopNestedScroll(View target, int type) {
++            mNestedParent.onStopNestedScroll(target, type);
++            if (type != ViewCompat.TYPE_TOUCH) return;
++            if (mSheetNestedDrag && mSheetHost != null) {
++                float velocity = 0f;
++                if (mTracker != null) {
++                    mTracker.computeCurrentVelocity(1000);
++                    velocity = mTracker.getYVelocity();
++                }
++                mSheetHost.finishSheetDrag(velocity);
++            }
++            mSheetNestedDrag = false;
++        }
++
++        @Override
++        public void onStopNestedScroll(View target) {
++            onStopNestedScroll(target, ViewCompat.TYPE_TOUCH);
++        }
++
++        @Override
++        public void onNestedScroll(
++                View target,
++                int dxConsumed,
++                int dyConsumed,
++                int dxUnconsumed,
++                int dyUnconsumed,
++                int type,
++                int[] consumed) {
++            if (type != ViewCompat.TYPE_TOUCH) return;
++            if (dyUnconsumed >= 0) return;
++            if (mSheetHost == null || !mSheetHost.sheetActive() || mSheetHost.reorderActive()) {
++                return;
++            }
++            mSheetHost.dragSheetBy(-dyUnconsumed);
++            consumed[1] += dyUnconsumed;
++            mSheetNestedDrag = true;
++        }
++
++        @Override
++        public void onNestedScroll(
++                View target,
++                int dxConsumed,
++                int dyConsumed,
++                int dxUnconsumed,
++                int dyUnconsumed,
++                int type) {
++            int[] consumed = new int[2];
++            onNestedScroll(
++                    target, dxConsumed, dyConsumed, dxUnconsumed, dyUnconsumed, type, consumed);
++        }
++
++        @Override
++        public void onNestedPreScroll(View target, int dx, int dy, int[] consumed, int type) {}
++
++        @Override
++        public void onNestedPreScroll(View target, int dx, int dy, int[] consumed) {
++            onNestedPreScroll(target, dx, dy, consumed, ViewCompat.TYPE_TOUCH);
++        }
++
++        @Override
++        public boolean onNestedFling(
++                View target, float velocityX, float velocityY, boolean consumed) {
++            return false;
++        }
++
++        @Override
++        public boolean onNestedPreFling(View target, float velocityX, float velocityY) {
++            return false;
++        }
++
++        @Override
++        public int getNestedScrollAxes() {
++            return mNestedParent.getNestedScrollAxes();
++        }
++
+         @Override
+         public boolean onInterceptTouchEvent(MotionEvent ev) {
+             if (mDrag == null) return super.onInterceptTouchEvent(ev);
+diff --git a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+index a9ab3b38b6..c5283e6668 100644
+--- a/chrome/android/junit/BUILD.gn
++++ b/chrome/android/junit/BUILD.gn
+@@ -451,6 +451,7 @@ if (is_android) {
+       "src/org/chromium/chrome/browser/bare/BareTabSwitcherUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareToolbarActionCatalogueUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java",
++      "src/org/chromium/chrome/browser/bare/BareTabSheetSnapUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/settings/BareSettingsLayoutUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareCrxDownloadWatcherUnitTest.java",
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetSnapUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetSnapUnitTest.java
+new file mode 100644
+index 0000000000..98a23a5e1c
+--- /dev/null
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetSnapUnitTest.java
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.bare;
++
++import static org.junit.Assert.assertEquals;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.annotation.Config;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.bare.BareTabSheetSnap.State;
++
++/** Snap decisions for the tab sheet: position and fling velocity choose the next stop. */
++@RunWith(BaseRobolectricTestRunner.class)
++@Config(manifest = Config.NONE)
++public class BareTabSheetSnapUnitTest {
++    private static final float FLING = 100f;
++
++    @Test
++    public void progressOfEachState() {
++        assertEquals(0f, BareTabSheetSnap.progressOf(State.HIDDEN), 0f);
++        assertEquals(0.5f, BareTabSheetSnap.progressOf(State.HALF), 0f);
++        assertEquals(1f, BareTabSheetSnap.progressOf(State.FULL), 0f);
++    }
++
++    @Test
++    public void aSlowDragSettlesAtTheNearestStop() {
++        assertEquals(State.HIDDEN, BareTabSheetSnap.nearest(0f));
++        assertEquals(State.HIDDEN, BareTabSheetSnap.nearest(0.24f));
++        assertEquals(State.HALF, BareTabSheetSnap.nearest(0.25f));
++        assertEquals(State.HALF, BareTabSheetSnap.nearest(0.5f));
++        assertEquals(State.HALF, BareTabSheetSnap.nearest(0.74f));
++        assertEquals(State.FULL, BareTabSheetSnap.nearest(0.75f));
++        assertEquals(State.FULL, BareTabSheetSnap.nearest(1f));
++    }
++
++    @Test
++    public void aTiePrefersTheMoreOpenStop() {
++        // Midway between hidden and half is 0.25; midway between half and full is 0.75.
++        assertEquals(State.HALF, BareTabSheetSnap.nearest(0.25f));
++        assertEquals(State.FULL, BareTabSheetSnap.nearest(0.75f));
++    }
++
++    @Test
++    public void aFlingUpFromBelowHalfOpensToHalf() {
++        assertEquals(State.HALF, BareTabSheetSnap.snap(0.1f, -FLING, FLING));
++        assertEquals(State.HALF, BareTabSheetSnap.snap(0.49f, -200f, FLING));
++    }
++
++    @Test
++    public void aFlingUpFromHalfOrAboveGoesToFull() {
++        assertEquals(State.FULL, BareTabSheetSnap.snap(0.5f, -FLING, FLING));
++        assertEquals(State.FULL, BareTabSheetSnap.snap(0.7f, -FLING, FLING));
++        assertEquals(State.FULL, BareTabSheetSnap.snap(1f, -FLING, FLING));
++    }
++
++    @Test
++    public void aFlingDownFromAboveHalfSettlesAtHalf() {
++        assertEquals(State.HALF, BareTabSheetSnap.snap(0.51f, FLING, FLING));
++        assertEquals(State.HALF, BareTabSheetSnap.snap(0.9f, 250f, FLING));
++        assertEquals(State.HALF, BareTabSheetSnap.snap(1f, FLING, FLING));
++    }
++
++    @Test
++    public void aFlingDownFromHalfOrBelowCloses() {
++        assertEquals(State.HIDDEN, BareTabSheetSnap.snap(0.5f, FLING, FLING));
++        assertEquals(State.HIDDEN, BareTabSheetSnap.snap(0.2f, FLING, FLING));
++        assertEquals(State.HIDDEN, BareTabSheetSnap.snap(0f, FLING, FLING));
++    }
++
++    @Test
++    public void aVelocityBelowTheFlingThresholdUsesTheNearestStop() {
++        assertEquals(State.FULL, BareTabSheetSnap.snap(0.9f, 99f, FLING));
++        assertEquals(State.HIDDEN, BareTabSheetSnap.snap(0.1f, -99f, FLING));
++        assertEquals(State.HALF, BareTabSheetSnap.snap(0.4f, 50f, FLING));
++    }
++
++    @Test
++    public void aVelocityAtTheFlingThresholdCountsAsAFling() {
++        assertEquals(State.FULL, BareTabSheetSnap.snap(0.6f, -FLING, FLING));
++        assertEquals(State.HIDDEN, BareTabSheetSnap.snap(0.4f, FLING, FLING));
++    }
++}
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index e932a2311d..5cf9be24cf 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -19,9 +19,12 @@ import static org.mockito.Mockito.when;
+ 
+ import android.app.Activity;
+ import android.graphics.Bitmap;
++import android.view.Gravity;
+ import android.view.View;
+ import android.view.ViewGroup;
+ import android.view.accessibility.AccessibilityNodeInfo;
++import android.widget.FrameLayout;
++import android.widget.LinearLayout;
+ import android.widget.TextView;
+ 
+ import androidx.recyclerview.widget.RecyclerView;
+@@ -557,4 +560,100 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertNotNull(count);
+         assertTrue(count.getText().toString().contains("2"));
+     }
++
++    @Test
++    public void testOpeningTheSheetSettlesAtHalf() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testOpeningTheDrawerStillGoesAllTheWay() {
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(1f, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testAFlingUpFromTheSheetHalfGoesToFull() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(1f, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testAFlingDownFromTheSheetHalfClosesIt() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.finishSheetDragForTesting(10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(0f, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testAFlingDownFromTheSheetFullSettlesAtHalf() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        mDrawer.finishSheetDragForTesting(10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testTheSheetActionsStayPutAndTheListEndsAboveThem() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        View actions = findTag("sheet_actions");
++        assertNotNull(actions);
++        assertTrue(actions.getParent() instanceof LinearLayout);
++        LinearLayout panel = (LinearLayout) actions.getParent();
++        View root = (View) panel.getParent();
++        layoutOverlay(root, 1080, 2000);
++        mDrawer.finishAnimationForTesting();
++        layoutOverlay(root, 1080, 2000);
++
++        assertEquals(0f, actions.getTranslationY(), 0f);
++        assertEquals(0f, panel.getTranslationY(), 0f);
++        FrameLayout.LayoutParams halfParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        assertEquals(Gravity.BOTTOM, halfParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
++        assertEquals(Math.round(BareTabSheetSnap.HALF_RATIO * 2000), halfParams.height);
++        RecyclerView list = find(content(), RecyclerView.class);
++        assertNotNull(list);
++        assertEquals(0, list.getPaddingBottom());
++        View listHolder = (View) list.getParent();
++        assertTrue(panel.indexOfChild(listHolder) < panel.indexOfChild(actions));
++        assertTrue(listHolder.getBottom() <= actions.getTop());
++
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        layoutOverlay(root, 1080, 2000);
++        assertEquals(0f, actions.getTranslationY(), 0f);
++        assertEquals(0f, panel.getTranslationY(), 0f);
++        FrameLayout.LayoutParams fullParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        assertEquals(Gravity.BOTTOM, fullParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
++        assertEquals(2000, fullParams.height);
++        assertTrue(listHolder.getBottom() <= actions.getTop());
++    }
++
++    private void layoutOverlay(View root, int width, int height) {
++        root.measure(
++                View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY));
++        root.layout(0, 0, width, height);
++    }
+ }
+-- 
+2.34.1
+
