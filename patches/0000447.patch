@@ -1,0 +1,1295 @@
+From a738a3660d985d0f050a204fc2b4463efab41e7d Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:33:13 +0000
+Subject: [PATCH] Bare: always undo the page card when the tab sheet is gone
+
+The page dim and scale were removed only on a progress-0 frame, so a
+dismissed, detached, paused or re-moded sheet could leave the page
+dimmed. restoreSheetChrome() is now the one idempotent restore (scale,
+clip, backdrop, shade, status bar, scrim, url bar focus guard), driven
+by whether the sheet window is actually on screen and called from every
+close path.
+
+Also fixes three bugs found on the way:
+- Re-hosting the origin pill while it was the touch target re-added an
+  attached view and crashed (child already has a parent). Detach is now
+  safe and the rehost is posted while the pill touch is on the stack.
+- Close all from the sheet finished the activity. It now opens a new tab
+  first and closes the old tabs with undo.
+- Closing the sheet by dragging it down could focus the omnibox.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 603 ++++++++++++++++--
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 352 +++++++++-
+ 2 files changed, 901 insertions(+), 54 deletions(-)
+ mode change 100755 => 100644 chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+ mode change 100755 => 100644 chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+old mode 100755
+new mode 100644
+index 48fb18b745..0812e0aeb9
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -8,9 +8,12 @@ import android.animation.Animator;
+ import android.animation.AnimatorListenerAdapter;
+ import android.animation.ValueAnimator;
+ import android.app.Activity;
++import android.app.Application;
+ import android.app.Dialog;
++import android.content.ComponentCallbacks;
+ import android.content.Context;
+ import android.content.res.Configuration;
++import android.os.Bundle;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+ import android.graphics.Color;
+@@ -317,18 +320,47 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     // Screen Y of the keyboard's top while it is showing. -1 when it is not.
+     private int mLatchedImeTop = -1;
+     private boolean mInWindowLayout;
++    /** A glass-window move is already posted, so layout does not queue another. */
++    private boolean mGlassPlacePosted;
+     // How far the keyboard lifts the bottom search field, and the sheet with it; and how much of
+     // a sheet dropped from the top it would otherwise cover.
+     private int mImeLift;
+     private int mImeCover;
+     /** True while a sheet is up and the address bar must not take focus. */
+     private boolean mUrlBarBlocked;
++    // Page-card restore follows the sheet window. Progress 0 is one signal.
++    // A paused activity, a dismissed dialog, or a detached overlay is another.
++    private boolean mActivityObscured;
++    private boolean mRehosting;
++    /** True while {@link #detachFromParent} is inside {@code removeView}. */
++    private boolean mDetachingChild;
++    /** A pill reparent is already posted for after the current touch or remove. */
++    private boolean mPillReparentPosted;
++    /** Depth of {@link #onOriginPillTouch}. Removing the pill from inside it crashes. */
++    private int mOriginPillTouchDepth;
++    private boolean mHandlingDismiss;
++    private boolean mRestoringSheet;
++    private boolean mHostCallbacksRegistered;
++    private boolean mChromeModeKnown;
++    private boolean mLastWasSheet;
++    private boolean mLastFromTop;
++    private static @Nullable BareVerticalTabsDrawer sCallbackOwner;
++    private Application.@Nullable ActivityLifecycleCallbacks mActivityCallbacks;
++    private @Nullable ComponentCallbacks mComponentCallbacks;
++    private final ViewTreeObserver.OnGlobalLayoutListener mSafetyLayoutListener =
++            this::onSafetyLayout;
++    private final ViewTreeObserver.OnWindowFocusChangeListener mSafetyFocusListener =
++            this::onSafetyWindowFocus;
+     // Lets tests stand in for a device that can blur behind windows.
+     private static @Nullable Boolean sGlassForTesting;
+     private @Nullable TabModelSelector mObservedSelector;
+     private boolean mOpen;
+     private float mProgress;
+     private boolean mSheetHandleDragging;
++    /** This gesture moved past the slop. A later UP must not count as a pill tap. */
++    private boolean mSheetGestureMoved;
++    /** The close in progress was a drag, so the address bar must not take that finger-up. */
++    private boolean mDragClosedSheet;
+     private float mSheetDragStartProgress;
+     private float mSheetDragStartY;
+     private @Nullable VelocityTracker mSheetTracker;
+@@ -470,6 +502,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mSelectorSupplier = selectorSupplier;
+         mCreatorsSupplier = creatorsSupplier;
+         mContentSupplier = contentSupplier;
++        registerHostCallbacks();
+     }
+ 
+     /**
+@@ -633,6 +666,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     }
+                     Dialog glass = mGlassWindow;
+                     if (glass != null && !mOpen && glass.isShowing()) glass.dismiss();
++                    if (!mOpen) restorePageCard();
+                     releaseObservers();
+                     // The dialog is gone. Focus the omnibox only if this close stuck.
+                     if (!mOpen) deliverPendingOmniboxFocus();
+@@ -641,6 +675,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Releases everything. Called when the activity goes away. */
+     public void destroy() {
++        mHandlingDismiss = true;
++        unregisterHostCallbacks();
+         if (mAnimator != null) mAnimator.cancel();
+         if (mBackAnimator != null) mBackAnimator.cancel();
+         watchFocus(false);
+@@ -752,7 +788,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * once the sheet is gone, so a pill tap can still focus it after the close finishes.
+      */
+     private void guardUrlBarFocus() {
+-        boolean block = isSheetChrome() && (mOpen || mProgress > 0.001f);
++        boolean block = sheetBlocksUrlBar();
+         View url = mActivity.findViewById(R.id.url_bar);
+         if (url == null) return;
+         if (block) {
+@@ -768,10 +804,289 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void releaseUrlBarFocusGuard() {
+         if (!mUrlBarBlocked) return;
+         mUrlBarBlocked = false;
++        boolean dragClosed = mDragClosedSheet;
++        mDragClosedSheet = false;
+         View url = mActivity.findViewById(R.id.url_bar);
+         if (url == null) return;
+         url.setFocusable(true);
+         url.setFocusableInTouchMode(true);
++        // A drag that closed the sheet delivers its UP to the bar once the bar can focus.
++        if (!dragClosed || mPendingOmniboxFocus) return;
++        if (url.hasFocus()) url.clearFocus();
++        url.post(
++                () -> {
++                    if (mPendingOmniboxFocus || mOpen || !url.hasFocus()) return;
++                    url.clearFocus();
++                    InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
++                    if (imm != null && url.getWindowToken() != null) {
++                        imm.hideSoftInputFromWindow(url.getWindowToken(), 0);
++                    }
++                });
++    }
++
++    /**
++     * The sheet overlay is on screen. Progress is separate: a close animation still has a
++     * window until it finishes, and a dismissed dialog does not, even if progress is above 0.
++     */
++    private boolean sheetWindowPresent() {
++        if (mActivityObscured || mHandlingDismiss) return false;
++        FrameLayout root = mRoot;
++        if (root == null || root.getVisibility() != View.VISIBLE) return false;
++        if (root.getParent() == null) return false;
++        if (mGlass) {
++            Dialog glass = mGlassWindow;
++            if (glass == null || !glass.isShowing()) return false;
++        }
++        return true;
++    }
++
++    /** Bottom-bar page card. Top-bar sheets and the side drawer do not scale the page. */
++    private boolean pageCardWanted() {
++        return isSheetChrome()
++                && !sheetFromTop()
++                && mProgress > 0.001f
++                && sheetWindowPresent();
++    }
++
++    /** The address bar stays unfocusable while any sheet window is actually up. */
++    private boolean sheetBlocksUrlBar() {
++        return isSheetChrome() && sheetWindowPresent() && (mOpen || mProgress > 0.001f);
++    }
++
++    private boolean pageCardVisuallyOn() {
++        if (mPageCardArmed || mUrlBarBlocked) return true;
++        if (mPageShade != null
++                && mPageShade.getVisibility() == View.VISIBLE
++                && mPageShade.getAlpha() > 0f) {
++            return true;
++        }
++        if (mPageBackdrop != null
++                && mPageBackdrop.getVisibility() == View.VISIBLE
++                && mPageBackdrop.getAlpha() > 0f) {
++            return true;
++        }
++        View page = mActivity.findViewById(R.id.compositor_view_holder);
++        return page != null
++                && (page.getScaleX() < 0.999f
++                        || page.getScaleY() < 0.999f
++                        || page.getClipToOutline());
++    }
++
++    /**
++     * One restore for every way the sheet leaves. Scale, clip, scrim, backdrop, shade,
++     * status-bar colour, icon appearance, and the address-bar focus block all go back.
++     */
++    private void restoreSheetChrome() {
++        if (mRestoringSheet) return;
++        mRestoringSheet = true;
++        try {
++            View page = mActivity.findViewById(R.id.compositor_view_holder);
++            if (page != null) {
++                page.setPivotX(page.getWidth() * 0.5f);
++                page.setPivotY(page.getHeight() * 0.5f);
++                page.setScaleX(1f);
++                page.setScaleY(1f);
++                page.setClipToOutline(false);
++                page.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
++            }
++            mPageTopInset = 0;
++            mPageDim = 0f;
++            mPageCardArmed = false;
++            hidePageBackdrop();
++            if (mPageShade != null) {
++                mPageShade.setAlpha(0f);
++                mPageShade.setVisibility(View.GONE);
++            }
++            disarmStatusBarGuard();
++            applyStatusBarForPageCard(false, 0f);
++            if (!pageCardWanted()) clearPageCardScrim();
++            releaseUrlBarFocusGuard();
++        } finally {
++            mRestoringSheet = false;
++        }
++    }
++
++    /** Drops the bottom-sheet dim. The drawer and the top sheet keep their own scrim. */
++    private void clearPageCardScrim() {
++        if (!isSheetChrome() || sheetFromTop()) return;
++        View scrim = mScrim;
++        if (scrim == null) return;
++        scrim.setAlpha(0f);
++        placeSheetScrim(scrim, false);
++    }
++
++    /** The glass dialog went away without a finished close animation. */
++    private void onSheetWindowDismissed() {
++        if (mRehosting || mHandlingDismiss) return;
++        if (!mOpen && mProgress <= 0.001f) {
++            restorePageCard();
++            return;
++        }
++        mHandlingDismiss = true;
++        try {
++            mOpen = false;
++            mProgress = 0f;
++            if (mAnimator != null) mAnimator.cancel();
++            watchFocus(false);
++            watchDialogLayout(false);
++            clearSearch();
++            if (mBackCallback != null) mBackCallback.setEnabled(false);
++            FrameLayout root = mRoot;
++            if (root != null && root.getVisibility() != View.GONE) root.setVisibility(View.GONE);
++            setBackProgress(0f);
++            mSettledState = null;
++            mImeLift = 0;
++            mImeCover = 0;
++            mLatchedImeTop = -1;
++            restoreSheetChrome();
++            releaseObservers();
++        } finally {
++            mHandlingDismiss = false;
++        }
++    }
++
++    /** Tabs style or address-bar side changed while the views still exist. */
++    private void applyChromeIfModeChanged() {
++        boolean sheet = isSheetChrome();
++        boolean fromTop = sheetFromTop();
++        if (!mChromeModeKnown) {
++            mChromeModeKnown = true;
++            mLastWasSheet = sheet;
++            mLastFromTop = fromTop;
++            return;
++        }
++        if (sheet == mLastWasSheet && fromTop == mLastFromTop) return;
++        mLastWasSheet = sheet;
++        mLastFromTop = fromTop;
++        if (mRoot == null) return;
++        applyChrome();
++        applyProgress(mProgress);
++    }
++
++    /** Layout, focus, pause, or a configuration change. Re-applies only if the sheet is up. */
++    private void onSheetHostChanged() {
++        if (mRestoringSheet) return;
++        applyChromeIfModeChanged();
++        if (pageCardWanted()) {
++            // Already drawing the card. Applying again from a layout pass schedules
++            // another pass, and the test looper never goes idle.
++            if (!pageCardVisuallyOn()) applyProgress(mProgress);
++            return;
++        }
++        restorePageCard();
++    }
++
++    private void onSafetyLayout() {
++        if (mRestoringSheet || mInWindowLayout) return;
++        mInWindowLayout = true;
++        try {
++            onSheetHostChanged();
++        } finally {
++            mInWindowLayout = false;
++        }
++    }
++
++    private void onSafetyWindowFocus(boolean hasFocus) {
++        if (sWindowFocusedForTesting != null) hasFocus = sWindowFocusedForTesting;
++        if (hasFocus) return;
++        if (!sheetWindowPresent()) restorePageCard();
++    }
++
++    /** Same check the window-focus listener runs. Tests call it without a real focus event. */
++    void noteWindowFocusForTesting(boolean hasFocus) {
++        onSafetyWindowFocus(hasFocus);
++    }
++
++    private void registerHostCallbacks() {
++        if (mHostCallbacksRegistered) return;
++        if (sCallbackOwner != null && sCallbackOwner != this) {
++            sCallbackOwner.unregisterHostCallbacks();
++        }
++        sCallbackOwner = this;
++        mActivityCallbacks =
++                new Application.ActivityLifecycleCallbacks() {
++                    @Override
++                    public void onActivityCreated(Activity activity, @Nullable Bundle state) {}
++
++                    @Override
++                    public void onActivityStarted(Activity activity) {}
++
++                    @Override
++                    public void onActivityResumed(Activity activity) {
++                        if (activity != mActivity) return;
++                        mActivityObscured = false;
++                        if (mRoot == null) return;
++                        onSheetHostChanged();
++                    }
++
++                    @Override
++                    public void onActivityPaused(Activity activity) {
++                        if (activity != mActivity) return;
++                        mActivityObscured = true;
++                        // Night mode recreates the activity. Rotation does not. Drop the sheet
++                        // window first so its dialog is not still attached while tabs reparent.
++                        if (activity.isChangingConfigurations()) releaseSheetWindowForRecreation();
++                        restorePageCard();
++                    }
++
++                    @Override
++                    public void onActivityStopped(Activity activity) {
++                        if (activity != mActivity) return;
++                        mActivityObscured = true;
++                        restorePageCard();
++                    }
++
++                    @Override
++                    public void onActivitySaveInstanceState(Activity activity, Bundle outState) {}
++
++                    @Override
++                    public void onActivityDestroyed(Activity activity) {
++                        if (activity != mActivity) return;
++                        mActivityObscured = true;
++                        restorePageCard();
++                    }
++                };
++        mComponentCallbacks =
++                new ComponentCallbacks() {
++                    @Override
++                    public void onConfigurationChanged(Configuration newConfig) {
++                        onSheetHostChanged();
++                    }
++
++                    @Override
++                    public void onLowMemory() {}
++                };
++        Application app = mActivity.getApplication();
++        if (app != null) app.registerActivityLifecycleCallbacks(mActivityCallbacks);
++        mActivity.registerComponentCallbacks(mComponentCallbacks);
++        View decor = mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
++        if (decor != null) {
++            ViewTreeObserver observer = decor.getViewTreeObserver();
++            if (observer.isAlive()) {
++                observer.addOnGlobalLayoutListener(mSafetyLayoutListener);
++                observer.addOnWindowFocusChangeListener(mSafetyFocusListener);
++            }
++        }
++        mHostCallbacksRegistered = true;
++    }
++
++    private void unregisterHostCallbacks() {
++        if (!mHostCallbacksRegistered) return;
++        mHostCallbacksRegistered = false;
++        if (sCallbackOwner == this) sCallbackOwner = null;
++        Application app = mActivity.getApplication();
++        if (app != null && mActivityCallbacks != null) {
++            app.unregisterActivityLifecycleCallbacks(mActivityCallbacks);
++        }
++        if (mComponentCallbacks != null) mActivity.unregisterComponentCallbacks(mComponentCallbacks);
++        View decor = mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
++        if (decor != null) {
++            ViewTreeObserver observer = decor.getViewTreeObserver();
++            if (observer.isAlive()) {
++                observer.removeOnGlobalLayoutListener(mSafetyLayoutListener);
++                observer.removeOnWindowFocusChangeListener(mSafetyFocusListener);
++            }
++        }
+     }
+ 
+     private void releaseObservers() {
+@@ -813,6 +1128,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     @Override
+                     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+                         super.onSizeChanged(w, h, oldw, oldh);
++                        // Tab reparenting detaches views during this layout. Do not rehost.
++                        if (mActivity.isFinishing() || mActivity.isChangingConfigurations()) return;
+                         applySheetInsets();
+                         sizePanel(w);
+                         layoutOriginPill();
+@@ -840,7 +1157,37 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                                     });
+                         }
+                     }
++
++                    @Override
++                    protected void onConfigurationChanged(Configuration newConfig) {
++                        super.onConfigurationChanged(newConfig);
++                        onSheetHostChanged();
++                    }
++
++                    @Override
++                    protected void onVisibilityChanged(View changedView, int visibility) {
++                        super.onVisibilityChanged(changedView, visibility);
++                        if (changedView != this || visibility == View.VISIBLE) return;
++                        post(
++                                () -> {
++                                    if (!sheetWindowPresent()) restorePageCard();
++                                });
++                    }
+                 };
++        root.addOnAttachStateChangeListener(
++                new View.OnAttachStateChangeListener() {
++                    @Override
++                    public void onViewAttachedToWindow(View v) {}
++
++                    @Override
++                    public void onViewDetachedFromWindow(View v) {
++                        v.post(
++                                () -> {
++                                    if (mRehosting || mHandlingDismiss) return;
++                                    if (!sheetWindowPresent()) restorePageCard();
++                                });
++                    }
++                });
+         root.setVisibility(View.GONE);
+         root.setClickable(true);
+         // The top-bar pill sits just above the overlay, in the address bar's own slot.
+@@ -1981,7 +2328,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             watchDialogLayout(glass && isSheetChrome());
+             return;
+         }
+-        if (root.getParent() instanceof ViewGroup parent) parent.removeView(root);
++        if (root.getParent() != null) {
++            mRehosting = true;
++            boolean detached = detachFromParent(root);
++            mRehosting = false;
++            if (!detached) return;
++        }
+         mGlass = glass;
+         if (!glass) {
+             ViewGroup content = mActivity.findViewById(android.R.id.content);
+@@ -1993,7 +2345,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                                 ViewGroup.LayoutParams.MATCH_PARENT));
+             }
+             Dialog old = mGlassWindow;
+-            if (old != null && old.isShowing()) old.dismiss();
++            if (old != null && old.isShowing()) {
++                mRehosting = true;
++                old.dismiss();
++                mRehosting = false;
++            }
+             watchDialogLayout(false);
+             return;
+         }
+@@ -2036,6 +2392,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 w.setNavigationBarContrastEnforced(false);
+             }
+             mGlassWindow = window;
++            window.setOnDismissListener(dialog -> onSheetWindowDismissed());
+         } else {
+             window.setContentView(
+                     root,
+@@ -2089,6 +2446,28 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Bounds the sheet's glass window to the content between the toolbars. */
+     private void placeSheetGlassWindow(int top, int bottom) {
++        Dialog window = mGlassWindow;
++        Window w = window != null ? window.getWindow() : null;
++        View content = mActivity.findViewById(android.R.id.content);
++        if (w == null || content == null) return;
++        // This runs from a global-layout listener. Measuring during that traversal
++        // schedules another traversal, and Robolectric never finishes idling it.
++        if (content.isInLayout()) {
++            if (mGlassPlacePosted) return;
++            mGlassPlacePosted = true;
++            int topNow = top;
++            int bottomNow = bottom;
++            content.post(
++                    () -> {
++                        mGlassPlacePosted = false;
++                        placeSheetGlassWindowPosted(topNow, bottomNow);
++                    });
++            return;
++        }
++        placeSheetGlassWindowPosted(top, bottom);
++    }
++
++    private void placeSheetGlassWindowPosted(int top, int bottom) {
+         Dialog window = mGlassWindow;
+         Window w = window != null ? window.getWindow() : null;
+         View content = mActivity.findViewById(android.R.id.content);
+@@ -2141,6 +2520,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     @Override
+                     public void onAnimationCancel(Animator animation) {
+                         mCancelled = true;
++                        FrameLayout overlay = mRoot;
++                        if (overlay == null) return;
++                        overlay.post(
++                                () -> {
++                                    if (mOpen || sheetWindowPresent()) return;
++                                    mProgress = 0f;
++                                    restorePageCard();
++                                });
+                     }
+ 
+                     @Override
+@@ -2201,7 +2588,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     placeSheetScrim(scrim, false);
+                     setStatusBarScrim(Color.TRANSPARENT);
+                     restorePageCard();
+-                } else {
++                } else if (pageCardWanted()) {
+                     // Opaque black so the view alpha is the dim. Same amount on the page
+                     // and on the band above the sheet, including through the status bar.
+                     scrim.setBackgroundColor(Color.BLACK);
+@@ -2210,6 +2597,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     // below it so the gap stays the same colour as the status bar.
+                     placeSheetScrim(scrim, true);
+                     applyPageCard(dim);
++                } else {
++                    scrim.setAlpha(0f);
++                    placeSheetScrim(scrim, false);
++                    setStatusBarScrim(Color.TRANSPARENT);
++                    restorePageCard();
+                 }
+             } else {
+                 scrim.setBackgroundColor(SCRIM_COLOR);
+@@ -2275,49 +2667,43 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * toolbar and the origin pill are not children of it, so they stay full size.
+      */
+     private void applyPageCard(float dim) {
+-        boolean on = dim > 0.001f;
+-        if (!on && !mPageCardArmed) return;
+-        if (on) rememberStatusBar();
++        if (!pageCardWanted() || dim <= 0.001f) {
++            restorePageCard();
++            return;
++        }
++        rememberStatusBar();
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
+         if (page != null) {
+-            if (on) {
+-                float scale = 1f - dim * (1f - PAGE_SCALE);
+-                page.setPivotX(page.getWidth() * 0.5f);
+-                page.setPivotY(0f);
+-                page.setScaleX(scale);
+-                page.setScaleY(scale);
+-                mPageCornerRadius = dp(PAGE_CORNER_DP) * dim;
+-                // Screen gap is the inset times scale. Round the inset up so the
+-                // backdrop shows for the full 8dp under the status bar.
+-                int gap = dp(SHEET_FULL_GAP_DP);
+-                mPageTopInset = (int) Math.ceil(gap / Math.max(scale, 0.5f));
+-                page.setOutlineProvider(mPageOutline);
+-                page.setClipToOutline(true);
+-                page.invalidateOutline();
+-                ensurePageBackdrop(page, dim);
+-            } else {
+-                page.setPivotX(page.getWidth() * 0.5f);
+-                page.setPivotY(page.getHeight() * 0.5f);
+-                page.setScaleX(1f);
+-                page.setScaleY(1f);
+-                mPageTopInset = 0;
+-                page.setClipToOutline(false);
+-                page.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+-                hidePageBackdrop();
+-            }
+-        } else if (!on) {
+-            hidePageBackdrop();
++            float scale = 1f - dim * (1f - PAGE_SCALE);
++            page.setPivotX(page.getWidth() * 0.5f);
++            page.setPivotY(0f);
++            page.setScaleX(scale);
++            page.setScaleY(scale);
++            mPageCornerRadius = dp(PAGE_CORNER_DP) * dim;
++            // Screen gap is the inset times scale. Round the inset up so the
++            // backdrop shows for the full 8dp under the status bar.
++            int gap = dp(SHEET_FULL_GAP_DP);
++            mPageTopInset = (int) Math.ceil(gap / Math.max(scale, 0.5f));
++            page.setOutlineProvider(mPageOutline);
++            page.setClipToOutline(true);
++            page.invalidateOutline();
++            ensurePageBackdrop(page, dim);
+         }
+         // Status bar and the 8dp under it are the backdrop, one colour from y = 0.
+-        mPageDim = on ? dim : 0f;
+-        mPageCardArmed = on;
++        mPageDim = dim;
++        mPageCardArmed = true;
+         applyPageShade(mPageDim);
+-        applyStatusBarForPageCard(on, mPageDim);
+-        if (on && mGlass) flattenGlassDecor();
++        applyStatusBarForPageCard(true, mPageDim);
++        if (mGlass) flattenGlassDecor();
+     }
+ 
++    /**
++     * Clears the page card when it is still applied. Safe to call again: a second call
++     * finds the page already at scale 1 and returns.
++     */
+     private void restorePageCard() {
+-        applyPageCard(0f);
++        if (mRestoringSheet || !pageCardVisuallyOn()) return;
++        restoreSheetChrome();
+     }
+ 
+     private void releasePageCard() {
+@@ -2429,8 +2815,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         host.post(
+                 () -> {
+                     mPageCardPost = false;
+-                    if (mRoot == null) return;
+-                    if (!(isSheetChrome() && !sheetFromTop())) {
++                    if (mRoot == null || !pageCardWanted()) {
+                         restorePageCard();
+                         return;
+                     }
+@@ -2674,6 +3059,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         switch (ev.getActionMasked()) {
+             case MotionEvent.ACTION_DOWN:
+                 mSheetHandleDragging = false;
++                mSheetGestureMoved = false;
+                 mSheetDragStartY = ev.getRawY();
+                 mSheetDragStartProgress = mProgress;
+                 if (mSheetTracker != null) mSheetTracker.recycle();
+@@ -2685,6 +3071,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 float dy = ev.getRawY() - mSheetDragStartY;
+                 if (!mSheetHandleDragging && Math.abs(dy) > slop) {
+                     mSheetHandleDragging = true;
++                    // Stays set if this remove re-enters the listener with CANCEL. The UP
++                    // that follows is still this drag, not a tap.
++                    mSheetGestureMoved = true;
+                     mSheetDragStartY = ev.getRawY();
+                     mSheetDragStartProgress = mProgress;
+                     if (mAnimator != null) mAnimator.cancel();
+@@ -2745,6 +3134,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         BareTabSheetSnap.State next =
+                 BareTabSheetSnap.snap(mProgress, towardClosed, dp(SHEET_FLING_DP_PER_S));
+         if (next == BareTabSheetSnap.State.HIDDEN) {
++            // A drag is not a pill tap, and its finger-up must not land in the omnibox.
++            mDragClosedSheet = true;
++            cancelPendingOmniboxFocus();
+             close();
+         } else {
+             settleSheet(next, /* announce= */ true);
+@@ -3066,7 +3458,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         ? mActivity.findViewById(android.R.id.content)
+                         : mHandleRow;
+         if (!(wantView instanceof ViewGroup want) || pill.getParent() == want) return;
+-        if (pill.getParent() instanceof ViewGroup parent) parent.removeView(pill);
++        if (mDetachingChild) return;
++        if (!detachFromParent(pill) || pill.getParent() != null) return;
+         if (want instanceof FrameLayout) {
+             pill.setElevation(dp(20));
+             want.addView(
+@@ -3358,11 +3751,66 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (slot != null) row.removeView(slot);
+     }
+ 
++    /**
++     * Takes {@code child} off its parent. Safe when the child is already loose, and when
++     * {@code removeView} re-enters layout before the parent pointer drops: the re-entry does
++     * not add the child a second time.
++     *
++     * @return true when {@code child} has no parent
++     */
++    private boolean detachFromParent(View child) {
++        if (child.getParent() == null) return true;
++        if (mDetachingChild) return false;
++        if (!(child.getParent() instanceof ViewGroup group)) return false;
++        mDetachingChild = true;
++        try {
++            group.endViewTransition(child);
++            if (child.getParent() == group) group.removeView(child);
++            if (child.getParent() == group) group.removeViewInLayout(child);
++        } finally {
++            mDetachingChild = false;
++        }
++        return child.getParent() == null;
++    }
++
++    /** The sheet dialog cannot outlive a configuration recreate. Rotation never gets here. */
++    private void releaseSheetWindowForRecreation() {
++        mHandlingDismiss = true;
++        mRehosting = true;
++        try {
++            Dialog glass = mGlassWindow;
++            if (glass != null) {
++                if (glass.isShowing()) glass.dismiss();
++                mGlassWindow = null;
++            }
++            FrameLayout root = mRoot;
++            if (root != null) detachFromParent(root);
++            LinearLayout pill = mOriginPill;
++            if (pill != null) detachFromParent(pill);
++        } finally {
++            mRehosting = false;
++            mHandlingDismiss = false;
++        }
++    }
++
+     private void placePillOnRoot(
+             LinearLayout pill, FrameLayout root, int width, int height, float left, float top) {
+         ensurePillSlot();
+         if (pill.getParent() != root) {
+-            if (pill.getParent() instanceof ViewGroup parent) parent.removeView(pill);
++            // Removing the pill while it is the touch target re-enters this method with the
++            // parent still set, and addView throws. Do it after the gesture instead.
++            if (mOriginPillTouchDepth > 0 || mDetachingChild) {
++                if (mDetachingChild) return;
++                postPillReparent(pill, root, width, height, left, top);
++                return;
++            }
++            if (!detachFromParent(pill)) {
++                if (pill.getParent() instanceof ViewGroup) {
++                    postPillReparent(pill, root, width, height, left, top);
++                }
++                return;
++            }
++            if (pill.getParent() != null) return;
+             pill.setElevation(dp(24));
+             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                 pill.setOutlineAmbientShadowColor(Color.TRANSPARENT);
+@@ -3406,6 +3854,28 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         pill.setTranslationY(top);
+     }
+ 
++    private void postPillReparent(
++            LinearLayout pill, FrameLayout root, int width, int height, float left, float top) {
++        if (mPillReparentPosted || pill.getParent() == root) return;
++        mPillReparentPosted = true;
++        pill.post(
++                () -> {
++                    mPillReparentPosted = false;
++                    if (mOriginPill != pill || mRoot != root) return;
++                    placePillOnRoot(pill, root, width, height, left, top);
++                });
++    }
++
++    /** Moves the travelling pill onto the sheet root. Tests rehost an already-attached pill. */
++    void rehostOriginPillForTesting() {
++        LinearLayout pill = mOriginPill;
++        FrameLayout root = mRoot;
++        if (pill == null || root == null) return;
++        int width = pill.getWidth() > 0 ? pill.getWidth() : dp(PILL_MIN_WIDTH_DP);
++        int height = pill.getHeight() > 0 ? pill.getHeight() : dp(PILL_HEIGHT_DP);
++        placePillOnRoot(pill, root, width, height, pill.getTranslationX(), pill.getTranslationY());
++    }
++
+     /** Above the sheet panel (and its cards and actions row) while the pill travels on root. */
+     private float morphPillZ() {
+         Panel panel = mPanel;
+@@ -3421,7 +3891,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         pill.setTranslationY(0f);
+         if (pill.getElevation() != 0f) pill.setElevation(0f);
+         if (pill.getParent() != row) {
+-            if (pill.getParent() instanceof ViewGroup parent) parent.removeView(pill);
++            if (mDetachingChild) return;
++            if (!detachFromParent(pill) || pill.getParent() != null) return;
+             LinearLayout.LayoutParams created = new LinearLayout.LayoutParams(width, height);
+             created.gravity = Gravity.CENTER_HORIZONTAL;
+             row.addView(pill, 0, created);
+@@ -3703,7 +4174,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         cover.setBackgroundColor(color(0xFF1B1B1E, 0xFFF4F4F7));
+         if (cover.getParent() != host) {
+-            if (cover.getParent() instanceof ViewGroup old) old.removeView(cover);
++            if (mDetachingChild) return;
++            if (!detachFromParent(cover) || cover.getParent() != null) return;
+             host.addView(cover, host.indexOfChild(pill));
+         }
+         cover.setElevation(pill.getElevation());
+@@ -3785,10 +4257,16 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** A drag moves the sheet. A tap, with no drag, closes it and focuses the omnibox. */
+     private boolean onOriginPillTouch(View view, MotionEvent ev) {
+-        boolean wasDragging = mSheetHandleDragging;
+-        onSheetHandleTouch(view, ev);
+-        if (ev.getActionMasked() == MotionEvent.ACTION_UP && !wasDragging) {
+-            view.performClick();
++        mOriginPillTouchDepth++;
++        try {
++            onSheetHandleTouch(view, ev);
++            // mSheetGestureMoved survives the CANCEL that a reparent sends mid-drag, so the
++            // UP of that same drag does not focus the omnibox.
++            if (ev.getActionMasked() == MotionEvent.ACTION_UP && !mSheetGestureMoved) {
++                view.performClick();
++            }
++        } finally {
++            mOriginPillTouchDepth--;
+         }
+         return true;
+     }
+@@ -4356,9 +4834,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Follows the keyboard while the sheet is open, so it never covers the field or the list. */
+     private void onWindowLayout() {
+-        if (mInWindowLayout || !mOpen || !isSheetChrome()) return;
++        if (mInWindowLayout) return;
+         mInWindowLayout = true;
+         try {
++            onSheetHostChanged();
++            if (!mOpen || !isSheetChrome()) return;
+             applyImeLiftFromInsets();
+             // A later toolbar pass can put the old fill back. Keep the sheet colour on it.
+             applyToolbarSurface();
+@@ -4517,6 +4997,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void refreshSoon() {
++        if (mActivity.isFinishing() || mActivity.isChangingConfigurations()) return;
+         if (mDragging) {
+             mRefreshPending = true;
+             return;
+@@ -4686,8 +5167,26 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void closeAllTabs() {
+         TabModel model = currentModel();
+         if (model == null || model.getCount() == 0) return;
+-        model.getTabRemover()
+-                .closeTabs(TabClosureParams.closeAllTabs().build(), /* allowDialog= */ true);
++        // Closing the last tab finishes the activity when a homepage is set. Open a new tab
++        // first, then close only the tabs that were already open, so Bare stays up on that tab.
++        List<Tab> existing = new ArrayList<>();
++        for (int i = 0; i < model.getCount(); i++) {
++            Tab tab = model.getTabAt(i);
++            if (tab == null || tab.isClosing() || tab.isDestroyed()) continue;
++            existing.add(tab);
++        }
++        TabCreatorManager creators = mCreatorsSupplier.get();
++        if (creators == null) {
++            close();
++            return;
++        }
++        creators.getTabCreator(model.isIncognito()).launchNtp(TabLaunchType.FROM_CHROME_UI);
++        if (!existing.isEmpty()) {
++            model.getTabRemover()
++                    .closeTabs(
++                            TabClosureParams.closeTabs(existing).allowUndo(true).build(),
++                            /* allowDialog= */ true);
++        }
+         close();
+     }
+ 
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+old mode 100755
+new mode 100644
+index b05b8e71a6..0c225be28d
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -13,6 +13,7 @@ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyBoolean;
+ import static org.mockito.ArgumentMatchers.anyInt;
+ import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.inOrder;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+@@ -26,7 +27,9 @@ import android.os.Build;
+ import android.graphics.drawable.ColorDrawable;
+ import android.graphics.drawable.Drawable;
+ import android.graphics.drawable.GradientDrawable;
++import android.os.SystemClock;
+ import android.view.Gravity;
++import android.view.MotionEvent;
+ import android.view.View;
+ import android.view.ViewOutlineProvider;
+ import android.view.ViewGroup;
+@@ -50,6 +53,7 @@ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
++import org.mockito.InOrder;
+ import org.robolectric.Shadows;
+ import org.robolectric.annotation.Config;
+ import org.robolectric.shadows.ShadowLooper;
+@@ -268,7 +272,10 @@ public class BareVerticalTabsDrawerUnitTest {
+     public void testCloseAllClosesEveryTabThroughTheTabRemover() {
+         openAndGetList();
+         button("Close all").performClick();
+-        verify(mRemover).closeTabs(any(), eq(true));
++        // A new tab is opened first so the model is never empty and the activity stays up.
++        InOrder order = inOrder(mCreator, mRemover);
++        order.verify(mCreator).launchNtp(TabLaunchType.FROM_CHROME_UI);
++        order.verify(mRemover).closeTabs(any(), eq(true));
+         assertFalse(mDrawer.isOpen());
+     }
+ 
+@@ -278,6 +285,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         openAndGetList();
+         button("Close all").performClick();
+         verify(mRemover, never()).closeTabs(any(), anyBoolean());
++        verify(mCreator, never()).launchNtp(anyInt());
+     }
+ 
+     @Test
+@@ -572,7 +580,9 @@ public class BareVerticalTabsDrawerUnitTest {
+     public void testTheSheetCloseAllButtonClosesEveryTab() {
+         openSheetAndGetList();
+         findTag("sheet_close_all").performClick();
+-        verify(mRemover).closeTabs(any(), eq(true));
++        InOrder order = inOrder(mCreator, mRemover);
++        order.verify(mCreator).launchNtp(TabLaunchType.FROM_CHROME_UI);
++        order.verify(mRemover).closeTabs(any(), eq(true));
+         assertFalse(mDrawer.isOpen());
+     }
+ 
+@@ -2013,6 +2023,98 @@ public class BareVerticalTabsDrawerUnitTest {
+         verify(mModel, never()).moveTab(anyInt(), anyInt());
+     }
+ 
++    @Test
++    public void testRehostingAnAttachedPillDoesNotThrowAndSurvivesAnotherTouch() {
++        setAddressBarOnTop(false);
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++        try {
++            LinearLayout panel = openSheetLaidOut(px(400), px(800));
++            View root = (View) panel.getParent();
++            View pill = originPill();
++            assertNotNull(pill.getParent());
++            // removeView re-enters the rehost before the parent pointer drops. That is the
++            // addView crash from a touch on the pill.
++            final boolean[] reentered = {false};
++            FrameLayout sticky =
++                    new FrameLayout(mActivity) {
++                        @Override
++                        public void removeView(View child) {
++                            if (!reentered[0]) {
++                                reentered[0] = true;
++                                mDrawer.rehostOriginPillForTesting();
++                            }
++                            super.removeView(child);
++                        }
++                    };
++            ((ViewGroup) pill.getParent()).removeView(pill);
++            sticky.addView(pill);
++            mDrawer.rehostOriginPillForTesting();
++            assertTrue(reentered[0]);
++            assertEquals(root, pill.getParent());
++
++            mDrawer.finishSheetDragForTesting(10_000f);
++            mDrawer.finishAnimationForTesting();
++            assertFalse(mDrawer.isOpen());
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            View again = originPill();
++            long time = SystemClock.uptimeMillis();
++            again.dispatchTouchEvent(
++                    MotionEvent.obtain(time, time, MotionEvent.ACTION_DOWN, 20f, 20f, 0));
++            again.dispatchTouchEvent(
++                    MotionEvent.obtain(time, time + 40, MotionEvent.ACTION_MOVE, 20f, 120f, 0));
++            again.dispatchTouchEvent(
++                    MotionEvent.obtain(time, time + 80, MotionEvent.ACTION_UP, 20f, 280f, 0));
++            mDrawer.finishAnimationForTesting();
++            ShadowLooper.idleMainLooper();
++            assertNotNull(again.getParent());
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
++    }
++
++    @Test
++    public void testADragDownDoesNotFocusTheOmnibox() {
++        setAddressBarOnTop(false);
++        android.widget.EditText url = new android.widget.EditText(mActivity);
++        url.setId(org.chromium.chrome.R.id.url_bar);
++        url.setFocusable(true);
++        url.setFocusableInTouchMode(true);
++        content().addView(url, new FrameLayout.LayoutParams(200, 50));
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++        try {
++            openSheetLaidOut(px(400), px(800));
++            View pill = originPill();
++            long time = SystemClock.uptimeMillis();
++            MotionEvent down =
++                    MotionEvent.obtain(time, time, MotionEvent.ACTION_DOWN, 10f, 10f, 0);
++            // The handler reads raw Y. This obtain sets raw Y to the finger point.
++            // setLocation does not, so a drag built that way was counted as a tap.
++            MotionEvent move =
++                    MotionEvent.obtain(time, time + 30, MotionEvent.ACTION_MOVE, 10f, 220f, 0);
++            MotionEvent up =
++                    MotionEvent.obtain(time, time + 60, MotionEvent.ACTION_UP, 10f, 420f, 0);
++            pill.dispatchTouchEvent(down);
++            pill.dispatchTouchEvent(move);
++            pill.dispatchTouchEvent(up);
++            down.recycle();
++            move.recycle();
++            up.recycle();
++            if (mDrawer.isOpen()) mDrawer.finishSheetDragForTesting(10_000f);
++            mDrawer.finishAnimationForTesting();
++            ShadowLooper.idleMainLooper();
++            assertFalse(mDrawer.isOpen());
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++            assertFalse(url.hasFocus());
++            assertTrue(url.isFocusable());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
++    }
++
+     @Test
+     public void testAPillTapClosesTheSheetAndAsksForTheOmnibox() {
+         setAddressBarOnTop(false);
+@@ -2503,4 +2605,250 @@ public class BareVerticalTabsDrawerUnitTest {
+                 View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY));
+         root.layout(0, 0, width, height);
+     }
++
++    /**
++     * Every way the sheet leaves the screen puts the page, the scrim, the shade, the status
++     * bar, and the address-bar focus block back. A path that leaves the sheet up keeps the card.
++     */
++    @Test
++    public void testThePageCardIsClearedWheneverTheSheetIsGone() {
++        try {
++            View page = armPageCard("setup");
++
++            findTag("sheet_search").performClick();
++            ShadowLooper.idleMainLooper();
++            mDrawer.finishAnimationForTesting();
++            assertTrue("search stays open", mDrawer.isOpen());
++            assertEquals("search keeps the card", 0.95f, page.getScaleX(), 0.02f);
++            BareVerticalTabsDrawer.setImeVisibleForTesting(true);
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue("back hides the keyboard and leaves the sheet", mDrawer.isOpen());
++            assertEquals("back 1 keeps the card", 0.95f, page.getScaleX(), 0.02f);
++            BareVerticalTabsDrawer.setImeVisibleForTesting(false);
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue("back clears the search and leaves the sheet", mDrawer.isOpen());
++            assertEquals("back 2 keeps the card", 0.95f, page.getScaleX(), 0.02f);
++            backDispatcher().onBackPressed();
++            assertPageCardCleared(page, "back 3");
++
++            page = armPageCard("predictive back");
++            backDispatcher().dispatchOnBackStarted(backEvent(0f));
++            backDispatcher().dispatchOnBackProgressed(backEvent(0.4f));
++            assertEquals("predictive back keeps the card", 0.95f, page.getScaleX(), 0.02f);
++            backDispatcher().onBackPressed();
++            assertPageCardCleared(page, "predictive back");
++
++            page = armPageCard("tab");
++            RecyclerView list = find(content(), RecyclerView.class);
++            assertNotNull(list);
++            list.measure(
++                    View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.EXACTLY),
++                    View.MeasureSpec.makeMeasureSpec(2000, View.MeasureSpec.EXACTLY));
++            list.layout(0, 0, 1000, 2000);
++            assertTrue(list.getChildCount() > 0);
++            list.getChildAt(0).performClick();
++            assertPageCardCleared(page, "tab");
++
++            page = armPageCard("new tab");
++            findTag("sheet_new").performClick();
++            assertPageCardCleared(page, "new tab");
++
++            page = armPageCard("close all");
++            findTag("sheet_close_all").performClick();
++            assertPageCardCleared(page, "close all");
++
++            page = armPageCard("drag");
++            mDrawer.finishSheetDragForTesting(10_000f);
++            assertPageCardCleared(page, "drag");
++
++            android.widget.EditText other = new android.widget.EditText(mActivity);
++            other.setFocusableInTouchMode(true);
++            content().addView(other, new FrameLayout.LayoutParams(180, 48));
++            page = armPageCard("omnibox");
++            assertTrue(other.requestFocus());
++            ShadowLooper.idleMainLooper();
++            assertPageCardCleared(page, "omnibox");
++
++            page = armPageCard("focus loss");
++            mDrawer.noteWindowFocusForTesting(false);
++            assertEquals("focus loss keeps a visible sheet", 0.95f, page.getScaleX(), 0.02f);
++            View overlay = (View) findTag("sheet_actions").getParent().getParent();
++            overlay.setVisibility(View.GONE);
++            ShadowLooper.idleMainLooper();
++            mDrawer.noteWindowFocusForTesting(false);
++            assertPageCardCleared(page, "focus loss");
++
++            page = armPageCard("detach");
++            View overlay2 = (View) findTag("sheet_actions").getParent().getParent();
++            ((ViewGroup) overlay2.getParent()).removeView(overlay2);
++            ShadowLooper.idleMainLooper();
++            assertPageCardCleared(page, "detach");
++
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            BareVerticalTabsDrawer.setGlassForTesting(true);
++            page = armPageCard("dialog");
++            Dialog glass = mDrawer.glassWindowForTesting();
++            assertNotNull(glass);
++            glass.dismiss();
++            ShadowLooper.idleMainLooper();
++            assertPageCardCleared(page, "dialog");
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++
++            page = armPageCard("pause");
++            mActivityScenarioRule
++                    .getScenario()
++                    .moveToState(androidx.lifecycle.Lifecycle.State.STARTED);
++            assertPageCardCleared(page, "pause");
++            mActivityScenarioRule
++                    .getScenario()
++                    .moveToState(androidx.lifecycle.Lifecycle.State.RESUMED);
++            ShadowLooper.idleMainLooper();
++            if (mDrawer.isOpen()) {
++                assertEquals("resume puts the card back", 0.95f, page.getScaleX(), 0.02f);
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++
++            page = armPageCard("stop");
++            mActivityScenarioRule
++                    .getScenario()
++                    .moveToState(androidx.lifecycle.Lifecycle.State.CREATED);
++            assertPageCardCleared(page, "stop");
++            mActivityScenarioRule
++                    .getScenario()
++                    .moveToState(androidx.lifecycle.Lifecycle.State.RESUMED);
++            ShadowLooper.idleMainLooper();
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++
++            page = armPageCard("config");
++            android.content.res.Configuration config =
++                    new android.content.res.Configuration(
++                            mActivity.getResources().getConfiguration());
++            config.uiMode =
++                    (config.uiMode & ~android.content.res.Configuration.UI_MODE_NIGHT_MASK)
++                            | android.content.res.Configuration.UI_MODE_NIGHT_YES;
++            mActivity.onConfigurationChanged(config);
++            ShadowLooper.idleMainLooper();
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            assertPageCardCleared(page, "config");
++
++            page = armPageCard("style");
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            mActivity.getWindow().getDecorView().requestLayout();
++            mActivity.onConfigurationChanged(mActivity.getResources().getConfiguration());
++            ShadowLooper.idleMainLooper();
++            assertEquals("style scale", 1f, page.getScaleX(), 0.001f);
++            assertFalse("style clip", page.getClipToOutline());
++            assertEquals("style status", 0xFF112233, mActivity.getWindow().getStatusBarColor());
++            assertTrue("style icons", mPageIcons.isAppearanceLightStatusBars());
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++
++            page = armPageCard("address bar");
++            setAddressBarOnTop(true);
++            mActivity.getWindow().getDecorView().requestLayout();
++            mActivity.getApplication().onConfigurationChanged(
++                    mActivity.getResources().getConfiguration());
++            ShadowLooper.idleMainLooper();
++            assertEquals("address bar scale", 1f, page.getScaleX(), 0.001f);
++            assertFalse("address bar clip", page.getClipToOutline());
++            View shade = mActivity.getWindow().getDecorView().findViewWithTag("page_dim_shade");
++            if (shade != null) {
++                assertTrue(
++                        "address bar shade",
++                        shade.getVisibility() != View.VISIBLE || shade.getAlpha() == 0f);
++            }
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            assertPageCardCleared(page, "address bar");
++
++            page = armPageCard("destroy");
++            mDrawer.destroy();
++            assertPageCardCleared(page, "destroy");
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++            BareVerticalTabsDrawer.setImeVisibleForTesting(null);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            setAddressBarOnTop(false);
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            mActivityScenarioRule
++                    .getScenario()
++                    .moveToState(androidx.lifecycle.Lifecycle.State.RESUMED);
++        }
++    }
++
++    private WindowInsetsControllerCompat mPageIcons;
++
++    private View armPageCard(String path) {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++        BareVerticalTabsDrawer.setImeVisibleForTesting(false);
++        View page = mActivity.findViewById(org.chromium.chrome.R.id.compositor_view_holder);
++        if (page == null) page = attachPage();
++        if (mActivity.findViewById(org.chromium.chrome.R.id.url_bar) == null) {
++            android.widget.EditText url = new android.widget.EditText(mActivity);
++            url.setId(org.chromium.chrome.R.id.url_bar);
++            url.setFocusable(true);
++            url.setFocusableInTouchMode(true);
++            content().addView(url, new FrameLayout.LayoutParams(200, 48));
++        }
++        mPageIcons =
++                new WindowInsetsControllerCompat(
++                        mActivity.getWindow(), mActivity.getWindow().getDecorView());
++        mPageIcons.setAppearanceLightStatusBars(true);
++        mActivity.getWindow().setStatusBarColor(0xFF112233);
++        if (mDrawer.isOpen()) {
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            ShadowLooper.idleMainLooper();
++        }
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++        assertEquals(path + " arms the card", 0.95f, page.getScaleX(), 0.02f);
++        assertTrue(path + " clips", page.getClipToOutline());
++        return page;
++    }
++
++    private void assertPageCardCleared(View page, String path) {
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++        assertEquals(path + " scaleX", 1f, page.getScaleX(), 0.001f);
++        assertEquals(path + " scaleY", 1f, page.getScaleY(), 0.001f);
++        assertFalse(path + " clip", page.getClipToOutline());
++        View shade = mActivity.getWindow().getDecorView().findViewWithTag("page_dim_shade");
++        if (shade != null) {
++            assertTrue(
++                    path + " shade",
++                    shade.getVisibility() != View.VISIBLE || shade.getAlpha() == 0f);
++        }
++        View backdrop =
++                page.getParent() instanceof ViewGroup parent
++                        ? parent.findViewWithTag("page_card_backdrop")
++                        : null;
++        if (backdrop != null) {
++            assertTrue(
++                    path + " backdrop",
++                    backdrop.getVisibility() != View.VISIBLE || backdrop.getAlpha() == 0f);
++        }
++        assertEquals(path + " status", 0xFF112233, mActivity.getWindow().getStatusBarColor());
++        assertTrue(path + " icons", mPageIcons.isAppearanceLightStatusBars());
++        View url = mActivity.findViewById(org.chromium.chrome.R.id.url_bar);
++        assertNotNull(path + " url", url);
++        assertTrue(path + " url focusable", url.isFocusable());
++        assertTrue(path + " url touch", url.isFocusableInTouchMode());
++        if (!mDrawer.isOpen()) {
++            View actions = findTag("sheet_actions");
++            if (actions != null && actions.getParent() != null && actions.getParent().getParent() instanceof ViewGroup root) {
++                assertEquals(path + " scrim", 0f, root.getChildAt(0).getAlpha(), 0.001f);
++            }
++        }
++    }
+ }
+-- 
+2.34.1
+
