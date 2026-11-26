@@ -1,0 +1,270 @@
+From 636a846c75fa4208f400fc00692ae963bc5cdf0b Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:28:44 +0000
+Subject: [PATCH] Bare: Back that clears tab search returns the sheet to its
+ stop
+
+Opening tab search takes the sheet to full. The Back press (or the
+clear button) that collapses the field now returns the sheet to the stop
+it had when the search opened: a sheet that was at half animates back to
+half; a sheet the user had already opened to full stays full. Hiding the
+keyboard and emptying the text without collapsing do not move the sheet,
+and the 3-step Back order (keyboard, clear, close) is unchanged.
+
+When the clear also snaps the sheet, the search row's fade transition is
+skipped; the settle cut it off and left the actions row half faded.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  |  72 ++++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 117 ++++++++++++++++++
+ 2 files changed, 186 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index e938d23b71..2a4f4d8837 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -266,6 +266,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private boolean mToolbarPulling;
+ 
+     private boolean mSearchExpanded;
++    // Stop the sheet was on when this search opened. Collapsing the field returns there.
++    private BareTabSheetSnap.@Nullable State mStopBeforeSearch;
+     // How many times a pill tap has asked the omnibox to take focus.
+     private int mOmniboxFocusRequests;
+     // How far the keyboard lifts the bottom search field, and the sheet with it; and how much of
+@@ -946,7 +948,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+                         @Override
+                         public void handleOnBackPressed() {
+-                            // 1) hide the keyboard, 2) clear and collapse the field, 3) close.
++                            // 1) hide the keyboard, 2) clear and collapse the field, which
++                            // returns the sheet to the stop it had before the search, 3) close.
+                             // The system takes the first Back to hide a soft keyboard. A field
+                             // that still has focus with no keyboard (hidden, or a hardware
+                             // keyboard) goes straight to clearing, so it is never a dead press.
+@@ -3235,6 +3238,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** Magnifier: the row becomes the search field, the keyboard comes up, and the sheet goes full. */
+     private void expandSearch() {
+         if (!mOpen || !isSheetChrome() || mSearchField == null || mSearchExpanded) return;
++        rememberStopBeforeSearch();
+         mSearchExpanded = true;
+         beginSearchRowTransition();
+         applySearchRow();
+@@ -3259,6 +3263,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void onSearchFocused() {
+         if (!mOpen || !isSheetChrome()) return;
+         if (!mSearchExpanded) {
++            rememberStopBeforeSearch();
+             mSearchExpanded = true;
+             applySearchRow();
+             setSheetWindowFocusForSearch(true);
+@@ -3291,9 +3296,65 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (thief == null || !thief.requestFocus()) field.clearFocus();
+     }
+ 
+-    /** Empties the field, collapses it back to the magnifier, and lists every tab again. */
++    /**
++     * Records the sheet's stop once, before a search sends it to full. A sheet already on
++     * full stays there when the field later collapses; one that was at half returns to half.
++     */
++    private void rememberStopBeforeSearch() {
++        if (mStopBeforeSearch != null) return;
++        // A move that has already reached a stop counts, even if its end callback has not run.
++        if (mProgress >= 1f - 0.001f) {
++            mStopBeforeSearch = BareTabSheetSnap.State.FULL;
++            return;
++        }
++        if (Math.abs(mProgress - BareTabSheetSnap.HALF_RATIO) <= 0.001f) {
++            mStopBeforeSearch = BareTabSheetSnap.State.HALF;
++            return;
++        }
++        BareTabSheetSnap.State settled = mSettledState;
++        if (settled == BareTabSheetSnap.State.HALF || settled == BareTabSheetSnap.State.FULL) {
++            mStopBeforeSearch = settled;
++            return;
++        }
++        mStopBeforeSearch =
++                BareTabSheetSnap.nearest(mProgress) == BareTabSheetSnap.State.FULL
++                        ? BareTabSheetSnap.State.FULL
++                        : BareTabSheetSnap.State.HALF;
++    }
++
++    /**
++     * Snaps back to the stop from before this search. Closing has already marked the sheet
++     * shut, so that path forgets the search without this snap.
++     */
++    private boolean willRestoreStopAfterSearch() {
++        BareTabSheetSnap.State stop = mStopBeforeSearch;
++        if (!mOpen || !isSheetChrome()) return false;
++        if (stop != BareTabSheetSnap.State.HALF && stop != BareTabSheetSnap.State.FULL) return false;
++        float target = BareTabSheetSnap.progressOf(stop);
++        return !(stop == mSettledState && mAnimator == null && Math.abs(mProgress - target) < 0.001f);
++    }
++
++    private void restoreStopAfterSearch() {
++        BareTabSheetSnap.State stop = mStopBeforeSearch;
++        mStopBeforeSearch = null;
++        if (!mOpen || !isSheetChrome()) return;
++        if (stop != BareTabSheetSnap.State.HALF && stop != BareTabSheetSnap.State.FULL) return;
++        float target = BareTabSheetSnap.progressOf(stop);
++        if (stop == mSettledState && mAnimator == null && Math.abs(mProgress - target) < 0.001f) {
++            return;
++        }
++        settleSheet(stop, /* announce= */ true);
++    }
++
++    /**
++     * Empties the field, collapses it back to the magnifier, and lists every tab again. While
++     * the sheet stays open, it returns to the stop it had when the search opened.
++     */
+     private void clearSearch() {
+-        if (mSearchExpanded) beginSearchRowTransition();
++        boolean wasExpanded = mSearchExpanded;
++        // When the clear also moves the sheet back to its stop, the row's fade would be cut off
++        // by the settle and leave the actions row half faded; the sheet's motion carries it.
++        if (wasExpanded && !willRestoreStopAfterSearch()) beginSearchRowTransition();
+         mSearchExpanded = false;
+         EditText field = mSearchField;
+         if (field != null && field.length() > 0) field.setText("");
+@@ -3305,6 +3366,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             mSnapNext = true;
+             refresh();
+         }
++        if (wasExpanded) {
++            restoreStopAfterSearch();
++        } else {
++            mStopBeforeSearch = null;
++        }
+     }
+ 
+     /**
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 3de690f9e6..050a47f7be 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1556,6 +1556,123 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertFalse(mDrawer.isOpen());
+     }
+ 
++    @Test
++    public void testBackClearsASearchFromHalfAndTheThirdBackCloses() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++
++        findTag("sheet_search").performClick();
++        searchField().setText("sec");
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        BareVerticalTabsDrawer.setImeVisibleForTesting(true);
++        try {
++            // Hiding the keyboard leaves the sheet full and the field up.
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue(mDrawer.isOpen());
++            assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++            assertEquals("sec", searchField().getText().toString());
++            assertEquals(View.VISIBLE, searchField().getVisibility());
++
++            // The press that clears the field returns to the stop from before the search.
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue(mDrawer.isOpen());
++            assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++            assertEquals("", searchField().getText().toString());
++            assertEquals(View.GONE, searchField().getVisibility());
++            assertEquals(View.VISIBLE, findTag("sheet_search").getVisibility());
++
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertFalse(mDrawer.isOpen());
++        } finally {
++            BareVerticalTabsDrawer.setImeVisibleForTesting(null);
++        }
++    }
++
++    @Test
++    public void testBackClearsASearchTheUserOpenedFullAndLeavesTheSheetFull() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        findTag("sheet_search").performClick();
++        searchField().setText("sec");
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        BareVerticalTabsDrawer.setImeVisibleForTesting(true);
++        try {
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++            assertEquals(View.VISIBLE, searchField().getVisibility());
++
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue(mDrawer.isOpen());
++            assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++            assertEquals(View.GONE, searchField().getVisibility());
++
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertFalse(mDrawer.isOpen());
++        } finally {
++            BareVerticalTabsDrawer.setImeVisibleForTesting(null);
++        }
++    }
++
++    @Test
++    public void testTheClearButtonReturnsAHalfSheetToHalfButEmptyingTheTextDoesNot() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        findTag("sheet_search").performClick();
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        searchField().setText("sec");
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        // Deleting the query leaves the field open, so the sheet stays full.
++        searchField().setText("");
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.VISIBLE, searchField().getVisibility());
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        searchField().setText("sec");
++        assertEquals(View.VISIBLE, findTag("sheet_search_clear").getVisibility());
++        findTag("sheet_search_clear").performClick();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals("", searchField().getText().toString());
++        assertEquals(View.GONE, searchField().getVisibility());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testTheClearButtonLeavesASheetTheUserOpenedFullWhereItIs() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        findTag("sheet_search").performClick();
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        searchField().setText("sec");
++        findTag("sheet_search_clear").performClick();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(View.GONE, searchField().getVisibility());
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++    }
++
+     @Test
+     public void testWithNoKeyboardUpTheFirstBackClearsTheSearch() {
+         setAddressBarOnTop(false);
+-- 
+2.34.1
+
