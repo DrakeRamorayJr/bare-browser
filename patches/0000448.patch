@@ -1,0 +1,265 @@
+From 4d08b78e2fc3553acdeb69bbc9de9833e75f41b5 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 03:27:08 +0000
+Subject: [PATCH] Bare: show the address-bar hint in the sheet pill on the new
+ tab page
+
+On the new tab page the url bar text is empty, so the morphing origin
+pill fell back to the tab spec and showed chrome-native://newtab/, and
+the parked pill was blank. NTP, chrome://, chrome-native:// and about:
+pages now use the bar text if it is not a raw internal URL, then the
+bar hint, then the page title. Normal pages still show the host.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 136 ++++++++++++------
+ .../bare/BareVerticalTabsDrawerUnitTest.java  |  70 +++++++++
+ 2 files changed, 164 insertions(+), 42 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 0812e0aeb9..9ba6768cb7 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -103,6 +103,7 @@ import org.chromium.chrome.browser.tabmodel.TabCreatorManager;
+ import org.chromium.chrome.browser.tabmodel.TabModel;
+ import org.chromium.chrome.browser.tabmodel.TabModelObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
++import org.chromium.components.embedder_support.util.UrlConstants;
+ import org.chromium.components.embedder_support.util.UrlUtilities;
+ import org.chromium.chrome.browser.omnibox.LocationBarBackgroundDrawable;
+ import org.chromium.components.omnibox.OmniboxFocusReason;
+@@ -2231,14 +2232,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void updateDomainAndSheetCount(TabModel model, @Nullable Tab selected, int n) {
+-        String label = "";
+-        if (selected != null
+-                && selected.getUrl() != null
+-                && !UrlUtilities.isNtpUrl(selected.getUrl())
+-                && !TextUtils.isEmpty(selected.getUrl().getSpec())) {
+-            String host = selected.getUrl().getHost();
+-            label = TextUtils.isEmpty(host) ? selected.getUrl().getSpec() : host;
+-        }
++        GURL url = selected == null ? null : selected.getUrl();
++        String label =
++                originPillLabel(
++                        url,
++                        shownBarText(),
++                        shownBarHint(),
++                        selected == null ? null : selected.getTitle());
+         TextView domain = mDomain;
+         if (domain != null) {
+             domain.setText(label);
+@@ -3625,44 +3625,96 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+     }
+ 
+-    private CharSequence cachedBarUrl() {
+-        String cached = mCachedBarUrl;
+-        if (cached != null) return cached;
++    /**
++     * Text the origin pill shows. A normal page uses the host. The new-tab page, a chrome page,
++     * and an empty URL use the address bar hint, or the page title when the bar has no hint.
++     * A raw chrome:// or chrome-native:// URL is never returned.
++     */
++    static String originPillLabel(
++            @Nullable GURL url,
++            @Nullable CharSequence barText,
++            @Nullable CharSequence barHint,
++            @Nullable CharSequence pageTitle) {
++        if (url != null && !isHintPage(url)) {
++            String host = url.getHost();
++            if (!TextUtils.isEmpty(host)) return host;
++            String spec = url.getSpec();
++            return isRawInternalUrl(spec) ? "" : spec;
++        }
++        String shown = safeDisplayText(barText);
++        if (!shown.isEmpty()) return shown;
++        String hint = safeDisplayText(barHint);
++        if (!hint.isEmpty()) return hint;
++        return safeDisplayText(pageTitle);
++    }
++
++    /** New-tab page, chrome and chrome-native pages, about: pages, and an empty URL. */
++    static boolean isHintPage(@Nullable GURL url) {
++        if (url == null || GURL.isEmptyOrInvalid(url)) return true;
++        if (UrlUtilities.isNtpUrl(url) || UrlUtilities.isChromeScheme(url)) return true;
++        String scheme = url.getScheme();
++        return "about".equalsIgnoreCase(scheme) || isRawInternalUrl(url.getSpec());
++    }
++
++    static boolean isRawInternalUrl(@Nullable String text) {
++        if (text == null) return false;
++        String trimmed = text.trim().toLowerCase(Locale.US);
++        return trimmed.startsWith("chrome-native:")
++                || trimmed.startsWith("chrome:")
++                || trimmed.startsWith("about:");
++    }
++
++    private static String safeDisplayText(@Nullable CharSequence text) {
++        if (text == null) return "";
++        String value = text.toString().trim();
++        if (value.isEmpty() || isRawInternalUrl(value)) return "";
++        return value;
++    }
++
++    /**
++     * Text in the address field. An empty url bar is the real state (the hint is showing) and
++     * is not replaced by the location-bar container.
++     */
++    private @Nullable CharSequence shownBarText() {
+         View url = mActivity.findViewById(R.id.url_bar);
+-        if (url instanceof TextView urlText) {
+-            CharSequence shown = urlText.getText();
+-            if (shown != null && shown.length() > 0) {
+-                cached = shown.toString();
+-                mCachedBarUrl = cached;
+-                return cached;
+-            }
+-        }
++        if (url instanceof TextView urlText) return urlText.getText();
+         View location = mActivity.findViewById(R.id.location_bar);
+-        if (location instanceof TextView locationText) {
+-            CharSequence shown = locationText.getText();
+-            if (shown != null && shown.length() > 0) {
+-                cached = shown.toString();
+-                mCachedBarUrl = cached;
+-                return cached;
+-            }
+-        }
++        if (location instanceof TextView locationText) return locationText.getText();
++        return null;
++    }
++
++    private @Nullable CharSequence shownBarHint() {
++        View url = mActivity.findViewById(R.id.url_bar);
++        if (url instanceof TextView urlText) return urlText.getHint();
++        View location = mActivity.findViewById(R.id.location_bar);
++        if (location instanceof TextView locationText) return locationText.getHint();
++        return null;
++    }
++
++    private @Nullable Tab currentTab() {
+         TabModel model = currentModel();
+-        if (model != null) {
+-            int index = model.index();
+-            if (index >= 0 && index < model.getCount()) {
+-                Tab tab = model.getTabAt(index);
+-                if (tab != null
+-                        && tab.getUrl() != null
+-                        && !TextUtils.isEmpty(tab.getUrl().getSpec())) {
+-                    cached = tab.getUrl().getSpec();
+-                    mCachedBarUrl = cached;
+-                    return cached;
+-                }
+-            }
++        if (model == null) return null;
++        int index = model.index();
++        if (index < 0 || index >= model.getCount()) return null;
++        return model.getTabAt(index);
++    }
++
++    private CharSequence cachedBarUrl() {
++        if (mCachedBarUrl != null) return mCachedBarUrl;
++        Tab tab = currentTab();
++        GURL url = tab == null ? null : tab.getUrl();
++        CharSequence barText = shownBarText();
++        CharSequence hint = shownBarHint();
++        CharSequence title = tab == null ? null : tab.getTitle();
++        boolean rawBar = isRawInternalUrl(barText == null ? null : barText.toString());
++        String resolved;
++        if (isHintPage(url) || rawBar || TextUtils.isEmpty(barText)) {
++            resolved = originPillLabel(url, barText, hint, title);
++        } else {
++            resolved = barText.toString();
+         }
+-        cached = mOriginLabel;
+-        mCachedBarUrl = cached;
+-        return cached;
++        if (!resolved.isEmpty()) mCachedBarUrl = resolved;
++        return resolved;
+     }
+ 
+     /** Width of the 32dp pill from the host, not from the full URL shown mid-morph. */
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 0c225be28d..991a4a8cdd 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -630,6 +630,76 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertTrue(count.getText().toString().contains("2"));
+     }
+ 
++    @Test
++    public void testOriginPillLabelUsesTheHintForInternalPagesAndTheHostForHttps() {
++        String hint = "Search DuckDuckGo (No AI) or type URL";
++        assertEquals(
++                hint,
++                BareVerticalTabsDrawer.originPillLabel(
++                        JUnitTestGURLs.NTP_NATIVE_URL, "", hint, "New tab"));
++        assertEquals(
++                hint,
++                BareVerticalTabsDrawer.originPillLabel(
++                        JUnitTestGURLs.NTP_NATIVE_URL, "chrome-native://newtab/", hint, "New tab"));
++        assertEquals(
++                hint,
++                BareVerticalTabsDrawer.originPillLabel(
++                        JUnitTestGURLs.NTP_URL, "chrome://newtab/", hint, "New tab"));
++        assertEquals(
++                hint,
++                BareVerticalTabsDrawer.originPillLabel(
++                        new org.chromium.url.GURL("chrome://flags/"),
++                        "chrome://flags/",
++                        hint,
++                        "Flags"));
++        assertEquals(
++                "Settings",
++                BareVerticalTabsDrawer.originPillLabel(
++                        new org.chromium.url.GURL("chrome://settings/"),
++                        "chrome://settings/",
++                        "",
++                        "Settings"));
++        assertEquals(
++                hint,
++                BareVerticalTabsDrawer.originPillLabel(null, "", hint, "New tab"));
++        assertEquals(
++                "www.one.com",
++                BareVerticalTabsDrawer.originPillLabel(
++                        JUnitTestGURLs.URL_1_WITH_PATH,
++                        "www.one.com/some_path.html",
++                        hint,
++                        "One"));
++        assertFalse(
++                BareVerticalTabsDrawer.originPillLabel(
++                                JUnitTestGURLs.NTP_NATIVE_URL,
++                                "chrome-native://newtab/",
++                                null,
++                                null)
++                        .contains("chrome"));
++    }
++
++    @Test
++    public void testTheMorphingPillShowsTheBarHintOnTheNewTabPage() {
++        when(mSecond.getUrl()).thenReturn(JUnitTestGURLs.NTP_NATIVE_URL);
++        when(mSecond.getTitle()).thenReturn("New tab");
++        TextView url = new TextView(mActivity);
++        url.setId(org.chromium.chrome.R.id.url_bar);
++        url.setText("");
++        url.setHint("Search DuckDuckGo (No AI) or type URL");
++        content().addView(url);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.02f);
++        TextView origin = (TextView) findTag("sheet_pill_origin");
++        assertEquals("Search DuckDuckGo (No AI) or type URL", origin.getText().toString());
++        mDrawer.updateToolbarPull(range * BareTabSheetSnap.HALF_RATIO);
++        assertEquals("Search DuckDuckGo (No AI) or type URL", origin.getText().toString());
++        mDrawer.updateToolbarPull(range);
++        assertEquals("Search DuckDuckGo (No AI) or type URL", origin.getText().toString());
++        assertFalse(origin.getText().toString().contains("chrome"));
++    }
++
+     @Test
+     public void testOpeningTheSheetSettlesAtHalf() {
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+-- 
+2.34.1
+
