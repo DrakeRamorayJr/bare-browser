@@ -1,0 +1,197 @@
+From 16009f172e09ba18453530ed30408adf5020d652 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:00:26 +0000
+Subject: [PATCH] Bare: square bottom corners on the bottom-bar tab sheet
+
+In bottom-bar Sheet mode the sheet keeps 20dp top corners but its
+bottom corners are now square, so its bottom edge sits flush with the
+12dp seam fill and the toolbar. The outline clip uses a custom convex
+path with the same radii, and the glass decor no longer clips to a
+rounded outline. Top-bar Sheet mode and the side drawer are unchanged.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 47 +++++++++++---
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 62 ++++++++++++++++++-
+ 2 files changed, 98 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 021e2ceb40..a05767e2cb 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -51,6 +51,7 @@ import android.widget.LinearLayout;
+ import android.widget.PopupMenu;
+ import android.graphics.Matrix;
+ import android.graphics.Outline;
++import android.graphics.Path;
+ import android.transition.AutoTransition;
+ import android.transition.TransitionManager;
+ import android.util.Size;
+@@ -348,6 +349,31 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             0, 0, view.getWidth(), view.getHeight(), mPageCornerRadius);
+                 }
+             };
++
++    /** Bottom-bar sheet clip: 20dp top corners, square bottom corners. */
++    private final Path mBottomBarSheetOutlinePath = new Path();
++    private final ViewOutlineProvider mBottomBarSheetOutline =
++            new ViewOutlineProvider() {
++                @Override
++                public void getOutline(View view, Outline outline) {
++                    int width = view.getWidth();
++                    int height = view.getHeight();
++                    if (width <= 0 || height <= 0) {
++                        outline.setRect(0, 0, Math.max(width, 0), Math.max(height, 0));
++                        return;
++                    }
++                    float radius = dp(20);
++                    mBottomBarSheetOutlinePath.reset();
++                    mBottomBarSheetOutlinePath.addRoundRect(
++                            0f,
++                            0f,
++                            width,
++                            height,
++                            new float[] {radius, radius, radius, radius, 0f, 0f, 0f, 0f},
++                            Path.Direction.CW);
++                    outline.setConvexPath(mBottomBarSheetOutlinePath);
++                }
++            };
+     private boolean mRefreshPosted;
+     // A model refresh arrived while a card was being dragged. Applied when the drag ends.
+     private boolean mRefreshPending;
+@@ -1612,19 +1638,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             return;
+         }
+         int radius = dp(20);
++        boolean fromTop = sheetFromTop();
+         GradientDrawable background = new GradientDrawable();
+         background.setColor(sheetSurfaceColor());
+-        // Rising over the bottom toolbar, the sheet is a card: the bottom corners match
+-        // the top. Dropping from a top bar, only the free bottom edge is round.
++        // A bottom-bar sheet meets the 12dp seam and the toolbar on one square edge.
++        // Round bottom corners leave a notch of the page. A top-bar sheet keeps a
++        // square top and a round bottom.
++        float top = fromTop ? 0f : radius;
++        float bottom = fromTop ? radius : 0f;
+         background.setCornerRadii(
+-                sheetFromTop()
+-                        ? new float[] {0f, 0f, 0f, 0f, radius, radius, radius, radius}
+-                        : new float[] {
+-                            radius, radius, radius, radius, radius, radius, radius, radius
+-                        });
++                new float[] {top, top, top, top, bottom, bottom, bottom, bottom});
+         panel.setBackground(background);
+         panel.setClipToOutline(true);
+-        panel.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
++        panel.setOutlineProvider(fromTop ? ViewOutlineProvider.BACKGROUND : mBottomBarSheetOutline);
++        panel.invalidateOutline();
+         applyActionsSurface();
+     }
+ 
+@@ -2359,6 +2386,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             decor.setPadding(0, 0, 0, 0);
+         }
+         if (w.getStatusBarColor() != Color.TRANSPARENT) w.setStatusBarColor(Color.TRANSPARENT);
++        // The blur window stays a rectangle. A rounded clip would notch the sheet
++        // above the seam and show the page in the bottom corners.
++        decor.setOutlineProvider(ViewOutlineProvider.BOUNDS);
++        if (decor.getClipToOutline()) decor.setClipToOutline(false);
+     }
+ 
+     private static void detachView(@Nullable View view) {
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 52ffc2d314..046a2ff1f0 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -21,11 +21,14 @@ import static org.mockito.Mockito.when;
+ import android.app.Activity;
+ import android.app.Dialog;
+ import android.graphics.Bitmap;
++import android.graphics.Outline;
++import android.os.Build;
+ import android.graphics.drawable.ColorDrawable;
+ import android.graphics.drawable.Drawable;
+ import android.graphics.drawable.GradientDrawable;
+ import android.view.Gravity;
+ import android.view.View;
++import android.view.ViewOutlineProvider;
+ import android.view.ViewGroup;
+ import android.view.WindowManager;
+ import android.view.accessibility.AccessibilityNodeInfo;
+@@ -2143,7 +2146,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         setAddressBarOnTop(false);
+         LinearLayout panel = openSheetLaidOut(px(400), px(800));
+         assertEquals(px(12), panelBottomMargin(panel));
+-        assertBottomCornersMatchTop(panel);
++        assertBottomCornersSquare(panel);
+ 
+         mDrawer.finishSheetDragForTesting(-10_000f);
+         mDrawer.finishAnimationForTesting();
+@@ -2213,11 +2216,64 @@ public class BareVerticalTabsDrawerUnitTest {
+         return ((FrameLayout.LayoutParams) panel.getLayoutParams()).bottomMargin;
+     }
+ 
+-    private void assertBottomCornersMatchTop(View panel) {
++    @Test
++    public void testBottomBarSheetSquaresItsBottomCornersInGlassAndNight() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            for (boolean night : new boolean[] {false, true}) {
++                setNightMode(night);
++                for (boolean glass : new boolean[] {false, true}) {
++                    if (mDrawer.isOpen()) {
++                        mDrawer.close();
++                        mDrawer.finishAnimationForTesting();
++                    }
++                    BareVerticalTabsDrawer.setGlassForTesting(glass);
++                    mDrawer.open();
++                    mDrawer.finishAnimationForTesting();
++                    View panel = (View) sheetActions(glass).getParent();
++                    View root = (View) panel.getParent();
++                    layoutOverlay(root, px(400), px(800));
++                    layoutOverlay(root, px(400), px(800));
++                    assertBottomCornersSquare(panel);
++                    if (glass) {
++                        Dialog dialog = mDrawer.glassWindowForTesting();
++                        assertNotNull(dialog);
++                        View decor = dialog.getWindow().getDecorView();
++                        assertFalse(decor.getClipToOutline());
++                        assertEquals(ViewOutlineProvider.BOUNDS, decor.getOutlineProvider());
++                    }
++                }
++            }
++        } finally {
++            setNightMode(false);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            if (mDrawer.isOpen()) {
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++        }
++    }
++
++    private void assertBottomCornersSquare(View panel) {
+         float[] radii = ((GradientDrawable) panel.getBackground()).getCornerRadii();
+         assertNotNull(radii);
+         float radius = px(20);
+-        for (float corner : radii) assertEquals(radius, corner, 0.6f);
++        for (int i = 0; i < 4; i++) assertEquals(radius, radii[i], 0.6f);
++        for (int i = 4; i < 8; i++) assertEquals(0f, radii[i], 0.6f);
++        assertTrue(panel.getClipToOutline());
++        assertNotEquals(ViewOutlineProvider.BACKGROUND, panel.getOutlineProvider());
++        assertTrue(panel.getWidth() > 0);
++        assertTrue(panel.getHeight() > 0);
++        Outline outline = new Outline();
++        panel.getOutlineProvider().getOutline(panel, outline);
++        // API 29 does not clip this convex path (canClip is false). The drawable
++        // radii above are the corners on that SDK. Newer SDKs clip the path.
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++            assertTrue(outline.canClip());
++            float outlineRadius = outline.getRadius();
++            assertTrue("outline radius " + outlineRadius, outlineRadius < 1f);
++        }
+     }
+ 
+     private View attachPage() {
+-- 
+2.34.1
+
