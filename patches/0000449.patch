@@ -1,0 +1,182 @@
+From db5c116217cc6f9a4b3cf5dc78a51f509db56743 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 03:43:46 +0000
+Subject: [PATCH] Bare: hide the site icon and the in-bar progress line while
+ the bar morphs into the sheet pill.
+
+The site icon is its own view at the end of a secure page, and the loading and download line is drawn by the pill drawable. A toolbar capture still paints that drawable while its view is INVISIBLE. Both stay out during the morph and come back when the sheet closes.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 17 +++++
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 64 +++++++++++++++++++
+ .../browser_ui/widget/BareProgressLine.java   | 15 +++++
+ 3 files changed, 96 insertions(+)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 9ba6768cb7..fcc191cf43 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -260,6 +260,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private int mSavedLocationVis = View.VISIBLE;
+     private int mSavedUrlVis = View.VISIBLE;
+     private int mSavedBgVis = View.GONE;
++    private int mSavedStatusVis = View.VISIBLE;
++    private int mSavedFaviconVis = View.GONE;
++    private int mSavedSiteButtonVis = View.GONE;
+     private int mBarWidthPx;
+     private int mBarHeightPx;
+     private float mBarLeftPx;
+@@ -4013,22 +4016,36 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         View location = mActivity.findViewById(R.id.location_bar);
+         View url = mActivity.findViewById(R.id.url_bar);
+         View background = mActivity.findViewById(R.id.location_bar_background_view);
++        // The site icon sits in the status view, and again at the end of the bar on a secure page.
++        // Both are hidden with the bar so neither stays up over the travelling pill.
++        View status = mActivity.findViewById(R.id.location_bar_status);
++        View favicon = mActivity.findViewById(R.id.location_bar_site_favicon);
++        View siteButton = mActivity.findViewById(R.id.location_bar_site_settings_button);
+         if (hidden) {
+             if (!mAddressCaptured) {
+                 mAddressCaptured = true;
+                 if (location != null) mSavedLocationVis = location.getVisibility();
+                 if (url != null) mSavedUrlVis = url.getVisibility();
+                 if (background != null) mSavedBgVis = background.getVisibility();
++                if (status != null) mSavedStatusVis = status.getVisibility();
++                if (favicon != null) mSavedFaviconVis = favicon.getVisibility();
++                if (siteButton != null) mSavedSiteButtonVis = siteButton.getVisibility();
+             }
+             hideAddressView(location);
+             hideAddressView(url);
+             hideAddressView(background);
++            hideAddressView(status);
++            hideAddressView(favicon);
++            hideAddressView(siteButton);
+             return;
+         }
+         if (!mAddressCaptured) return;
+         restoreAddressView(location, mSavedLocationVis);
+         restoreAddressView(url, mSavedUrlVis);
+         restoreAddressView(background, mSavedBgVis);
++        restoreAddressView(status, mSavedStatusVis);
++        restoreAddressView(favicon, mSavedFaviconVis);
++        restoreAddressView(siteButton, mSavedSiteButtonVis);
+         mAddressCaptured = false;
+     }
+ 
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 991a4a8cdd..548b4daa15 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1194,6 +1194,70 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(View.VISIBLE, bar.getVisibility());
+     }
+ 
++    @Test
++    public void testTheMorphHidesTheSiteIconAndTheInBarProgressLine() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int barW = px(280);
++        int barH = px(48);
++        android.widget.TextView bar = new android.widget.TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/");
++        content().addView(bar, new FrameLayout.LayoutParams(barW, barH, Gravity.BOTTOM));
++
++        View background = new View(mActivity);
++        background.setId(org.chromium.chrome.R.id.location_bar_background_view);
++        android.graphics.drawable.ColorDrawable pill = new android.graphics.drawable.ColorDrawable(0xFF123456);
++        background.setBackground(pill);
++        content().addView(background, new FrameLayout.LayoutParams(barW, barH, Gravity.BOTTOM));
++
++        android.widget.ImageView status = new android.widget.ImageView(mActivity);
++        status.setId(org.chromium.chrome.R.id.location_bar_status);
++        content().addView(status, new FrameLayout.LayoutParams(px(24), px(24), Gravity.BOTTOM));
++
++        android.widget.ImageView favicon = new android.widget.ImageView(mActivity);
++        favicon.setId(org.chromium.chrome.R.id.location_bar_site_favicon);
++        content().addView(favicon, new FrameLayout.LayoutParams(px(16), px(16), Gravity.BOTTOM));
++
++        android.widget.ImageView siteButton = new android.widget.ImageView(mActivity);
++        siteButton.setId(org.chromium.chrome.R.id.location_bar_site_settings_button);
++        content().addView(siteButton, new FrameLayout.LayoutParams(px(40), px(40), Gravity.BOTTOM));
++
++        org.chromium.components.browser_ui.widget.BareProgressLine.setPage(0.4f, 1f);
++        assertTrue(org.chromium.components.browser_ui.widget.BareProgressLine.draws(pill));
++
++        mDrawer.beginToolbarPull();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        content().measure(
++                View.MeasureSpec.makeMeasureSpec(px(400), View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(px(800), View.MeasureSpec.EXACTLY));
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        int range = root.getHeight() - sheetGap();
++        mDrawer.updateToolbarPull(range * 0.05f);
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.05f);
++
++        assertEquals(View.INVISIBLE, bar.getVisibility());
++        assertEquals(View.INVISIBLE, background.getVisibility());
++        assertEquals(View.INVISIBLE, status.getVisibility());
++        assertEquals(View.INVISIBLE, favicon.getVisibility());
++        assertEquals(View.INVISIBLE, siteButton.getVisibility());
++        assertFalse(org.chromium.components.browser_ui.widget.BareProgressLine.draws(pill));
++
++        mDrawer.updateToolbarPull(-range);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.VISIBLE, bar.getVisibility());
++        assertEquals(View.VISIBLE, background.getVisibility());
++        assertEquals(View.VISIBLE, status.getVisibility());
++        assertEquals(View.VISIBLE, favicon.getVisibility());
++        assertEquals(View.VISIBLE, siteButton.getVisibility());
++        assertTrue(org.chromium.components.browser_ui.widget.BareProgressLine.draws(pill));
++        org.chromium.components.browser_ui.widget.BareProgressLine.setPage(0f, 0f);
++    }
++
+     @Test
+     public void testLettingGoOfAToolbarPullSnapsToTheNearestStop() {
+         setAddressBarOnTop(false);
+diff --git a/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/BareProgressLine.java b/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/BareProgressLine.java
+index d5cb3ea991..000bfd7dd8 100644
+--- a/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/BareProgressLine.java
++++ b/components/browser_ui/widget/android/java/src/org/chromium/components/browser_ui/widget/BareProgressLine.java
+@@ -203,6 +203,19 @@ public final class BareProgressLine {
+         return sText != null && sShown;
+     }
+ 
++    /**
++     * The line is painted by the pill drawable. A toolbar capture still draws that drawable while
++     * its view is {@link View#INVISIBLE}, because the capture only skips {@code GONE}. The sheet
++     * morph hides the address bar that way, so the line and the download words stay out until the
++     * view is visible again.
++     */
++    public static boolean draws(Drawable owner) {
++        if (owner.getCallback() instanceof View view) {
++            return view.getVisibility() == View.VISIBLE;
++        }
++        return true;
++    }
++
+     /**
+      * Draws the download words in the middle of the address field, if there are any. The field
+      * lies between the site icon and the buttons at the end of the pill, so nothing is drawn over
+@@ -216,6 +229,7 @@ public final class BareProgressLine {
+             boolean rtl,
+             float density,
+             Drawable owner) {
++        if (!draws(owner)) return;
+         String full = sText;
+         if (full == null || !sShown) return;
+         pill.computeBounds(sBounds, true);
+@@ -289,6 +303,7 @@ public final class BareProgressLine {
+      */
+     public static void draw(
+             Canvas canvas, Path pill, boolean rtl, boolean darkPill, float density, Drawable owner) {
++        if (!draws(owner)) return;
+         float fraction;
+         float alpha = 1f;
+         int color;
+-- 
+2.34.1
+
