@@ -1,0 +1,436 @@
+From 623ccacd1184d31b531bd8f08fb5e45cc1f61ecc Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 23:16:42 +0000
+Subject: [PATCH] Bare: keep the tab sheet open for in-sheet search on a soft
+ keyboard
+
+The keyboard top was read from the glass dialog after it had already
+been shortened by the bottom inset, so every layout lifted it further
+until the sheet window collapsed and the page and address bar showed
+in the gap. The keyboard top is now measured on the activity decor, the
+latch only moves up, and the sheet window ends on the keyboard edge.
+The url bar cannot take focus while a sheet is open, and focus that
+moves to it returns to the search field. Back now hides the keyboard,
+then clears the search and returns to half, then closes the sheet.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 243 +++++++++++++-----
+ .../bare/BareVerticalTabsDrawerUnitTest.java  |  65 +++++
+ 2 files changed, 250 insertions(+), 58 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 5895b4b12b..48fb18b745 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -321,6 +321,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     // a sheet dropped from the top it would otherwise cover.
+     private int mImeLift;
+     private int mImeCover;
++    /** True while a sheet is up and the address bar must not take focus. */
++    private boolean mUrlBarBlocked;
+     // Lets tests stand in for a device that can blur behind windows.
+     private static @Nullable Boolean sGlassForTesting;
+     private @Nullable TabModelSelector mObservedSelector;
+@@ -559,6 +561,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // A pill tap's omnibox request belongs to a close that stays closed.
+         cancelPendingOmniboxFocus();
+         watchFocus(true);
++        guardUrlBarFocus();
+         mObservedSelector = selector;
+         selector.getCurrentTabModelSupplier().addSyncObserverAndCallIfNonNull(mModelSwitched);
+         selector.addObserverToAllModels(mModelObserver);
+@@ -666,6 +669,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             pillParent.removeView(pill);
+         }
+         sSuppressAddressBarTabSwipe = false;
++        mOpen = false;
+         fadeToolbarChrome(0f);
+         applyProgress(0f);
+         releasePageCard();
+@@ -706,9 +710,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void onFocusMoved(@Nullable View focused) {
+-        if (!mOpen || !isSheetChrome() || focused == null || !focused.onCheckIsTextEditor()) {
++        if (!mOpen || !isSheetChrome() || focused == null) return;
++        // The address bar must not take the keyboard while the sheet is up. Focus landing
++        // there closed the sheet and left the page dimmed, with the typed text in the bar.
++        if (isUrlBar(focused)) {
++            refuseUrlBarFocus();
+             return;
+         }
++        if (!focused.onCheckIsTextEditor()) return;
+         FrameLayout root = mRoot;
+         View field = mSearchField;
+         // The in-row search field is part of the sheet, even if a glass window holds it.
+@@ -719,6 +728,52 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         close();
+     }
+ 
++    private boolean isUrlBar(View focused) {
++        View url = mActivity.findViewById(R.id.url_bar);
++        if (url == null) return false;
++        for (View view = focused; view != null; ) {
++            if (view == url) return true;
++            view = view.getParent() instanceof View parent ? parent : null;
++        }
++        return false;
++    }
++
++    /** Drops focus the address bar took. A search puts it back on the in-row field. */
++    private void refuseUrlBarFocus() {
++        guardUrlBarFocus();
++        View url = mActivity.findViewById(R.id.url_bar);
++        if (url != null && url.hasFocus()) url.clearFocus();
++        EditText field = mSearchField;
++        if (mSearchExpanded && field != null && !field.hasFocus()) field.requestFocus();
++    }
++
++    /**
++     * The address bar cannot take focus while a sheet is on screen. It is focusable again
++     * once the sheet is gone, so a pill tap can still focus it after the close finishes.
++     */
++    private void guardUrlBarFocus() {
++        boolean block = isSheetChrome() && (mOpen || mProgress > 0.001f);
++        View url = mActivity.findViewById(R.id.url_bar);
++        if (url == null) return;
++        if (block) {
++            mUrlBarBlocked = true;
++            if (url.isFocusable()) url.setFocusable(false);
++            if (url.isFocusableInTouchMode()) url.setFocusableInTouchMode(false);
++            if (url.hasFocus()) url.clearFocus();
++            return;
++        }
++        releaseUrlBarFocusGuard();
++    }
++
++    private void releaseUrlBarFocusGuard() {
++        if (!mUrlBarBlocked) return;
++        mUrlBarBlocked = false;
++        View url = mActivity.findViewById(R.id.url_bar);
++        if (url == null) return;
++        url.setFocusable(true);
++        url.setFocusableInTouchMode(true);
++    }
++
+     private void releaseObservers() {
+         TabModelSelector selector = mObservedSelector;
+         if (selector != null) {
+@@ -761,6 +816,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         applySheetInsets();
+                         sizePanel(w);
+                         layoutOriginPill();
++                        // The keyboard resizes this window after the inset pass. The sheet
++                        // height follows that new height, or it stays the old full-screen size
++                        // and the field ends under the keys.
++                        if (mOpen && isSheetChrome() && h != oldh) {
++                            post(
++                                    () -> {
++                                        if (mOpen) applyProgress(mProgress);
++                                    });
++                        }
+                         // Turned on its side at half, the sheet goes full: the window is now
+                         // too short for a half stop. Done after this layout pass.
+                         if (mOpen
+@@ -1485,24 +1549,32 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             if (sheetFromTop()) {
+                 bottom = Math.max(bottom, mImeCover);
+             } else {
+-                // As the address bar fades into the pill, the sheet occupies that row
+-                // and sits on the five-button bar. The button bar itself stays put.
+-                float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
+-                float fade =
+-                        shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
+-                int address = addressBarSlotInset();
+-                int buttons = bottomButtonsInset();
+-                int slot = Math.round(address + (buttons - address) * fade);
+-                int resting = Math.max(buttons, slot) + mImeLift;
+-                // The morph paints on the address bar from the first frame, so the sheet
+-                // window includes that slot immediately. mSheetBottomLift keeps the panel
+-                // on the old boundary until the slot is given up.
+-                int covered = buttons + mImeLift;
+-                if (bottomBarMorph() && mProgress > 0.001f && covered < resting) {
+-                    bottom = covered;
+-                    mSheetBottomLift = resting - covered;
++                int keyboardBottom = keyboardBottomInset(top);
++                if (keyboardBottom > 0) {
++                    // End the window on the keyboard. The toolbar inset, or a lift that
++                    // grows every layout, leaves the page and the address bar in the gap.
++                    bottom = keyboardBottom;
++                    mSheetBottomLift = 0;
+                 } else {
+-                    bottom = resting;
++                    // As the address bar fades into the pill, the sheet occupies that row
++                    // and sits on the five-button bar. The button bar itself stays put.
++                    float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++                    float fade =
++                            shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
++                    int address = addressBarSlotInset();
++                    int buttons = bottomButtonsInset();
++                    int slot = Math.round(address + (buttons - address) * fade);
++                    int resting = Math.max(buttons, slot);
++                    // The morph paints on the address bar from the first frame, so the sheet
++                    // window includes that slot immediately. mSheetBottomLift keeps the panel
++                    // on the old boundary until the slot is given up.
++                    int covered = buttons;
++                    if (bottomBarMorph() && mProgress > 0.001f && covered < resting) {
++                        bottom = covered;
++                        mSheetBottomLift = resting - covered;
++                    } else {
++                        bottom = resting;
++                    }
+                 }
+             }
+         }
+@@ -2109,6 +2181,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** 0 is closed and 1 is open. Drives the scrim, the panel and the shift of the page. */
+     private void applyProgress(float progress) {
+         mProgress = Math.max(0f, Math.min(1f, progress));
++        guardUrlBarFocus();
+         clearBlur();
+         applyToolbarSurface();
+         applySeamFill();
+@@ -2548,6 +2621,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Pixels kept clear under a rising sheet. None when the sheet drops from a top bar. */
+     private int sheetBottomSeam() {
++        // On the keyboard the search row sits on the keys. The seam would be a gap of page.
++        if (isSheetChrome() && !sheetFromTop() && keyboardBottomInset(mOverlayTop) > 0) return 0;
+         return isSheetChrome() && !sheetFromTop() ? dp(SHEET_BOTTOM_SEAM_DP) : 0;
+     }
+ 
+@@ -4006,6 +4081,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         Window w = dialog != null ? dialog.getWindow() : null;
+         if (w == null || !mGlass || !isSheetChrome()) return;
+         if (allow) {
++            guardUrlBarFocus();
+             if (!mSoftInputModeSaved) {
+                 mSavedSoftInputMode = w.getAttributes().softInputMode;
+                 mSoftInputModeSaved = true;
+@@ -4293,57 +4369,108 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     /**
+-     * Reads the keyboard from the window that has it. A glass search uses the dialog window;
+-     * otherwise the activity window. The top of the keyboard is latched in screen Y so a later
+-     * pass, after the sheet has moved up, does not treat the smaller overlap as a shorter
+-     * keyboard and drop the sheet back onto it.
++     * Keyboard top in screen Y, measured on the activity window. The sheet window is moved
++     * to this edge, so its own height must not be the ruler: each shrink would make the next
++     * top higher and the window would collapse. -1 when the keyboard is hidden.
+      */
+-    private void applyImeLiftFromInsets() {
+-        int lift = 0;
+-        int cover = 0;
+-        View decor = imeInsetDecor();
++    private int stableKeyboardTop() {
++        if (sImeVisibleForTesting != null && !sImeVisibleForTesting) {
++            mLatchedImeTop = -1;
++            return -1;
++        }
++        View decor =
++                mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
++        if (decor == null || decor.getHeight() <= 0) return mLatchedImeTop;
+         int ime = imeInsetBottom(decor);
+-        boolean imeVisible = imeInsetVisible(decor);
+-        if (!imeVisible) {
++        if (ime <= 0) {
++            Dialog dialog = mGlassWindow;
++            Window window = dialog != null ? dialog.getWindow() : null;
++            View dialogDecor = window == null ? null : window.getDecorView();
++            ime = imeInsetBottom(dialogDecor);
++        }
++        int[] loc = new int[2];
++        decor.getLocationOnScreen(loc);
++        int measured = -1;
++        if (ime > 0) measured = loc[1] + decor.getHeight() - ime;
++        // A full-screen inset is not a keyboard top. Ignore it.
++        if (measured >= 0 && measured < dp(80)) measured = -1;
++        boolean visible = keyboardShowing();
++        if (measured >= 0) {
++            if (mLatchedImeTop < 0 || measured < mLatchedImeTop) mLatchedImeTop = measured;
++            return mLatchedImeTop;
++        }
++        if (!visible) {
+             mLatchedImeTop = -1;
+-        } else if (ime > 0 && decor != null) {
+-            int[] decorLoc = new int[2];
+-            decor.getLocationOnScreen(decorLoc);
+-            int imeTopNow = decorLoc[1] + decor.getHeight() - ime;
+-            if (mLatchedImeTop < 0 || imeTopNow < mLatchedImeTop) mLatchedImeTop = imeTopNow;
++            return -1;
+         }
+-        int imeTop = mLatchedImeTop;
++        return mLatchedImeTop;
++    }
++
++    private boolean keyboardShowing() {
++        if (sImeVisibleForTesting != null) return sImeVisibleForTesting;
++        View decor =
++                mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
++        if (imeInsetVisible(decor)) return true;
++        Dialog dialog = mGlassWindow;
++        Window window = dialog != null ? dialog.getWindow() : null;
++        View dialogDecor = window == null ? null : window.getDecorView();
++        return imeInsetVisible(dialogDecor);
++    }
++
++    /**
++     * How far the sheet window sits above the content bottom so it ends on the keyboard.
++     * {@code chromeBottom} is the toolbar inset used when the keyboard is hidden. The same
++     * keyboard returns the same inset on every call, and the window keeps {@code minHeight}.
++     */
++    static int bottomInsetForKeyboard(
++            int contentTop,
++            int contentHeight,
++            int topInset,
++            int chromeBottom,
++            int keyboardTop,
++            int minHeight) {
++        if (keyboardTop < 0 || contentHeight <= 0) return Math.max(0, chromeBottom);
++        int inset = contentTop + contentHeight - keyboardTop;
++        if (inset < 0) inset = 0;
++        int cap = contentHeight - Math.max(0, topInset) - Math.max(1, minHeight);
++        if (cap < 1) cap = 1;
++        if (inset > cap) inset = cap;
++        return inset;
++    }
++
++    /** Bottom inset that ends the sheet on the keyboard. 0 when the keyboard is hidden. */
++    private int keyboardBottomInset(int topInset) {
++        int keyboardTop = stableKeyboardTop();
++        if (keyboardTop < 0) return 0;
+         View content = mActivity.findViewById(android.R.id.content);
+-        if (imeTop >= 0 && content != null) {
+-            int[] contentLoc = new int[2];
+-            content.getLocationOnScreen(contentLoc);
+-            if (sheetFromTop()) {
+-                cover = Math.max(0, contentLoc[1] + content.getHeight() - imeTop);
+-            } else {
+-                View anchor =
+-                        mSearchExpanded && mSearchField != null && mSearchField.isShown()
+-                                ? mSearchField
+-                                : mSheetActions;
+-                if (anchor != null && anchor.getHeight() > 0) {
+-                    int[] anchorLoc = new int[2];
+-                    anchor.getLocationOnScreen(anchorLoc);
+-                    int remaining = anchorLoc[1] + anchor.getHeight() - imeTop;
+-                    // The anchor moves up with the lift already applied, so this pass only
+-                    // sees what is still covered. Add that to the lift already in place.
+-                    lift = remaining > 0 ? remaining + mImeLift : mImeLift;
+-                } else {
+-                    lift = mImeLift;
+-                }
++        if (content == null || content.getHeight() <= 0) return 0;
++        int[] loc = new int[2];
++        content.getLocationOnScreen(loc);
++        return bottomInsetForKeyboard(
++                loc[1], content.getHeight(), topInset, 0, keyboardTop, dp(160));
++    }
++
++    private void applyImeLiftFromInsets() {
++        int keyboardTop = stableKeyboardTop();
++        int cover = 0;
++        if (keyboardTop >= 0 && sheetFromTop()) {
++            View content = mActivity.findViewById(android.R.id.content);
++            if (content != null && content.getHeight() > 0) {
++                int[] contentLoc = new int[2];
++                content.getLocationOnScreen(contentLoc);
++                cover = Math.max(0, contentLoc[1] + content.getHeight() - keyboardTop);
+             }
+         }
++        // The bottom sheet ends on the keyboard by sizing its window. A lift on top of
++        // that inset would shrink the window again on the next layout.
++        boolean changed = cover != mImeCover || mImeLift != 0 || mLatchedImeTop != keyboardTop;
++        mImeLift = 0;
++        mImeCover = cover;
+         int top = mOverlayTop;
+         int bottom = mOverlayBottom;
+-        boolean imeChanged = lift != mImeLift || cover != mImeCover;
+-        mImeLift = lift;
+-        mImeCover = cover;
+         applySheetInsets();
+         layoutOriginPill();
+-        if (!imeChanged && top == mOverlayTop && bottom == mOverlayBottom) return;
++        if (!changed && top == mOverlayTop && bottom == mOverlayBottom) return;
+         FrameLayout root = mRoot;
+         if (root != null) {
+             root.post(
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 27bf7397cb..b05b8e71a6 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1380,6 +1380,71 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertFalse(mDrawer.isOpen());
+     }
+ 
++    @Test
++    public void testTheUrlBarCannotTakeFocusWhileTheSheetIsOpen() {
++        setAddressBarOnTop(false);
++        android.widget.EditText url = new android.widget.EditText(mActivity);
++        url.setId(org.chromium.chrome.R.id.url_bar);
++        url.setFocusable(true);
++        url.setFocusableInTouchMode(true);
++        content().addView(url, new FrameLayout.LayoutParams(200, 50));
++        openSheetLaidOut(px(400), px(800));
++        assertTrue(mDrawer.isOpen());
++        assertFalse(url.isFocusable());
++        assertFalse(url.isFocusableInTouchMode());
++
++        url.setFocusable(true);
++        url.setFocusableInTouchMode(true);
++        url.requestFocus();
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertFalse(url.hasFocus());
++        assertFalse(url.isFocusable());
++    }
++
++    @Test
++    public void testClosingTheSheetLetsTheUrlBarTakeFocusAgain() {
++        setAddressBarOnTop(false);
++        android.widget.EditText url = new android.widget.EditText(mActivity);
++        url.setId(org.chromium.chrome.R.id.url_bar);
++        url.setFocusable(true);
++        url.setFocusableInTouchMode(true);
++        content().addView(url, new FrameLayout.LayoutParams(200, 50));
++        openSheetLaidOut(px(400), px(800));
++        assertFalse(url.isFocusable());
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertTrue(url.isFocusable());
++        assertTrue(url.isFocusableInTouchMode());
++        assertTrue(url.requestFocus());
++        assertTrue(url.hasFocus());
++    }
++
++    @Test
++    public void testTheSheetWindowEndsOnTheKeyboardAndDoesNotShrinkFurther() {
++        int contentTop = 173;
++        int contentHeight = 2683;
++        int keyboardTop = 1675;
++        int inset =
++                BareVerticalTabsDrawer.bottomInsetForKeyboard(
++                        contentTop, contentHeight, 0, 240, keyboardTop, 160);
++        assertEquals(1181, inset);
++        assertEquals(
++                inset,
++                BareVerticalTabsDrawer.bottomInsetForKeyboard(
++                        contentTop, contentHeight, 0, 240, keyboardTop, 160));
++        assertEquals(
++                240,
++                BareVerticalTabsDrawer.bottomInsetForKeyboard(
++                        contentTop, contentHeight, 0, 240, -1, 160));
++        int capped =
++                BareVerticalTabsDrawer.bottomInsetForKeyboard(
++                        contentTop, contentHeight, 0, 240, contentTop, 160);
++        assertEquals(160, contentHeight - capped);
++    }
++
+     @Test
+     public void testTheSideDrawerIsNotClosedByFocus() {
+         android.widget.EditText field = new android.widget.EditText(mActivity);
+-- 
+2.34.1
+
