@@ -1,0 +1,902 @@
+From 90f9d0c7d1dd566b49918ae05bde174cbb3ad97b Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:48:17 +0000
+Subject: [PATCH] Bare: paint the bottom tab sheet with the live bar colour
+
+The bottom-bar tab sheet used a hardcoded purple-seed container
+(#F1EDF6 / #1C1A20) and blended the bottom button bar toward it, so the
+sheet read pink against the bar. The page card backdrop also showed
+black in the gesture inset while the sheet was up.
+
+The bottom-bar sheet, seam and action row now take the opaque colour the
+bottom bar actually paints (bottom bar, toolbar, control container,
+then the incognito-aware surface container high). The pill and search
+field follow the omnibox fill. The toolbar is no longer blended while
+the sheet is up. The navigation bar blends to the sheet surface with
+progress and is restored on close; the page backdrop is clipped off the
+navigation inset and the page parent is painted with the sheet colour.
+
+Top-bar sheet and the side drawer keep their colours.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 451 ++++++++++++++++--
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 226 ++++++++-
+ 2 files changed, 632 insertions(+), 45 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index fcc191cf43..ff39185003 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -17,6 +17,7 @@ import android.os.Bundle;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+ import android.graphics.Color;
++import android.graphics.Rect;
+ import android.graphics.Typeface;
+ import android.graphics.drawable.ColorDrawable;
+ import android.graphics.drawable.Drawable;
+@@ -86,6 +87,8 @@ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.R;
+ import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
+ import org.chromium.components.browser_ui.styles.ChromeColors;
++import org.chromium.components.browser_ui.styles.IncognitoColors;
++import org.chromium.components.browser_ui.styles.SemanticColorUtils;
+ import org.chromium.ui.util.ColorUtils;
+ import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
+ import org.chromium.chrome.browser.logo.BareAnimatedLogo;
+@@ -253,8 +256,17 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private int mSheetBottomLift;
+     // Bottom toolbar fill saved while a rising sheet tints that bar to the sheet surface.
+     private @Nullable Drawable mHeldToolbarBackground;
+-    private @ColorInt int mHeldToolbarColor;
+     private boolean mToolbarSurfaceHeld;
++    // Navigation bar colour saved while a bottom-bar sheet is up.
++    private boolean mNavBarHeld;
++    private @ColorInt int mSavedNavBarColor;
++    private boolean mSavedLightNavBar;
++    private boolean mHaveSavedLightNavBar;
++    /** True once {@link #readBarChrome} has copied an opaque omnibox fill. */
++    private boolean mBarFillCaptured;
++    private boolean mFamilyApplied;
++    private boolean mAppliedFamilyBottom;
++    private @ColorInt int mAppliedFamilyColor;
+     private @Nullable View mSeamFill;
+     private boolean mAddressCaptured;
+     private int mSavedLocationVis = View.VISIBLE;
+@@ -374,6 +386,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private @ColorInt int mStatusBarScrimColor = Color.TRANSPARENT;
+     // Page under a bottom sheet: scaled, rounded, with a black surround behind it.
+     private @Nullable View mPageBackdrop;
++    private @Nullable View mPageParentPainted;
++    private @Nullable Drawable mHeldPageParentBackground;
++    private boolean mPageParentColorSet;
++    private int mPageParentColor;
++    private @Nullable View mBackdropClipView;
++    private int mBackdropClipW = -1;
++    private int mBackdropClipB = -1;
+     private @Nullable View mPageShade;
+     private float mPageCornerRadius;
+     // Local y of the card's top, so the gap under the status bar is backdrop.
+@@ -534,6 +553,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return mProgress;
+     }
+ 
++    @ColorInt
++    int sheetSurfaceColorForTesting() {
++        return sheetSurfaceColor();
++    }
++
++    void applyProgressForTesting(float progress) {
++        applyProgress(progress);
++    }
++
++    void setBottomInsetForTesting(int insetPx) {
++        mBottomInset = insetPx;
++    }
++
+     void finishAnimationForTesting() {
+         ValueAnimator back = mBackAnimator;
+         if (back != null) back.end();
+@@ -2098,61 +2130,221 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         panel.setOutlineProvider(fromTop ? ViewOutlineProvider.BACKGROUND : mBottomBarSheetOutline);
+         panel.invalidateOutline();
+         applyActionsSurface();
++        applyBottomSheetFamilyColors();
+     }
+ 
+     /**
+-     * Fill shared by the sheet, the seam and the toolbar. Opaque when glass is on too:
+-     * a translucent tint composited over the page is a different tone from the opaque seam.
++     * Fill shared by the sheet, the seam and, while a bottom-bar sheet is up, the navigation bar.
++     * A bottom-bar sheet reads the colour the bottom chrome is already painting. A top-bar sheet
++     * keeps the previous fill. Opaque when glass is on too: a translucent tint over the page is a
++     * different tone from the opaque seam.
+      */
+     private @ColorInt int sheetSurfaceColor() {
+-        return color(0xFF1C1A20, 0xFFF1EDF6);
++        if (sheetFromTop()) return color(0xFF1C1A20, 0xFFF1EDF6);
++        return liveBottomChromeColor();
+     }
+ 
+-    /** Same colour as {@link #sheetSurfaceColor()}, so the seam and the toolbar match the sheet. */
++    /** Same colour as {@link #sheetSurfaceColor()}, so the seam and the sheet match. */
+     private @ColorInt int sheetJoinedSurfaceColor() {
+         return sheetSurfaceColor();
+     }
+ 
+     /**
+-     * Paints the action row with the panel fill. The old flat opaque color stayed put when
+-     * glass was on, so the row read as a second surface.
++     * Colour the five-button bar or the address-bar row is painting. When that drawable is
++     * transparent, the theme colour {@code ToolbarManager} uses for the bottom bar.
++     */
++    private @ColorInt int liveBottomChromeColor() {
++        int painted = opaqueBackgroundColor(bottomButtonBar());
++        if (painted != 0) return painted;
++        painted = opaqueBackgroundColor(mActivity.findViewById(R.id.toolbar));
++        if (painted != 0) return painted;
++        painted = opaqueBackgroundColor(mActivity.findViewById(R.id.control_container));
++        if (painted != 0) return painted;
++        return themeBottomChromeColor();
++    }
++
++    private static @ColorInt int opaqueBackgroundColor(@Nullable View view) {
++        if (view == null) return 0;
++        return opaqueDrawableColor(view.getBackground());
++    }
++
++    private static @ColorInt int opaqueDrawableColor(@Nullable Drawable drawable) {
++        if (drawable instanceof ColorDrawable color) {
++            int value = color.getColor();
++            if (Color.alpha(value) == 255) return value;
++        }
++        if (drawable instanceof GradientDrawable gradient && gradient.getColor() != null) {
++            int value = gradient.getColor().getDefaultColor();
++            if (Color.alpha(value) == 255) return value;
++        }
++        return 0;
++    }
++
++    /**
++     * Same source as {@code ToolbarManager}'s default for a bottom or minimal bar, including
++     * incognito. The baseline GM3 container-high colour is only the fallback when the theme has
++     * no surface attribute.
++     */
++    private @ColorInt int themeBottomChromeColor() {
++        try {
++            return IncognitoColors.getColorSurfaceContainerHigh(mActivity, currentIncognito());
++        } catch (IllegalArgumentException ignored) {
++            return baselineContainerColor(/* highest= */ false);
++        }
++    }
++
++    /** Omnibox step above the bar fill, used when the real pill drawable cannot be read. */
++    private @ColorInt int omniboxFallbackColor() {
++        try {
++            return IncognitoColors.getColorSurfaceContainerHighest(mActivity, currentIncognito());
++        } catch (IllegalArgumentException ignored) {
++            return baselineContainerColor(/* highest= */ true);
++        }
++    }
++
++    private @ColorInt int baselineContainerColor(boolean highest) {
++        boolean night = isNight();
++        int id;
++        if (highest) {
++            id =
++                    night
++                            ? org.chromium.components.browser_ui.styles.R.color
++                                    .gm3_baseline_surface_container_highest_dark
++                            : org.chromium.components.browser_ui.styles.R.color
++                                    .gm3_baseline_surface_container_highest_light;
++        } else {
++            id =
++                    night
++                            ? org.chromium.components.browser_ui.styles.R.color
++                                    .gm3_baseline_surface_container_high_dark
++                            : org.chromium.components.browser_ui.styles.R.color
++                                    .gm3_baseline_surface_container_high_light;
++        }
++        return mActivity.getColor(id);
++    }
++
++    /** Ink for text and icons on the sheet: the theme on-surface, or black or white. */
++    private @ColorInt int themeOnSurface() {
++        try {
++            return SemanticColorUtils.getColorOnSurface(mActivity);
++        } catch (IllegalArgumentException ignored) {
++            return ColorUtils.shouldUseLightForegroundOnBackground(sheetSurfaceColor())
++                    ? Color.WHITE
++                    : Color.BLACK;
++        }
++    }
++
++    private boolean currentIncognito() {
++        TabModelSelector selector = mSelectorSupplier.get();
++        if (selector == null) return false;
++        TabModel model = selector.getCurrentModel();
++        return model != null && model.isIncognito();
++    }
++
++    /** Pill fill: the omnibox colour once it has been read, otherwise the container step. */
++    private @ColorInt int settledPillColor() {
++        if (mBarFillCaptured) return mBarFillColor;
++        return omniboxFallbackColor();
++    }
++
++    /** Grip colour, one step from the sheet surface. Not the purple-seed grey. */
++    private @ColorInt int handleGripColor() {
++        int surface = sheetSurfaceColor();
++        int ink =
++                ColorUtils.shouldUseLightForegroundOnBackground(surface)
++                        ? Color.WHITE
++                        : Color.BLACK;
++        return ColorUtils.blendColorsMultiply(surface, ink, 0.42f);
++    }
++
++    /**
++     * Paints the action row with the panel fill. The old flat opaque color stayed put when glass
++     * was on, so the row read as a second surface.
+      */
+     private void applyActionsSurface() {
+         if (mSheetActions == null || !isSheetChrome()) return;
+-        mSheetActions.setBackgroundColor(sheetSurfaceColor());
++        int color = sheetSurfaceColor();
++        Drawable background = mSheetActions.getBackground();
++        if (background instanceof ColorDrawable fill && fill.getColor() == color) return;
++        mSheetActions.setBackgroundColor(color);
+     }
+ 
+     /**
+-     * While a bottom-bar sheet is open, the five-button bar uses the sheet surface so the
+-     * two read as one. The saved fill is put back as the sheet closes. Driven by the sheet's
+-     * progress, so the change tracks the open and the close. Top-bar sheets and the side
+-     * drawer leave the bar alone.
++     * Bottom-bar sheet: the pill, the grip and the search field follow the bar's surface family.
++     * A top-bar sheet keeps the colours it had. The side drawer does not show these views.
+      */
+-    private void applyToolbarSurface() {
+-        View bar = bottomButtonBar();
+-        if (bar == null || !isSheetChrome() || sheetFromTop() || mProgress <= 0.001f) {
+-            restoreToolbarSurface();
++    private void applyBottomSheetFamilyColors() {
++        if (!isSheetChrome()) return;
++        boolean bottom = !sheetFromTop();
++        int key = bottom ? settledPillColor() : 1;
++        if (mFamilyApplied && mAppliedFamilyBottom == bottom && mAppliedFamilyColor == key) {
+             return;
+         }
+-        if (!mToolbarSurfaceHeld) {
+-            Drawable background = bar.getBackground();
+-            if (background != null && background.getConstantState() != null) {
+-                mHeldToolbarBackground = background.getConstantState().newDrawable().mutate();
+-            } else {
+-                mHeldToolbarBackground = background;
++        mFamilyApplied = true;
++        mAppliedFamilyBottom = bottom;
++        mAppliedFamilyColor = key;
++        int pill = bottom ? key : color(0xFF2B2930, 0xFFE8EAED);
++        int ink =
++                bottom
++                        ? (mBarFillCaptured ? mBarTextColor : themeOnSurface())
++                        : color(0xFFE6E1E5, 0xFF1C1B1F);
++        int search = bottom ? pill : color(0xFF2B2930, 0xFFE3E1EC);
++        int hint =
++                bottom
++                        ? ColorUtils.setAlphaComponent(ink, 0xB3)
++                        : color(0xFF938F99, 0xFF79747E);
++        int grip = bottom ? handleGripColor() : color(0xFF6B6773, 0xFFC8C4D0);
++        int lock = bottom ? ink : color(0xFFCAC4D0, 0xFF49454F);
++        if (!(mMorphActive && bottom)) setDrawableColor(mOriginPill, pill);
++        if (mPillOrigin != null && !(mMorphActive && bottom)) mPillOrigin.setTextColor(ink);
++        if (mPillLock != null) mPillLock.setColorFilter(lock);
++        setDrawableColor(mSearchField, search);
++        if (mSearchField != null) {
++            mSearchField.setTextColor(ink);
++            mSearchField.setHintTextColor(hint);
++        }
++        if (mSearchClear instanceof ImageView clear) clear.setColorFilter(lock);
++        View handle = mHandleRow != null ? mHandleRow.findViewWithTag("sheet_handle") : null;
++        setDrawableColor(handle, grip);
++    }
++
++    private static void setDrawableColor(@Nullable View view, @ColorInt int color) {
++        if (view == null) return;
++        Drawable background = view.getBackground();
++        if (background instanceof GradientDrawable gradient) {
++            if (gradient.getColor() == null || gradient.getColor().getDefaultColor() != color) {
++                gradient.setColor(color);
+             }
+-            mHeldToolbarColor =
+-                    background instanceof ColorDrawable color
+-                            ? color.getColor()
+-                            : sheetJoinedSurfaceColor();
+-            mToolbarSurfaceHeld = true;
++        } else if (background instanceof ColorDrawable fill) {
++            if (fill.getColor() != color) view.setBackgroundColor(color);
+         }
+-        float opened = BareTabSheetSnap.HALF_RATIO;
+-        float t = opened <= 0f ? 1f : Math.min(1f, mProgress / opened);
+-        int blended = blendColor(mHeldToolbarColor, sheetJoinedSurfaceColor(), t);
+-        Drawable current = bar.getBackground();
+-        if (!(current instanceof ColorDrawable color) || color.getColor() != blended) {
+-            bar.setBackgroundColor(blended);
++    }
++
++    /** Keeps the panel on the live bar colour if that colour changes while the sheet is up. */
++    private void refreshBottomSheetSurface() {
++        if (!isSheetChrome() || sheetFromTop() || mProgress <= 0.001f) return;
++        int color = sheetSurfaceColor();
++        Panel panel = mPanel;
++        if (panel != null && panel.getBackground() instanceof GradientDrawable background) {
++            if (background.getColor() == null || background.getColor().getDefaultColor() != color) {
++                background.setColor(color);
++            }
++        }
++        applyActionsSurface();
++        applyBottomSheetFamilyColors();
++    }
++
++    /**
++     * The bottom-bar sheet uses the bar's own colour, so the five-button bar is not blended
++     * toward a second colour. A hold taken earlier is still put back. Top-bar sheets and the side
++     * drawer do not touch the bar.
++     */
++    private void applyToolbarSurface() {
++        if (bottomButtonBar() == null
++                || !isSheetChrome()
++                || sheetFromTop()
++                || mProgress <= 0.001f) {
++            restoreToolbarSurface();
+         }
+     }
+ 
+@@ -2164,7 +2356,103 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mToolbarSurfaceHeld = false;
+     }
+ 
+-    private @Nullable View bottomButtonBar() {
++    /**
++     * While a bottom-bar sheet moves, the system navigation bar follows the sheet surface.
++     * {@code Theme_Translucent_NoTitleBar} paints that bar black on the glass dialog; pinning it
++     * stops the snap. Closing puts the saved colour back.
++     */
++    private void applySheetNavigationBar() {
++        if (!isSheetChrome() || sheetFromTop() || mProgress <= 0.001f) {
++            restoreSheetNavigationBar();
++            return;
++        }
++        Window activity = mActivity.getWindow();
++        if (!mNavBarHeld) {
++            WindowInsetsControllerCompat controller =
++                    new WindowInsetsControllerCompat(activity, activity.getDecorView());
++            mSavedNavBarColor = activity.getNavigationBarColor();
++            mSavedLightNavBar = controller.isAppearanceLightNavigationBars();
++            mHaveSavedLightNavBar = true;
++            mNavBarHeld = true;
++        }
++        float t = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++        int color = blendColor(mSavedNavBarColor, sheetSurfaceColor(), t);
++        paintNavigationBar(activity, color, true);
++        Dialog dialog = mGlassWindow;
++        Window glass = dialog != null ? dialog.getWindow() : null;
++        if (glass != null) paintNavigationBar(glass, color, true);
++        // Backdrop is created later in this same frame. Clip it once it exists.
++        clipBackdropOffNavInset();
++        // The clipped inset shows the page parent's theme surface, not the nav-bar colour.
++        paintPageParentGap(color);
++    }
++
++    /** Before the first sheet frame, the dialog must not show its theme's black navigation bar. */
++    private void pinGlassNavigationBar(Window window) {
++        if (!isSheetChrome() || sheetFromTop()) return;
++        int base = mNavBarHeld ? mSavedNavBarColor : mActivity.getWindow().getNavigationBarColor();
++        int color = base;
++        if (mProgress > 0.001f) {
++            float t = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++            color = blendColor(base, sheetSurfaceColor(), t);
++        }
++        paintNavigationBar(window, color, true);
++    }
++
++    private void restoreSheetNavigationBar() {
++        clipBackdropOffNavInset();
++        restorePageParentGap();
++        if (!mNavBarHeld) return;
++        Window activity = mActivity.getWindow();
++        paintNavigationBar(activity, mSavedNavBarColor, false);
++        if (mHaveSavedLightNavBar) {
++            new WindowInsetsControllerCompat(activity, activity.getDecorView())
++                    .setAppearanceLightNavigationBars(mSavedLightNavBar);
++        }
++        Dialog dialog = mGlassWindow;
++        Window glass = dialog != null ? dialog.getWindow() : null;
++        if (glass != null) {
++            paintNavigationBar(glass, mSavedNavBarColor, false);
++            if (mHaveSavedLightNavBar) {
++                new WindowInsetsControllerCompat(glass, glass.getDecorView())
++                        .setAppearanceLightNavigationBars(mSavedLightNavBar);
++            }
++        }
++        mNavBarHeld = false;
++        mHaveSavedLightNavBar = false;
++    }
++
++    private void paintNavigationBar(Window window, @ColorInt int color, boolean iconsFollowColor) {
++        WindowManager.LayoutParams attrs = window.getAttributes();
++        int mask =
++                WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
++                        | WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION;
++        int want =
++                (attrs.flags | WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
++                        & ~WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION;
++        // setFlags notifies even when the bits are unchanged, and the pre-draw guard
++        // calls this every frame. Touch the window only when a bit actually changes.
++        if ((attrs.flags & mask) != (want & mask)) window.setFlags(want, mask);
++        if (window.isNavigationBarContrastEnforced()) {
++            window.setNavigationBarContrastEnforced(false);
++        }
++        if (window.getNavigationBarColor() != color) window.setNavigationBarColor(color);
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
++                && window.getNavigationBarDividerColor() != color) {
++            window.setNavigationBarDividerColor(color);
++        }
++        if (!iconsFollowColor) return;
++        boolean lightIcons = ColorUtils.shouldUseLightForegroundOnBackground(color);
++        WindowInsetsControllerCompat controller =
++                new WindowInsetsControllerCompat(window, window.getDecorView());
++        boolean wantLightBar = !lightIcons;
++        if (controller.isAppearanceLightNavigationBars() != wantLightBar) {
++            controller.setAppearanceLightNavigationBars(wantLightBar);
++        }
++    }
++
++    @Nullable
++    private View bottomButtonBar() {
+         return mActivity.findViewById(
+                 org.chromium.chrome.browser.ui.bottombar.R.id.bottom_bar_container);
+     }
+@@ -2575,6 +2863,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         clearBlur();
+         applyToolbarSurface();
+         applySeamFill();
++        refreshBottomSheetSurface();
++        applySheetNavigationBar();
+         layoutOriginPill();
+         View scrim = mScrim;
+         Panel panel = mPanel;
+@@ -2716,6 +3006,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mPageShade = null;
+         detachView(mPageBackdrop);
+         mPageBackdrop = null;
++        restorePageParentGap();
++        mBackdropClipView = null;
++        mBackdropClipW = -1;
++        mBackdropClipB = -1;
+         mPageCardArmed = false;
+     }
+ 
+@@ -2743,6 +3037,75 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mPageBackdrop.setBackgroundColor(backdropColor(dim));
+         mPageBackdrop.setAlpha(1f);
+         mPageBackdrop.setVisibility(View.VISIBLE);
++        clipBackdropOffNavInset();
++    }
++
++    /**
++     * The page-card backdrop is black, and a bottom-bar sheet scales the page up off the
++     * bottom, so the backdrop shows in the gesture-nav inset. Clip that inset out. The
++     * activity window already has the sheet colour there. Clipping does not request a layout,
++     * so a draw pass cannot reschedule itself.
++     */
++    /**
++     * The gesture-nav inset is not the colour {@link #paintNavigationBar} sets. Once the
++     * page-card backdrop is clipped off that inset, the page parent's theme surface shows
++     * through (light {@code #FFFFFF}, dark {@code #131314}). Paint the parent with the sheet
++     * colour. Skip the write when the colour is already applied so a pre-draw cannot loop.
++     */
++    private void paintPageParentGap(@ColorInt int color) {
++        View page = mActivity.findViewById(R.id.compositor_view_holder);
++        if (!(page != null && page.getParent() instanceof View parent)) return;
++        if (mPageParentPainted != parent) {
++            if (mPageParentPainted != null) restorePageParentGap();
++            mHeldPageParentBackground = parent.getBackground();
++            mPageParentPainted = parent;
++            mPageParentColorSet = false;
++        }
++        if (mPageParentColorSet && mPageParentColor == color) return;
++        mPageParentColor = color;
++        mPageParentColorSet = true;
++        parent.setBackgroundColor(color);
++    }
++
++    private void restorePageParentGap() {
++        View parent = mPageParentPainted;
++        if (parent == null) return;
++        parent.setBackground(mHeldPageParentBackground);
++        mHeldPageParentBackground = null;
++        mPageParentPainted = null;
++        mPageParentColorSet = false;
++    }
++
++    private void clipBackdropOffNavInset() {
++        View backdrop = mPageBackdrop;
++        if (backdrop == null) return;
++        if (backdrop != mBackdropClipView) {
++            mBackdropClipView = backdrop;
++            mBackdropClipW = -1;
++            mBackdropClipB = -1;
++        }
++        boolean cover =
++                isSheetChrome() && !sheetFromTop() && mProgress > 0.001f && mBottomInset > 0;
++        if (!cover) {
++            if (mBackdropClipW != 0) {
++                mBackdropClipW = 0;
++                mBackdropClipB = 0;
++                backdrop.setClipBounds(null);
++            }
++            return;
++        }
++        int width = backdrop.getWidth();
++        int height = backdrop.getHeight();
++        if ((width <= 0 || height <= 0) && backdrop.getParent() instanceof View parent) {
++            if (width <= 0) width = parent.getWidth();
++            if (height <= 0) height = parent.getHeight();
++        }
++        if (width <= 0 || height <= mBottomInset) return;
++        int bottom = height - mBottomInset;
++        if (mBackdropClipW == width && mBackdropClipB == bottom) return;
++        mBackdropClipW = width;
++        mBackdropClipB = bottom;
++        backdrop.setClipBounds(new Rect(0, 0, width, bottom));
+     }
+ 
+     private void hidePageBackdrop() {
+@@ -2898,6 +3261,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             return true;
+                         }
+                         applyStatusBarForPageCard(true, mPageDim);
++                        applySheetNavigationBar();
+                         return true;
+                     }
+                 };
+@@ -2931,6 +3295,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             decor.setPadding(0, 0, 0, 0);
+         }
+         if (w.getStatusBarColor() != Color.TRANSPARENT) w.setStatusBarColor(Color.TRANSPARENT);
++        pinGlassNavigationBar(w);
+         // The glass window stays a rectangle. A rounded clip would notch the sheet
+         // above the seam and show the page in the bottom corners.
+         decor.setOutlineProvider(ViewOutlineProvider.BOUNDS);
+@@ -3562,7 +3927,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mBarHeightPx = 0;
+         mBarTextPadStart = dp(10);
+         mBarTextPadEnd = dp(12);
+-        mBarTextColor = color(0xFFE6E1E5, 0xFF1C1B1F);
++        mBarFillCaptured = false;
++        mBarTextColor = themeOnSurface();
+         mBarTextSizePx =
+                 TypedValue.applyDimension(
+                         TypedValue.COMPLEX_UNIT_SP,
+@@ -3575,7 +3941,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         } else if (location != null) {
+             bg = location.getBackground();
+         }
+-        mBarFillColor = color(0xFF2B2930, 0xFFE8EAED);
++        mBarFillColor = omniboxFallbackColor();
+         mBarCornerRadius = modernBarRadiusPx();
+         GradientDrawable gradient = null;
+         if (bg instanceof LocationBarBackgroundDrawable drawable) {
+@@ -3585,7 +3951,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         if (gradient != null) {
+             if (gradient.getColor() != null) {
+-                mBarFillColor = gradient.getColor().getDefaultColor();
++                int value = gradient.getColor().getDefaultColor();
++                if (Color.alpha(value) == 255) {
++                    mBarFillColor = value;
++                    mBarFillCaptured = true;
++                }
+             }
+             if (gradient.getCornerRadius() > 0f) mBarCornerRadius = gradient.getCornerRadius();
+         }
+@@ -3769,8 +4139,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             textAlpha = (shrink - 0.2f) / 0.08f;
+         }
+         if (origin.getAlpha() != textAlpha) origin.setAlpha(textAlpha);
+-        int endColor = color(0xFFE6E1E5, 0xFF1C1B1F);
+-        origin.setTextColor(eased >= 1f ? endColor : blendColor(mBarTextColor, endColor, eased));
++        origin.setTextColor(mBarTextColor);
+         int lockVis = host ? mPillLockVisibility : View.GONE;
+         int iconVis = host ? mPillIconVisibility : View.GONE;
+         if (mPillLock != null && mPillLock.getVisibility() != lockVis) {
+@@ -4087,13 +4456,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         int width = Math.max(1, Math.round(lerp(startW, endW, eased)));
+         int height = Math.max(1, Math.round(lerp(startH, endH, eased)));
+         float radius = eased >= 1f ? height / 2f : lerp(mBarCornerRadius, height / 2f, eased);
+-        int endFill = color(0xFF2B2930, 0xFFE8EAED);
+-        int fill = eased >= 1f ? endFill : blendColor(mBarFillColor, endFill, eased);
++        int fill = mBarFillColor;
+         if (pill.getBackground() instanceof GradientDrawable background) {
+             background.setCornerRadius(radius);
+             background.setColor(fill);
+         }
+         applyMorphText(shrink, eased);
++        applyBottomSheetFamilyColors();
+         // Below half the list can overlap the handle row, so the pill rides the sheet top on
+         // the root, above the cards, and is parked in the handle row only from half up.
+         if (eased >= 1f && mProgress >= BareTabSheetSnap.HALF_RATIO - 0.001f) {
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 548b4daa15..d35671b7ba 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -8,6 +8,7 @@ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotEquals;
+ import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyBoolean;
+@@ -1687,7 +1688,9 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0, rootParams.bottomMargin);
+         // One opaque surface with the seam. The page behind the window is not blurred.
+         GradientDrawable background = (GradientDrawable) panel.getBackground();
+-        assertEquals(0xFFF1EDF6, background.getColor().getDefaultColor());
++        assertEquals(
++                mDrawer.sheetSurfaceColorForTesting(), background.getColor().getDefaultColor());
++        assertNotEquals(0xFFF1EDF6, background.getColor().getDefaultColor());
+         assertEquals(0, mDrawer.blurRadiusForTesting());
+         assertEquals(0, attributes.flags & WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
+         mDrawer.close();
+@@ -2365,8 +2368,8 @@ public class BareVerticalTabsDrawerUnitTest {
+                     BareVerticalTabsDrawer.setGlassForTesting(glass);
+                     mDrawer.open();
+                     mDrawer.finishAnimationForTesting();
+-                    // Sheet, seam and toolbar are one opaque colour, glass on or off.
+-                    int expected = night ? 0xFF1C1A20 : 0xFFF1EDF6;
++                    // The sheet matches the colour the bar is already painting.
++                    int expected = 0xFF123456;
+                     View actions = sheetActions(glass);
+                     assertEquals(
+                             "panel night=" + night + " glass=" + glass,
+@@ -2403,6 +2406,10 @@ public class BareVerticalTabsDrawerUnitTest {
+             mDrawer.open();
+             mDrawer.finishAnimationForTesting();
+             assertEquals(0xFF123456, drawableColor(bar.getBackground()));
++            assertEquals(
++                    0xFFF1EDF6,
++                    drawableColor(((View) sheetActions(false).getParent()).getBackground()));
++            assertEquals(0xFFE3E1EC, drawableColor(searchField().getBackground()));
+             assertEquals(View.GONE, mDrawer.seamFillForTesting().getVisibility());
+             mDrawer.close();
+             mDrawer.finishAnimationForTesting();
+@@ -2471,7 +2478,8 @@ public class BareVerticalTabsDrawerUnitTest {
+                     mDrawer.open();
+                     mDrawer.finishAnimationForTesting();
+                     View actions = sheetActions(glass);
+-                    int expected = night ? 0xFF1C1A20 : 0xFFF1EDF6;
++                    int expected = mDrawer.sheetSurfaceColorForTesting();
++                    assertNotEquals(night ? 0xFF1C1A20 : 0xFFF1EDF6, expected);
+                     assertEquals(0, mDrawer.blurRadiusForTesting());
+                     assertEquals(
+                             "night=" + night + " glass=" + glass,
+@@ -2624,6 +2632,216 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0, panelBottomMargin(drawerPanel));
+     }
+ 
++    @Test
++    public void testTheNavigationBarFollowsTheSheetAndReturns() {
++        View bar = new View(mActivity);
++        bar.setId(BareVerticalTabsDrawer.bottomBarIdForTesting());
++        bar.setBackgroundColor(0xFF123456);
++        content().addView(bar, new FrameLayout.LayoutParams(px(400), px(56), Gravity.BOTTOM));
++        mActivity.getWindow().setNavigationBarColor(0xFF112233);
++
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        try {
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0xFF123456, mActivity.getWindow().getNavigationBarColor());
++            Dialog glass = mDrawer.glassWindowForTesting();
++            assertNotNull(glass);
++            assertEquals(0xFF123456, glass.getWindow().getNavigationBarColor());
++            assertNotEquals(android.graphics.Color.BLACK, glass.getWindow().getNavigationBarColor());
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                assertEquals(0xFF123456, glass.getWindow().getNavigationBarDividerColor());
++            }
++
++            mDrawer.applyProgressForTesting(0.25f);
++            int mid = blendNav(0xFF112233, 0xFF123456, 0.5f);
++            assertEquals(mid, mActivity.getWindow().getNavigationBarColor());
++            assertEquals(mid, glass.getWindow().getNavigationBarColor());
++
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0xFF112233, mActivity.getWindow().getNavigationBarColor());
++
++            mActivity.getWindow().setNavigationBarColor(0xFF112233);
++            setAddressBarOnTop(true);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0xFF112233, mActivity.getWindow().getNavigationBarColor());
++            assertEquals(
++                    0xFFF1EDF6,
++                    drawableColor(((View) findTag("sheet_actions").getParent()).getBackground()));
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0xFF112233, mActivity.getWindow().getNavigationBarColor());
++            assertEquals(0xFF123456, drawableColor(bar.getBackground()));
++        } finally {
++            setAddressBarOnTop(false);
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            if (mDrawer.isOpen()) {
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++        }
++    }
++
++
++    @Test
++    public void testTheBottomSheetBackdropClearsTheNavigationInset() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View page = attachPage();
++        try {
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            ShadowLooper.idleMainLooper();
++            View backdrop =
++                    page.getParent() instanceof ViewGroup parent
++                            ? parent.findViewWithTag("page_card_backdrop")
++                            : null;
++            assertNotNull(backdrop);
++            int width = px(400);
++            int height = px(800);
++            int inset = px(48);
++            layoutOverlay(backdrop, width, height);
++            mDrawer.setBottomInsetForTesting(inset);
++            mDrawer.applyProgressForTesting(mDrawer.progressForTesting());
++            android.graphics.Rect clip = backdrop.getClipBounds();
++            assertNotNull(clip);
++            assertEquals(0, clip.left);
++            assertEquals(0, clip.top);
++            assertEquals(width, clip.right);
++            assertEquals(height - inset, clip.bottom);
++            assertNull(mActivity.getWindow().getDecorView().findViewWithTag("sheet_nav_fill"));
++            assertEquals(
++                    mDrawer.sheetSurfaceColorForTesting(),
++                    drawableColor(((View) page.getParent()).getBackground()));
++
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++            ShadowLooper.idleMainLooper();
++            assertNull(backdrop.getClipBounds());
++
++            setAddressBarOnTop(true);
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            ShadowLooper.idleMainLooper();
++            View topBackdrop =
++                    page.getParent() instanceof ViewGroup parent
++                            ? parent.findViewWithTag("page_card_backdrop")
++                            : null;
++            if (topBackdrop != null) assertNull(topBackdrop.getClipBounds());
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            setAddressBarOnTop(false);
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            View drawerBackdrop =
++                    page.getParent() instanceof ViewGroup parent
++                            ? parent.findViewWithTag("page_card_backdrop")
++                            : null;
++            if (drawerBackdrop != null) assertNull(drawerBackdrop.getClipBounds());
++        } finally {
++            setAddressBarOnTop(false);
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            if (mDrawer.isOpen()) {
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++        }
++    }
++
++    @Test
++    public void testThePillAndSearchFollowTheOmniboxNotThePurpleSeed() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        GradientDrawable omnibox = new GradientDrawable();
++        omnibox.setColor(0xFFAABBCC);
++        omnibox.setCornerRadius(px(16));
++        TextView bar = new TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setBackground(omnibox);
++        bar.setTextColor(0xFF101010);
++        bar.setText("https://example.com/");
++        content().addView(bar, new FrameLayout.LayoutParams(px(280), px(48), Gravity.BOTTOM));
++
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        layoutOverlay(root, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++
++        assertEquals(0xFFAABBCC, drawableColor(originPill().getBackground()));
++        assertEquals(0xFFAABBCC, drawableColor(searchField().getBackground()));
++        assertNotEquals(0xFFE8EAED, drawableColor(originPill().getBackground()));
++        assertNotEquals(0xFFE3E1EC, drawableColor(searchField().getBackground()));
++        assertNotEquals(0xFFC8C4D0, drawableColor(findTag("sheet_handle").getBackground()));
++
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        setAddressBarOnTop(true);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(0xFFE3E1EC, drawableColor(searchField().getBackground()));
++        assertEquals(0xFFE8EAED, drawableColor(originPill().getBackground()));
++        assertEquals(0xFFC8C4D0, drawableColor(findTag("sheet_handle").getBackground()));
++        assertEquals(
++                0xFFF1EDF6,
++                drawableColor(((View) findTag("sheet_actions").getParent()).getBackground()));
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++    }
++
++    @Test
++    public void testAnIncognitoSheetUsesTheIncognitoSurfaceWhenTheBarHasNoFill() {
++        when(mModel.isIncognito()).thenReturn(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            int expected =
++                    org.chromium.components.browser_ui.styles.IncognitoColors
++                            .getColorSurfaceContainerHigh(mActivity, true);
++            assertEquals(expected, mDrawer.sheetSurfaceColorForTesting());
++            assertEquals(
++                    expected,
++                    drawableColor(((View) findTag("sheet_actions").getParent()).getBackground()));
++            assertNotEquals(0xFF1C1A20, expected);
++        } finally {
++            when(mModel.isIncognito()).thenReturn(false);
++            if (mDrawer.isOpen()) {
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++        }
++    }
++
++    private static int blendNav(int from, int to, float t) {
++        float u = 1f - t;
++        return android.graphics.Color.argb(
++                Math.round(
++                        android.graphics.Color.alpha(from) * u
++                                + android.graphics.Color.alpha(to) * t),
++                Math.round(
++                        android.graphics.Color.red(from) * u + android.graphics.Color.red(to) * t),
++                Math.round(
++                        android.graphics.Color.green(from) * u
++                                + android.graphics.Color.green(to) * t),
++                Math.round(
++                        android.graphics.Color.blue(from) * u
++                                + android.graphics.Color.blue(to) * t));
++    }
++
+     private void setNightMode(boolean night) {
+         android.content.res.Configuration config = mActivity.getResources().getConfiguration();
+         int mode =
+-- 
+2.34.1
+
