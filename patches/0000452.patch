@@ -1,0 +1,1309 @@
+From df66b3d522a0bb2080235fd88c648b9168513b66 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:52:56 +0000
+Subject: [PATCH] Bare: show one address pill while the bar morphs into the tab
+ sheet
+
+The address pill on screen is the compositor toolbar texture, so hiding
+the location bar view did not remove it, and the glass sheet window was
+placed one layout late. While the bottom-bar sheet opened, the real pill
+and the travelling morph pill were both visible.
+
+The morph now waits until the glass window covers the bar, starts at
+the measured bar rect, hides the address views (INVISIBLE, not GONE) and
+suppresses the toolbar scene layer in the same step through a new
+ToolbarManager hook, which also drops the cached toolbar bitmap. A
+toolbar-coloured cover hides the last texture frame for a few frames.
+
+The glass window attributes are posted when they change during layout,
+which fixes an input-dispatch ANR. Top-bar sheet and side drawer are
+unchanged.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 816 ++++++++++++++++--
+ .../browser/toolbar/ToolbarManager.java       |  19 +-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 165 ++++
+ 3 files changed, 913 insertions(+), 87 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index f74ee696cd..f033072a37 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -254,6 +254,35 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private int mPillIconVisibility = View.GONE;
+     /** True while the bottom-bar morph is on screen, so leaving that path can restore the pill. */
+     private boolean mMorphActive;
++    /** Re-applies the hide after the toolbar layout pass, which puts alpha and visibility back. */
++    private boolean mMorphGuardOn;
++    private boolean mMorphGuardApplying;
++    /** First drawn morph frame used the real bar rect. Later frames follow progress. */
++    private boolean mMorphAnchored;
++    /** ToolbarManager is hiding the captured toolbar texture for this morph. */
++    private boolean mToolbarSceneSuppressed;
++    /**
++     * Frames left to paint the bar cover one bar above the location bar. The
++     * compositor draws the last toolbar texture there for a frame after suppress.
++     */
++    private int mGhostCoverFrames;
++    private boolean mGhostCoverTickPosted;
++    private boolean mGlassPlacePosted;
++    private int mPendingGlassTop;
++    private int mPendingGlassBottom;
++    private ViewTreeObserver.@Nullable OnPreDrawListener mMorphGuard;
++    private static @Nullable BareVerticalTabsDrawer sMorphGuardOwner;
++    /** Copies of bar icons drawn with the travelling pill. The real icons are hidden. */
++    private final java.util.ArrayList<ImageView> mMorphExtraIcons = new java.util.ArrayList<>();
++    private int mMorphExtraCount;
++    /** Bar string, drawn under the origin label while the two crossfade. */
++    private @Nullable TextView mMorphFromText;
++    /** Opaque stand-in for the real address pill while the morph is the only pill. */
++    private @Nullable View mBottomBarCover;
++    /** Fades the five-button row. That row ignores view alpha. */
++    private @Nullable View mBottomButtonCover;
++    private boolean mBottomBarVisHeld;
++    private int mSavedBottomBarVis = View.VISIBLE;
+     /**
+      * How far the panel and the scrim sit above the overlay bottom. The overlay covers the
+      * address-bar slot so the morph can draw there; the sheet itself stays where it was.
+@@ -342,7 +371,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private int mLatchedImeTop = -1;
+     private boolean mInWindowLayout;
+     /** A glass-window move is already posted, so layout does not queue another. */
+-    private boolean mGlassPlacePosted;
++    /** Content origin from the last pass that was not inside layout. */
++    private int mCachedContentY;
++    private int mCachedContentH;
+     // How far the keyboard lifts the bottom search field, and the sheet with it; and how much of
+     // a sheet dropped from the top it would otherwise cover.
+     private int mImeLift;
+@@ -545,6 +576,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             Supplier<@Nullable TabCreatorManager> creatorsSupplier,
+             Supplier<@Nullable TabContentManager> contentSupplier) {
+         mActivity = activity;
++        if (sMorphGuardOwner != null && sMorphGuardOwner != this) {
++            sMorphGuardOwner.disarmMorphGuard();
++        }
+         mSelectorSupplier = selectorSupplier;
+         mCreatorsSupplier = creatorsSupplier;
+         mContentSupplier = contentSupplier;
+@@ -733,7 +767,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         updateHandleAccessibility();
+                     }
+                     Dialog glass = mGlassWindow;
+-                    if (glass != null && !mOpen && glass.isShowing()) glass.dismiss();
++                    if (glass != null && !mOpen && glass.isShowing()) {
++                        // No exit animation: the last progress frame already matches the bar.
++                        killWindowAnimations(glass.getWindow());
++                        glass.dismiss();
++                    }
+                     if (!mOpen) restorePageCard();
+                     releaseObservers();
+                     // The dialog is gone. Focus the omnibox only if this close stuck.
+@@ -774,6 +812,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         sSuppressAddressBarTabSwipe = false;
+         mOpen = false;
++        disarmMorphGuard();
++        suppressToolbarSceneLayer(false);
++        clearMorphFloats();
++        hideBottomBarCover();
+         fadeToolbarChrome(0f);
+         applyProgress(0f);
+         releasePageCard();
+@@ -1979,24 +2021,27 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     bottom = keyboardBottom;
+                     mSheetBottomLift = 0;
+                 } else {
+-                    // As the address bar fades into the pill, the sheet occupies that row
+-                    // and sits on the five-button bar. The button bar itself stays put.
++                    // The address pill and the five-button row are different views. The
++                    // control container often reports only the button row, which left the
++                    // real pill outside the sheet window. Measure the location bar too.
++                    // The window includes that pill for the whole morph. Lift holds the
++                    // panel on the old edge and returns to 0 once the slot is yielded, so
++                    // a settled sheet still keeps the 12dp seam and the + row stays put.
+                     float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
+                     float fade =
+                             shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
+-                    int address = addressBarSlotInset();
++                    int address =
++                            Math.max(
++                                    addressBarSlotInset(),
++                                    slotInsetFromTop(R.id.location_bar, /*goneCounts=*/true));
+                     int buttons = bottomButtonsInset();
+-                    int slot = Math.round(address + (buttons - address) * fade);
+-                    int resting = Math.max(buttons, slot);
+-                    // The morph paints on the address bar from the first frame, so the sheet
+-                    // window includes that slot immediately. mSheetBottomLift keeps the panel
+-                    // on the old boundary until the slot is given up.
+-                    int covered = buttons;
+-                    if (bottomBarMorph() && mProgress > 0.001f && covered < resting) {
+-                        bottom = covered;
+-                        mSheetBottomLift = resting - covered;
++                    int resting = Math.max(buttons, address);
++                    if (bottomBarMorph() && mProgress > 0.001f && address > buttons) {
++                        bottom = buttons;
++                        mSheetBottomLift = Math.round((address - buttons) * (1f - fade));
+                     } else {
+                         bottom = resting;
++                        mSheetBottomLift = 0;
+                     }
+                 }
+             }
+@@ -2654,7 +2699,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             if (glass && mGlassWindow != null) {
+                 shapeGlassWindow();
+                 clearBlur();
+-                if (!mGlassWindow.isShowing()) mGlassWindow.show();
++                if (!mGlassWindow.isShowing()) {
++                    killWindowAnimations(mGlassWindow.getWindow());
++                    mGlassWindow.show();
++                    if (isSheetChrome() && !sheetFromTop()) {
++                        killWindowAnimations(mGlassWindow.getWindow());
++                    }
++                }
+             }
+             watchDialogLayout(glass && isSheetChrome());
+             return;
+@@ -2733,7 +2784,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         shapeGlassWindow();
+         clearBlur();
++        killWindowAnimations(window.getWindow());
+         window.show();
++        if (isSheetChrome() && !sheetFromTop()) killWindowAnimations(window.getWindow());
+         watchDialogLayout(isSheetChrome());
+     }
+ 
+@@ -2781,17 +2834,25 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         Window w = window != null ? window.getWindow() : null;
+         View content = mActivity.findViewById(android.R.id.content);
+         if (w == null || content == null) return;
+-        // This runs from a global-layout listener. Measuring during that traversal
+-        // schedules another traversal, and Robolectric never finishes idling it.
+-        if (content.isInLayout()) {
++        if (!content.isInLayout() && content.getHeight() > 0) {
++            int[] location = new int[2];
++            content.getLocationOnScreen(location);
++            mCachedContentY = location[1];
++            mCachedContentH = content.getHeight();
++        }
++        // setAttributes during layout starts another traversal. That loop is the
++        // ANR: the main thread never handled the focus event. Apply after this pass.
++        // The morph pill stays hidden until the window actually covers the bar, so
++        // the one-frame delay does not draw a second pill.
++        if (content.isInLayout() || mInWindowLayout) {
++            mPendingGlassTop = top;
++            mPendingGlassBottom = bottom;
+             if (mGlassPlacePosted) return;
+             mGlassPlacePosted = true;
+-            int topNow = top;
+-            int bottomNow = bottom;
+             content.post(
+                     () -> {
+                         mGlassPlacePosted = false;
+-                        placeSheetGlassWindowPosted(topNow, bottomNow);
++                        placeSheetGlassWindowPosted(mPendingGlassTop, mPendingGlassBottom);
+                     });
+             return;
+         }
+@@ -2803,17 +2864,29 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         Window w = window != null ? window.getWindow() : null;
+         View content = mActivity.findViewById(android.R.id.content);
+         if (w == null || content == null) return;
+-        int[] location = new int[2];
+-        content.getLocationOnScreen(location);
+-        int contentHeight =
+-                content.getHeight() > 0
+-                        ? content.getHeight()
+-                        : mActivity.getResources().getDisplayMetrics().heightPixels;
+-        int y = location[1] + top;
++        int yOrigin = mCachedContentY;
++        int contentHeight = mCachedContentH;
++        if (!content.isInLayout() && content.getHeight() > 0) {
++            int[] location = new int[2];
++            content.getLocationOnScreen(location);
++            yOrigin = location[1];
++            contentHeight = content.getHeight();
++            mCachedContentY = yOrigin;
++            mCachedContentH = contentHeight;
++        }
++        if (contentHeight <= 0) {
++            contentHeight = mActivity.getResources().getDisplayMetrics().heightPixels;
++        }
++        int y = yOrigin + top;
+         int height = Math.max(1, contentHeight - top - bottom);
+         WindowManager.LayoutParams attributes = w.getAttributes();
+         int gravity = Gravity.TOP | Gravity.FILL_HORIZONTAL;
+-        if (attributes.y == y && attributes.height == height && attributes.gravity == gravity) {
++        boolean animOk = sheetFromTop() || attributes.windowAnimations == 0;
++        if (!sheetFromTop()) attributes.windowAnimations = 0;
++        if (animOk
++                && attributes.y == y
++                && attributes.height == height
++                && attributes.gravity == gravity) {
+             return;
+         }
+         attributes.gravity = gravity;
+@@ -2835,7 +2908,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             // The bar-to-pill morph is driven by this progress every frame. An expo-out curve
+             // put almost all of it in the first frames, so the morph looked like a swap.
+             animator.setDuration(SHEET_DURATION_MS);
+-            animator.setInterpolator(new PathInterpolator(0.4f, 0f, 0.2f, 1f));
++            // Even steps, so a slowed recording shows the pill move every frame.
++            animator.setInterpolator(new android.view.animation.LinearInterpolator());
+         } else if (isSheetChrome()) {
+             animator.setDuration(Math.round(200 + (SHEET_DURATION_MS - 200) * distance));
+             animator.setInterpolator(new PathInterpolator(0.16f, 1f, 0.3f, 1f));
+@@ -2856,8 +2930,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         overlay.post(
+                                 () -> {
+                                     if (mOpen || sheetWindowPresent()) return;
+-                                    mProgress = 0f;
+-                                    restorePageCard();
++                                    // Same path as a finished close, so chrome is not popped on.
++                                    applyProgress(0f);
+                                 });
+                     }
+ 
+@@ -2954,6 +3028,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 panel.setTranslationY(0f);
+                 if (mSheetActions != null) mSheetActions.setTranslationY(0f);
+                 layoutSheetPanel(panel);
++                pinPanelTopToTravellingPill(panel);
+             }
+             // The sheet overlays the page; it does not push it aside the way the drawer does.
+             if (page != null) page.setTranslationX(0f);
+@@ -3647,6 +3722,31 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * under the row at half height. A bottom-bar sheet keeps
+      * {@link #SHEET_BOTTOM_SEAM_DP} clear of the toolbar.
+      */
++    /**
++     * While the bottom-bar pill is travelling, the sheet's top edge is that pill.
++     * A panel sized only from progress leaves the real bar visible under a second pill.
++     */
++    private void pinPanelTopToTravellingPill(Panel panel) {
++        if (!bottomBarMorph() || mProgress <= 0.001f) return;
++        LinearLayout pill = mOriginPill;
++        FrameLayout root = mRoot;
++        if (pill == null || root == null || root.getHeight() <= 0) return;
++        if (pill.getParent() != root) return;
++        int pillTop = Math.max(0, Math.round(pill.getTranslationY()));
++        int bottom = sheetBottomSeam();
++        int height = root.getHeight() - bottom - pillTop;
++        if (height < 1) return;
++        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        int gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
++        if (params.height == height && params.bottomMargin == bottom && params.gravity == gravity) {
++            return;
++        }
++        params.height = height;
++        params.bottomMargin = bottom;
++        params.gravity = gravity;
++        panel.setLayoutParams(params);
++    }
++
+     private void layoutSheetPanel(Panel panel) {
+         int height = Math.max(1, Math.round(mProgress * sheetRangeHeight()));
+         int gravity = (sheetFromTop() ? Gravity.TOP : Gravity.BOTTOM) | Gravity.CENTER_HORIZONTAL;
+@@ -4013,18 +4113,30 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         iconParams.setMarginStart(dp(4));
+         pill.addView(icon, iconParams);
+ 
+-        TextView origin = new TextView(mActivity);
++        FrameLayout texts = new FrameLayout(mActivity);
++        texts.setTag("sheet_pill_text_stack");
++        TextView fromText = newPillText();
++        fromText.setTag("morph_from_text");
++        fromText.setVisibility(View.GONE);
++        TextView origin = newPillText();
+         origin.setTag("sheet_pill_origin");
+-        origin.setTextColor(color(0xFFE6E1E5, 0xFF1C1B1F));
+-        origin.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+-        origin.setSingleLine(true);
+-        origin.setEllipsize(TextUtils.TruncateAt.END);
+-        origin.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        FrameLayout.LayoutParams fill =
++                new FrameLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT,
++                        ViewGroup.LayoutParams.WRAP_CONTENT,
++                        Gravity.CENTER_VERTICAL | Gravity.START);
++        texts.addView(fromText, fill);
++        texts.addView(
++                origin,
++                new FrameLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT,
++                        ViewGroup.LayoutParams.WRAP_CONTENT,
++                        Gravity.CENTER_VERTICAL | Gravity.START));
+         LinearLayout.LayoutParams textParams =
+-                new LinearLayout.LayoutParams(
+-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+         textParams.setMarginStart(dp(6));
+-        pill.addView(origin, textParams);
++        pill.addView(texts, textParams);
++        mMorphFromText = fromText;
+ 
+         pill.setOnClickListener(v -> closeAndFocusOmnibox());
+         pill.setOnTouchListener(this::onOriginPillTouch);
+@@ -4045,30 +4157,39 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         ImageView lock = mPillLock;
+         GURL url = selected == null ? null : selected.getUrl();
+         boolean ntp = url != null && UrlUtilities.isNtpUrl(url);
++        int iconVis = View.GONE;
++        int lockVis = View.GONE;
+         if (icon != null) {
+             Bitmap favicon = selected == null || ntp ? null : TabFavicon.getBitmap(selected);
+             if (favicon != null) {
+                 icon.setImageBitmap(favicon);
+-                icon.setVisibility(View.VISIBLE);
++                iconVis = View.VISIBLE;
+             } else {
+                 icon.setImageDrawable(null);
+-                icon.setVisibility(View.GONE);
+             }
+         }
+         if (lock != null) {
+             String scheme = url == null ? "" : url.getScheme();
+             boolean secure = "https".equalsIgnoreCase(scheme) && lock.getDrawable() != null;
+-            lock.setVisibility(secure ? View.VISIBLE : View.GONE);
+-        }
+-        if (icon != null) mPillIconVisibility = icon.getVisibility();
+-        if (lock != null) mPillLockVisibility = lock.getVisibility();
+-        // Icons belong to the settled pill. During the URL part of the morph they stay out.
+-        if (bottomBarMorph()
+-                && mProgress > 0.001f
+-                && mProgress / BareTabSheetSnap.HALF_RATIO < 0.2f) {
+-            if (icon != null) icon.setVisibility(View.GONE);
+-            if (lock != null) lock.setVisibility(View.GONE);
++            if (secure) lockVis = View.VISIBLE;
+         }
++        if (icon != null) mPillIconVisibility = iconVis;
++        if (lock != null) mPillLockVisibility = lockVis;
++        // While the morph is up the copied icons are drawn separately. Applying this
++        // visibility here would pop the in-flow pair back on.
++        if (mMorphActive && bottomBarMorph()) return;
++        if (icon != null && icon.getVisibility() != iconVis) icon.setVisibility(iconVis);
++        if (lock != null && lock.getVisibility() != lockVis) lock.setVisibility(lockVis);
++    }
++
++    private TextView newPillText() {
++        TextView text = new TextView(mActivity);
++        text.setTextColor(color(0xFFE6E1E5, 0xFF1C1B1F));
++        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
++        text.setSingleLine(true);
++        text.setEllipsize(TextUtils.TruncateAt.END);
++        text.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        return text;
+     }
+ 
+     /**
+@@ -4167,6 +4288,39 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return mModernBarRadiusPx;
+     }
+ 
++    /**
++     * Glass window is up but its decor does not yet contain the real address bar.
++     * Unit tests leave glass off, and an unattached host is not treated as lag.
++     */
++    private boolean morphWindowLagsBar() {
++        if (!mGlass) return false;
++        FrameLayout root = mRoot;
++        View bar = mActivity.findViewById(R.id.location_bar);
++        if (root == null || bar == null || root.getHeight() <= 0 || bar.getHeight() <= 0) {
++            return false;
++        }
++        if (!root.isAttachedToWindow() || !bar.isAttachedToWindow()) return false;
++        return !morphHostCoversBar();
++    }
++
++    /**
++     * Drops the compositor's toolbar texture while the morph is the only pill.
++     * View alpha does not change that texture. Set only when the flag changes:
++     * the supplier notifies observers even if the boolean is the same.
++     */
++    private void suppressToolbarSceneLayer(boolean suppress) {
++        // Same value must not notify. The supplier fires observers even when the
++        // boolean did not change, and this runs from layout.
++        if (suppress == mToolbarSceneSuppressed) return;
++        mToolbarSceneSuppressed = suppress;
++        // The last toolbar texture is drawn about one bar above the view for a
++        // frame after this. Cover that strip, then drop the extra on the next frames.
++        mGhostCoverFrames = suppress ? 4 : 0;
++        if (!(mActivity instanceof ChromeActivity chromeActivity)) return;
++        if (chromeActivity.getToolbarManager() == null) return;
++        chromeActivity.getToolbarManager().setBareSheetHidesToolbarSceneLayer(suppress);
++    }
++
+     /** True once the sheet window includes the bottom of the real address bar. */
+     private boolean morphHostCoversBar() {
+         FrameLayout root = mRoot;
+@@ -4389,30 +4543,51 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (Math.abs(origin.getTextSize() - size) > 0.25f) {
+             origin.setTextSize(TypedValue.COMPLEX_UNIT_PX, size);
+         }
+-        boolean host = shrink >= 0.2f;
+-        CharSequence want = host ? mOriginLabel : cachedBarUrl();
+-        if (!TextUtils.equals(origin.getText(), want)) origin.setText(want);
+-        float textAlpha = 1f;
+-        if (shrink < 0.2f) {
+-            if (shrink > 0.12f) textAlpha = (0.2f - shrink) / 0.08f;
+-        } else if (shrink < 0.28f) {
+-            textAlpha = (shrink - 0.2f) / 0.08f;
+-        }
+-        if (origin.getAlpha() != textAlpha) origin.setAlpha(textAlpha);
++        CharSequence from = cachedBarUrl();
++        CharSequence to = mOriginLabel == null ? "" : mOriginLabel;
++        boolean same = TextUtils.equals(from, to);
++        // Overlap the two strings. A threshold used to swap them in one frame.
++        float swap = same ? 1f : morphEase(unitRange((shrink - 0.16f) / 0.44f));
++        TextView fromView = mMorphFromText;
++        if (fromView != null) {
++            if (Math.abs(fromView.getTextSize() - size) > 0.25f) {
++                fromView.setTextSize(TypedValue.COMPLEX_UNIT_PX, size);
++            }
++            fromView.setTextColor(mBarTextColor);
++            if (!TextUtils.equals(fromView.getText(), from)) fromView.setText(from);
++            float fromAlpha = same ? 0f : 1f - swap;
++            if (fromView.getAlpha() != fromAlpha) fromView.setAlpha(fromAlpha);
++            int fromVis = fromAlpha <= 0.001f ? View.GONE : View.VISIBLE;
++            if (fromView.getVisibility() != fromVis) fromView.setVisibility(fromVis);
++        }
++        // Same string: one text view. Two strings: the origin holds the label and the
++        // from-view holds the bar text, and their alphas cross.
++        CharSequence shown = same ? from : to;
++        if (!TextUtils.equals(origin.getText(), shown)) origin.setText(shown);
++        float originAlpha = same ? 1f : swap;
++        if (origin.getAlpha() != originAlpha) origin.setAlpha(originAlpha);
+         origin.setTextColor(mBarTextColor);
+-        int lockVis = host ? mPillLockVisibility : View.GONE;
+-        int iconVis = host ? mPillIconVisibility : View.GONE;
+-        if (mPillLock != null && mPillLock.getVisibility() != lockVis) {
+-            mPillLock.setVisibility(lockVis);
+-        }
+-        if (mPillIcon != null && mPillIcon.getVisibility() != iconVis) {
+-            mPillIcon.setVisibility(iconVis);
+-        }
+         int padStart = Math.round(lerp(Math.max(0, mBarTextPadStart), dp(10), eased));
+         int padEnd = Math.round(lerp(Math.max(0, mBarTextPadEnd), dp(12), eased));
+         if (pill.getPaddingStart() != padStart || pill.getPaddingEnd() != padEnd) {
+             pill.setPaddingRelative(padStart, 0, padEnd, 0);
+         }
++        if (eased >= 1f) setTextStackMargin(dp(6));
++    }
++
++    private void setTextStackMargin(int margin) {
++        TextView origin = mPillOrigin;
++        if (origin == null || !(origin.getParent() instanceof View stack)) return;
++        if (!(stack.getLayoutParams() instanceof LinearLayout.LayoutParams params)) return;
++        if (params.getMarginStart() == margin) return;
++        params.setMarginStart(margin);
++        stack.setLayoutParams(params);
++    }
++
++    private static float unitRange(float t) {
++        if (t <= 0f) return 0f;
++        if (t >= 1f) return 1f;
++        return t;
+     }
+ 
+     /** Holds the handle row height while the pill is drawn outside it. */
+@@ -4621,6 +4796,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             background.setColor(color(0xFF2B2930, 0xFFE8EAED));
+             background.setCornerRadius(dp(PILL_HEIGHT_DP) / 2f);
+         }
++        settlePillIconsInFlow();
++        clearMorphFloats();
+     }
+ 
+     private void hideAddressView(@Nullable View view) {
+@@ -4678,6 +4855,286 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mAddressCaptured = false;
+     }
+ 
++    private void killWindowAnimations(@Nullable Window window) {
++        if (window == null) return;
++        WindowManager.LayoutParams lp = window.getAttributes();
++        if (lp.windowAnimations == 0) return;
++        lp.windowAnimations = 0;
++        window.setAttributes(lp);
++    }
++
++    /**
++     * The toolbar lays itself out after {@link #applyProgress} and puts its alpha back. This
++     * runs after that layout and before draw, so the old pill and the + cannot show through
++     * the sheet for a frame.
++     */
++    private void armMorphGuard() {
++        if (mMorphGuardOn) return;
++        if (sMorphGuardOwner != null && sMorphGuardOwner != this) {
++            sMorphGuardOwner.disarmMorphGuard();
++        }
++        sMorphGuardOwner = this;
++        View decor = mActivity.getWindow().getDecorView();
++        mMorphGuard =
++                () -> {
++                    if (mMorphGuardApplying) return true;
++                    if (!mMorphActive || !bottomBarMorph() || mProgress <= 0.001f) {
++                        disarmMorphGuard();
++                        return true;
++                    }
++                    mMorphGuardApplying = true;
++                    try {
++                        Dialog dialog = mGlassWindow;
++                        Window window = dialog != null ? dialog.getWindow() : null;
++                        killWindowAnimations(window);
++                        float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++                        fadeToolbarChrome(shrink);
++                        setAddressSurfaceHidden(true);
++                    } finally {
++                        mMorphGuardApplying = false;
++                    }
++                    return true;
++                };
++        decor.getViewTreeObserver().addOnPreDrawListener(mMorphGuard);
++        mMorphGuardOn = true;
++    }
++
++    private void disarmMorphGuard() {
++        if (sMorphGuardOwner == this) sMorphGuardOwner = null;
++        if (!mMorphGuardOn) return;
++        View decor = mActivity.getWindow().getDecorView();
++        ViewTreeObserver observer = decor.getViewTreeObserver();
++        if (observer.isAlive() && mMorphGuard != null) {
++            observer.removeOnPreDrawListener(mMorphGuard);
++        }
++        mMorphGuardOn = false;
++        mMorphGuard = null;
++    }
++
++    private void settlePillIconsInFlow() {
++        restoreFlowIcon(mPillLock, 0);
++        restoreFlowIcon(mPillIcon, dp(4));
++    }
++
++    private void restoreFlowIcon(@Nullable ImageView icon, int marginStart) {
++        if (icon == null) return;
++        icon.setTranslationX(0f);
++        icon.setTranslationY(0f);
++        icon.setScaleX(1f);
++        icon.setScaleY(1f);
++        if (icon.getAlpha() != 1f) icon.setAlpha(1f);
++        int vis = icon == mPillLock ? mPillLockVisibility : mPillIconVisibility;
++        LinearLayout.LayoutParams params =
++                icon.getLayoutParams() instanceof LinearLayout.LayoutParams existing
++                        ? existing
++                        : new LinearLayout.LayoutParams(dp(16), dp(16));
++        if (params.width != dp(16)
++                || params.height != dp(16)
++                || params.getMarginStart() != marginStart) {
++            params.width = dp(16);
++            params.height = dp(16);
++            params.setMarginStart(marginStart);
++            icon.setLayoutParams(params);
++        }
++        if (icon.getVisibility() != vis) icon.setVisibility(vis);
++    }
++
++    private void hideInFlowIcon(@Nullable ImageView icon) {
++        if (icon == null) return;
++        if (icon.getVisibility() != View.GONE) icon.setVisibility(View.GONE);
++    }
++
++    private void clearMorphFloats() {
++        for (int i = 0; i < mMorphExtraIcons.size(); i++) {
++            ImageView ghost = mMorphExtraIcons.get(i);
++            if (ghost.getAlpha() != 0f) ghost.setAlpha(0f);
++            if (ghost.getVisibility() != View.GONE) ghost.setVisibility(View.GONE);
++        }
++        mMorphExtraCount = 0;
++        TextView fromView = mMorphFromText;
++        if (fromView != null) {
++            if (fromView.getAlpha() != 0f) fromView.setAlpha(0f);
++            if (fromView.getVisibility() != View.GONE) fromView.setVisibility(View.GONE);
++        }
++    }
++
++    private ImageView morphGhost(int index) {
++        if (index < mMorphExtraIcons.size()) return mMorphExtraIcons.get(index);
++        ImageView ghost = new ImageView(mActivity);
++        ghost.setTag("morph_extra_icon");
++        ghost.setScaleType(ImageView.ScaleType.FIT_CENTER);
++        ghost.setClickable(false);
++        ghost.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        mMorphExtraIcons.add(ghost);
++        return ghost;
++    }
++
++    private boolean isKeptIcon(View view) {
++        int id = view.getId();
++        if (id == R.id.location_bar_status
++                || id == R.id.location_bar_site_favicon
++                || id == R.id.location_bar_site_settings_button) {
++            return true;
++        }
++        View status = mActivity.findViewById(R.id.location_bar_status);
++        return status instanceof ViewGroup && isInside(view, status);
++    }
++
++    /** Centre of {@code view} lies on the address-bar rect copied by {@link #readBarChrome}. */
++    private boolean iconSitsOnBar(View view) {
++        if (view.getWidth() <= 0 || view.getHeight() <= 0 || mBarWidthPx <= 0 || mBarHeightPx <= 0) {
++            return false;
++        }
++        int[] loc = new int[2];
++        view.getLocationOnScreen(loc);
++        int cx = loc[0] + view.getWidth() / 2;
++        int cy = loc[1] + view.getHeight() / 2;
++        return cx >= mBarOnScreen[0]
++                && cx < mBarOnScreen[0] + mBarWidthPx
++                && cy >= mBarOnScreen[1]
++                && cy < mBarOnScreen[1] + mBarHeightPx;
++    }
++
++    private int addBarIcon(ImageView[] out, int n, @Nullable View view) {
++        if (!(view instanceof ImageView image) || n >= out.length) return n;
++        if (image == mPillLock || image == mPillIcon) return n;
++        if ("morph_extra_icon".equals(String.valueOf(image.getTag()))) return n;
++        if (isInside(image, mRoot) || isInside(image, mOriginPill)) return n;
++        if (image.getDrawable() == null) return n;
++        for (int i = 0; i < n; i++) {
++            if (out[i] == image) return n;
++        }
++        out[n] = image;
++        return n + 1;
++    }
++
++    private int collectBarIcons(@Nullable View view, ImageView[] out, int n) {
++        if (view == null || n >= out.length) return n;
++        n = addBarIcon(out, n, view);
++        if (view instanceof ViewGroup group) {
++            for (int i = 0; i < group.getChildCount() && n < out.length; i++) {
++                n = collectBarIcons(group.getChildAt(i), out, n);
++            }
++        }
++        return n;
++    }
++
++    /**
++     * One copy of each bar icon, on the travelling pill. Icons that stay (lock, favicon) scale
++     * into their slot. The others fade and scale out over the first part of the shrink.
++     */
++    private void syncMorphIcons(
++            float shrink, float eased, float pillLeft, float pillTop, int pillW, int pillH) {
++        FrameLayout root = mRoot;
++        if (root == null) return;
++        ImageView[] sources = new ImageView[16];
++        int n = 0;
++        n = collectBarIcons(mActivity.findViewById(R.id.location_bar), sources, n);
++        n = addBarIcon(sources, n, mActivity.findViewById(R.id.location_bar_status));
++        n = addBarIcon(sources, n, mActivity.findViewById(R.id.location_bar_site_favicon));
++        n = addBarIcon(sources, n, mActivity.findViewById(R.id.location_bar_site_settings_button));
++        float extra = 1f - morphEase(unitRange(shrink / 0.4f));
++        float extraScale = lerp(1f, 0.7f, 1f - extra);
++        boolean keptGhost = false;
++        int used = 0;
++        int[] loc = new int[2];
++        for (int i = 0; i < n && used < 12; i++) {
++            ImageView source = sources[i];
++            boolean keep = isKeptIcon(source);
++            if (!keep && !iconSitsOnBar(source)) continue;
++            // Every bar icon fades in place. Sliding the lock onto the text drew a
++            // second glyph on top of the url ("eexample").
++            if (keep) keptGhost = true;
++            float alpha = extra;
++            if (alpha <= 0.001f) continue;
++            source.getLocationOnScreen(loc);
++            float relX = loc[0] - mBarOnScreen[0];
++            float relY = loc[1] - mBarOnScreen[1];
++            int sourceW = Math.max(1, source.getWidth());
++            int sourceH = Math.max(1, source.getHeight());
++            float x = pillLeft + relX;
++            float y = pillTop + relY;
++            int w = Math.max(1, Math.round(sourceW * extraScale));
++            int h = Math.max(1, Math.round(sourceH * extraScale));
++            ImageView ghost = morphGhost(used);
++            Drawable drawable = source.getDrawable();
++            if (ghost.getDrawable() == null
++                    || drawable == null
++                    || ghost.getDrawable().getConstantState() != drawable.getConstantState()) {
++                Drawable copy =
++                        drawable != null && drawable.getConstantState() != null
++                                ? drawable.getConstantState().newDrawable().mutate()
++                                : drawable;
++                ghost.setImageDrawable(copy);
++            }
++            placeMorphFloat(ghost, root, w, h, x, y, alpha);
++            if (ghost.getParent() != root) continue;
++            used++;
++        }
++        mMorphExtraCount = used;
++        for (int i = used; i < mMorphExtraIcons.size(); i++) {
++            ImageView ghost = mMorphExtraIcons.get(i);
++            if (ghost.getVisibility() != View.GONE) ghost.setVisibility(View.GONE);
++        }
++        // The in-flow lock would sit on top of the copied status icon. With those
++        // icons out of the row, the text margin would shove the glyphs off the url.
++        if (keptGhost && eased < 1f) {
++            hideInFlowIcon(mPillLock);
++            hideInFlowIcon(mPillIcon);
++            setTextStackMargin(0);
++        }
++    }
++
++    private void placeMorphFloat(
++            View view, FrameLayout root, int width, int height, float left, float top, float alpha) {
++        if (view.getParent() != root) {
++            if (mDetachingChild) return;
++            if (!detachFromParent(view) || view.getParent() != null) return;
++            root.addView(
++                    view,
++                    new FrameLayout.LayoutParams(width, height, Gravity.TOP | Gravity.START));
++        }
++        float z = morphPillZ() + dp(2);
++        if (view.getElevation() != z) view.setElevation(z);
++        View pill = mOriginPill;
++        if (pill != null
++                && pill.getParent() == root
++                && root.indexOfChild(view) < root.indexOfChild(pill)) {
++            view.bringToFront();
++        }
++        FrameLayout.LayoutParams params =
++                view.getLayoutParams() instanceof FrameLayout.LayoutParams existing
++                        ? existing
++                        : new FrameLayout.LayoutParams(width, height);
++        if (params.width != width
++                || params.height != height
++                || params.gravity != (Gravity.TOP | Gravity.START)) {
++            params.width = width;
++            params.height = height;
++            params.gravity = Gravity.TOP | Gravity.START;
++            params.leftMargin = 0;
++            params.topMargin = 0;
++            view.setLayoutParams(params);
++        }
++        view.setTranslationX(left);
++        view.setTranslationY(top);
++        if (view.getAlpha() != alpha) view.setAlpha(alpha);
++        if (view.getVisibility() != View.VISIBLE) view.setVisibility(View.VISIBLE);
++    }
++
++    private void fadeToolbarPiece(int id, float alpha, float scale) {
++        View view = mActivity.findViewById(id);
++        if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) return;
++        if (view.getAlpha() != alpha) view.setAlpha(alpha);
++        if (view.getScaleX() != scale) view.setScaleX(scale);
++        if (view.getScaleY() != scale) view.setScaleY(scale);
++    }
++
++    private void fadeNamedToolbarPiece(String name, float alpha, float scale) {
++        int id = mActivity.getResources().getIdentifier(name, "id", mActivity.getPackageName());
++        if (id != 0) fadeToolbarPiece(id, alpha, scale);
++    }
++
+     /**
+      * One object, from the location bar rect to the 32dp pill on the sheet top. The real bar is
+      * hidden while this is up. At the half detent the pill is parked in the handle row.
+@@ -4689,18 +5146,40 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         applySheetInsets();
+         boolean show = mProgress > 0.001f && root.getVisibility() == View.VISIBLE;
+         if (!show) {
++            disarmMorphGuard();
+             if (mMorphActive) {
+                 mMorphActive = false;
+                 resetMorphPillLook();
+             }
++            clearMorphFloats();
+             removePillSlot();
+             if (pill.getVisibility() != View.GONE) pill.setVisibility(View.GONE);
+             if (pill.getAlpha() != 1f) pill.setAlpha(1f);
+             pill.setTranslationX(0f);
+             pill.setTranslationY(0f);
++            hideBottomBarCover();
+             fadeToolbarChrome(0f);
+             setAddressSurfaceHidden(false);
+             mCachedBarUrl = null;
++            mMorphAnchored = false;
++            suppressToolbarSceneLayer(false);
++            return;
++        }
++        // The glass window is still the closed one. Drawing the morph now puts it
++        // a bar-height above the real pill. Wait until this window covers that rect.
++        if (morphWindowLagsBar()) {
++            disarmMorphGuard();
++            mMorphAnchored = false;
++            if (mMorphActive) {
++                mMorphActive = false;
++                resetMorphPillLook();
++            }
++            clearMorphFloats();
++            if (pill.getVisibility() != View.GONE) pill.setVisibility(View.GONE);
++            hideBottomBarCover();
++            fadeToolbarChrome(0f);
++            setAddressSurfaceHidden(false);
++            suppressToolbarSceneLayer(false);
+             return;
+         }
+         mMorphActive = true;
+@@ -4708,6 +5187,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         float eased = morphEase(shrink);
+         View location = mActivity.findViewById(R.id.location_bar);
+         readBarChrome(location);
++        // The first frame the morph is drawn is the real bar, pixel for pixel.
++        // Progress may already be a few percent by the time the window covers it.
++        if (!mMorphAnchored && mBarWidthPx > 0) {
++            shrink = 0f;
++            eased = 0f;
++            mMorphAnchored = true;
++        }
+         int endW = settledPillWidth();
+         int endH = dp(PILL_HEIGHT_DP);
+         int startW =
+@@ -4726,6 +5212,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // Below half the list can overlap the handle row, so the pill rides the sheet top on
+         // the root, above the cards, and is parked in the handle row only from half up.
+         if (eased >= 1f && mProgress >= BareTabSheetSnap.HALF_RATIO - 0.001f) {
++            settlePillIconsInFlow();
++            clearMorphFloats();
+             parkPillInHandleRow(pill, width, height);
+         } else {
+             float startLeft = mBarLeftPx;
+@@ -4739,19 +5227,26 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             int panelW = mPanelWidth > 0 ? mPanelWidth : rootW;
+             if (rootW > 0 && panelW > rootW) panelW = rootW;
+             int panelLeft = rootW > 0 ? Math.max(0, (rootW - panelW) / 2) : 0;
+-            int panelH = Math.max(1, Math.round(mProgress * sheetRangeHeight()));
+-            int panelTop = rootH - mSheetBottomLift - sheetBottomSeam() - panelH;
+             int pad = mHandleRow != null ? mHandleRow.getPaddingTop() : dp(10);
+             float left = lerp(startLeft + startW / 2f, panelLeft + panelW / 2f, eased) - width / 2f;
++            // Lerp toward the half-open handle, not the panel's current top. The panel is
++            // pinned to this pill afterwards, so the two stay one shape from the first frame.
++            int stableRange =
++                    Math.max(1, rootH - dp(SHEET_FULL_GAP_DP) - sheetBottomSeam());
++            int halfH = Math.round(BareTabSheetSnap.HALF_RATIO * stableRange);
++            int halfTop = rootH - sheetBottomSeam() - halfH;
++            float endTop = halfTop + pad;
+             float top =
+-                    lerp(startTop + startH / 2f, panelTop + pad + endH / 2f, eased) - height / 2f;
+-            // Never trail below the sheet's top edge: once the edge has passed the bar the pill
+-            // rides it, above the first cards, while its size keeps morphing.
+-            top = Math.min(top, panelTop + pad);
++                    lerp(startTop + startH / 2f, endTop + endH / 2f, eased) - height / 2f;
+             placePillOnRoot(pill, root, width, height, left, top);
++            syncMorphIcons(shrink, eased, left, top, width, height);
+         }
+         fadeToolbarChrome(shrink);
+         setAddressSurfaceHidden(true);
++        // The pre-draw guard rewrote visibility every frame and kept layout running.
++        disarmMorphGuard();
++        suppressToolbarSceneLayer(true);
++        layoutBottomBarCover();
+         if (pill.getAlpha() != 1f) pill.setAlpha(1f);
+         if (pill.getVisibility() != View.VISIBLE) pill.setVisibility(View.VISIBLE);
+     }
+@@ -4769,6 +5264,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             removePillSlot();
+             setAddressSurfaceHidden(false);
+             mCachedBarUrl = null;
++            mMorphAnchored = false;
++            suppressToolbarSceneLayer(false);
+         }
+         layoutAnchoredOriginPill();
+     }
+@@ -4915,25 +5412,172 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     /** Fades the real address bar so its URL and side buttons are not left under the pill. */
++
++    /**
++     * The + row is {@code bottom_bar_container}, not the phone toolbar. View alpha on the phone
++     * toolbar does not change those pixels. This fades that row and hides it once it is gone.
++     */
++    private void fadeBottomButtonBar(float alpha, float scale) {
++        // The + row is the sheet's anchor. View alpha does not fade it, and hiding
++        // it pops the whole row in one frame. Leave it sharp and outside the window.
++        if (!bottomBarMorph() || alpha < -1f || scale < -1f) return;
++        View buttons = bottomButtonBar();
++        if (buttons == null) return;
++        if (buttons.getAlpha() != 1f) buttons.setAlpha(1f);
++        if (buttons.getScaleX() != 1f) buttons.setScaleX(1f);
++        if (buttons.getScaleY() != 1f) buttons.setScaleY(1f);
++        if (mBottomBarVisHeld) {
++            if (buttons.getVisibility() != mSavedBottomBarVis) {
++                buttons.setVisibility(mSavedBottomBarVis);
++            }
++            mBottomBarVisHeld = false;
++        }
++    }
++
++    /**
++     * The glass window is transparent over the address pill, and the compositor can keep
++     * painting that pill for a frame after it is set invisible. An opaque patch in the
++     * toolbar colour hides it. The morph pill is drawn above this patch.
++     */
++    private void layoutBottomBarCover() {
++        if (!bottomBarMorph()) return;
++        FrameLayout root = mRoot;
++        if (root == null) return;
++        if (mBarHeightPx <= 0 && mSheetBottomLift <= 0) return;
++        View cover = mBottomBarCover;
++        if (cover == null) {
++            cover = new View(mActivity);
++            cover.setTag("sheet_bottom_bar_cover");
++            cover.setClickable(false);
++            cover.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++            mBottomBarCover = cover;
++        }
++        int color = liveBottomChromeColor();
++        Drawable background = cover.getBackground();
++        if (!(background instanceof ColorDrawable paint) || paint.getColor() != color) {
++            cover.setBackgroundColor(color);
++        }
++        View pill = mOriginPill;
++        if (cover.getParent() != root) {
++            if (mDetachingChild) return;
++            if (!detachFromParent(cover) || cover.getParent() != null) return;
++            int index =
++                    pill != null && pill.getParent() == root
++                            ? root.indexOfChild(pill)
++                            : root.getChildCount();
++            root.addView(
++                    cover,
++                    index,
++                    new FrameLayout.LayoutParams(
++                            root.getWidth(), mBarHeightPx, Gravity.TOP | Gravity.START));
++        }
++        // Cover from the live location-bar top to the bottom of the sheet window.
++        // Elevation stays under the pill and above the scrim, so the compositor
++        // pill cannot show through for the frames after it is set invisible.
++        View bar = mActivity.findViewById(R.id.location_bar);
++        int top;
++        int coverH;
++        if (bar != null
++                && bar.getHeight() > 0
++                && root.getHeight() > 0
++                && root.isAttachedToWindow()
++                && bar.isAttachedToWindow()) {
++            int[] barAt = new int[2];
++            int[] rootAt = new int[2];
++            bar.getLocationOnScreen(barAt);
++            root.getLocationOnScreen(rootAt);
++            top = barAt[1] - rootAt[1];
++            if (mGhostCoverFrames > 0) {
++                // One recorded frame showed the real pill one bar above the morph.
++                // The window already includes that y. The cover did not.
++                top -= bar.getHeight() + dp(16);
++            }
++            coverH = root.getHeight() - top;
++        } else {
++            coverH = Math.max(mBarHeightPx, mSheetBottomLift);
++            top = root.getHeight() - coverH;
++        }
++        if (coverH < 1) coverH = Math.max(1, mBarHeightPx);
++        if (top < 0) {
++            coverH += top;
++            top = 0;
++        }
++        float z = dp(20);
++        if (cover.getElevation() != z) cover.setElevation(z);
++        cover.setTranslationX(0f);
++        cover.setTranslationY(top);
++        if (cover.getAlpha() != 1f) cover.setAlpha(1f);
++        if (cover.getVisibility() != View.VISIBLE) cover.setVisibility(View.VISIBLE);
++        int coverW = Math.max(mBarWidthPx, root.getWidth());
++        FrameLayout.LayoutParams laid =
++                cover.getLayoutParams() instanceof FrameLayout.LayoutParams slot
++                        ? slot
++                        : null;
++        if (laid != null && (laid.height != coverH || laid.width != coverW)) {
++            laid.height = coverH;
++            laid.width = coverW;
++            cover.setLayoutParams(laid);
++        }
++        hideBottomButtonCover();
++        tickGhostCover(root);
++    }
++
++    /** Drops the extra cover strip after a few frames, once the texture is gone. */
++    private void tickGhostCover(FrameLayout root) {
++        if (mGhostCoverFrames <= 0 || mGhostCoverTickPosted) return;
++        mGhostCoverTickPosted = true;
++        root.postOnAnimation(
++                () -> {
++                    mGhostCoverTickPosted = false;
++                    if (mGhostCoverFrames > 0) mGhostCoverFrames--;
++                    if (mMorphActive && mRoot != null) layoutBottomBarCover();
++                });
++    }
++
++    /** The + row stays visible. Drop a cover left over from an older build. */
++    private void hideBottomButtonCover() {
++        View cover = mBottomButtonCover;
++        if (cover != null && cover.getVisibility() != View.GONE) cover.setVisibility(View.GONE);
++    }
++
++    private void hideBottomBarCover() {
++        View cover = mBottomBarCover;
++        if (cover != null && cover.getVisibility() != View.GONE) cover.setVisibility(View.GONE);
++        View buttons = mBottomButtonCover;
++        if (buttons != null && buttons.getVisibility() != View.GONE) {
++            buttons.setVisibility(View.GONE);
++        }
++    }
++
+     private void fadeToolbarChrome(float shrink) {
+-        float alpha = shrink <= 0f ? 1f : Math.max(0f, 1f - shrink / TOOLBAR_FADE_SHRINK);
++        float linear = shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
++        // Bottom-bar buttons scale out with the fade. Top-bar keeps the linear fade it had.
++        float gone = bottomBarMorph() ? morphEase(linear) : linear;
++        float alpha = 1f - gone;
++        float scale = bottomBarMorph() ? lerp(1f, 0.86f, gone) : 1f;
+         setToolbarAlpha(R.id.control_container, alpha);
+         setToolbarAlpha(R.id.toolbar_container, alpha);
+         setToolbarAlpha(R.id.toolbar, alpha);
+         setToolbarAlpha(R.id.location_bar, alpha);
+         setToolbarAlpha(R.id.url_bar, alpha);
+-        setToolbarAlpha(R.id.home_button, alpha);
+-        setToolbarAlpha(R.id.back_button, alpha);
+-        setToolbarAlpha(R.id.toolbar_buttons, alpha);
++        fadeToolbarPiece(R.id.home_button, alpha, scale);
++        fadeToolbarPiece(R.id.back_button, alpha, scale);
++        fadeToolbarPiece(R.id.toolbar_buttons, alpha, scale);
++        fadeNamedToolbarPiece("tab_switcher_button", alpha, scale);
++        fadeBottomButtonBar(alpha, scale);
+         // The compositor and later toolbar layout passes can restore a child's alpha.
+         // Once the bar has faded, hide the container so the URL cannot show through.
+         // Never hide the bar while it is still carrying the pull: a hidden view stops getting the
+         // rest of the gesture, and the sheet would be left part-way with no release.
+-        int vis = alpha <= 0.001f && !mToolbarPulling ? View.INVISIBLE : View.VISIBLE;
+-        for (int id : new int[] {R.id.control_container, R.id.toolbar_container}) {
+-            View view = mActivity.findViewById(id);
+-            if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) continue;
+-            if (view.getVisibility() != vis) view.setVisibility(vis);
++        // Hiding the container on a bottom bar also hides the + row, in one frame.
++        // The address-bar views are hidden on their own. Top-bar mode still hides it.
++        if (!bottomBarMorph()) {
++            int vis = alpha <= 0.001f && !mToolbarPulling ? View.INVISIBLE : View.VISIBLE;
++            for (int id : new int[] {R.id.control_container, R.id.toolbar_container}) {
++                View view = mActivity.findViewById(id);
++                if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) continue;
++                if (view.getVisibility() != vis) view.setVisibility(vis);
++            }
+         }
+     }
+ 
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java b/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java
+index ce21c0bb78..fe0729c921 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java
+@@ -517,6 +517,8 @@ public class ToolbarManager
+     private @Nullable ViewMarginAdjusterForSideUi mProgressBarSideUiObserver;
+     private boolean mIsVerticalTabsHiddenDueToNarrow;
+     private boolean mIsXrFsm;
++    /** Bare bottom-sheet morph. Keeps the captured toolbar texture hidden. */
++    private boolean mBareSheetHidesToolbarSceneLayer;
+     private int mRestoredLeftMargin;
+     private int mRestoredRightMargin;
+ 
+@@ -4280,7 +4282,22 @@ public class ToolbarManager
+     }
+ 
+     private void updateToolbarSceneLayerSuppression() {
+-        mSuppressToolbarSceneLayerSupplier.set(mIsXrFsm || mIsVerticalTabsHiddenDueToNarrow);
++        mSuppressToolbarSceneLayerSupplier.set(
++                mIsXrFsm || mIsVerticalTabsHiddenDueToNarrow || mBareSheetHidesToolbarSceneLayer);
++    }
++
++    /**
++     * Bare sheet morph. Hides the composited toolbar (the texture TopToolbarOverlay draws from
++     * the control container's capture) without changing XR or narrow-window suppression.
++     * Dropping the bitmap keeps a stale pill from lasting the frame the layer turns off.
++     */
++    public void setBareSheetHidesToolbarSceneLayer(boolean hide) {
++        boolean changed = mBareSheetHidesToolbarSceneLayer != hide;
++        mBareSheetHidesToolbarSceneLayer = hide;
++        updateToolbarSceneLayerSuppression();
++        if (hide && changed && mControlContainer != null) {
++            mControlContainer.getToolbarResourceAdapter().dropCachedBitmap();
++        }
+     }
+ 
+     @VisibleForTesting
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index fca54dc5de..6b04fb2094 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1334,6 +1334,171 @@ public class BareVerticalTabsDrawerUnitTest {
+     }
+ 
+     @Test
++    public void testTheMorphCrossfadesTheBarTextAndFadesIcons() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        FrameLayout bar = new FrameLayout(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        android.graphics.drawable.GradientDrawable barBackground =
++                new android.graphics.drawable.GradientDrawable();
++        barBackground.setColor(0xFF123456);
++        barBackground.setCornerRadius(px(12));
++        bar.setBackground(barBackground);
++        android.widget.TextView url = new android.widget.TextView(mActivity);
++        url.setId(org.chromium.chrome.R.id.url_bar);
++        url.setText("https://www.one.com/some_path.html");
++        url.setTextColor(0xFF111111);
++        bar.addView(
++                url,
++                new FrameLayout.LayoutParams(
++                        ViewGroup.LayoutParams.WRAP_CONTENT,
++                        ViewGroup.LayoutParams.WRAP_CONTENT,
++                        Gravity.CENTER_VERTICAL));
++        android.widget.ImageView extra = new android.widget.ImageView(mActivity);
++        extra.setImageDrawable(new android.graphics.drawable.ColorDrawable(0xFF010101));
++        bar.addView(
++                extra,
++                new FrameLayout.LayoutParams(
++                        px(18), px(18), Gravity.CENTER_VERTICAL | Gravity.START));
++        FrameLayout.LayoutParams barParams =
++                new FrameLayout.LayoutParams(px(280), px(48), Gravity.BOTTOM);
++        barParams.leftMargin = px(40);
++        barParams.bottomMargin = px(64);
++        content().addView(bar, barParams);
++
++        View home = new View(mActivity);
++        home.setId(org.chromium.chrome.R.id.home_button);
++        home.setAlpha(1f);
++        home.setScaleX(1f);
++        content().addView(home, new FrameLayout.LayoutParams(px(40), px(40), Gravity.BOTTOM));
++
++        mDrawer.beginToolbarPull();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        content().measure(
++                View.MeasureSpec.makeMeasureSpec(px(400), View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(px(800), View.MeasureSpec.EXACTLY));
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        int range = root.getHeight() - sheetGap();
++        mDrawer.updateToolbarPull(range * 0.004f);
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.004f);
++
++        assertEquals(1, countTag("sheet_origin_pill"));
++        assertEquals(View.INVISIBLE, bar.getVisibility());
++        android.widget.TextView from = (android.widget.TextView) findTag("morph_from_text");
++        assertNotNull(from);
++        assertEquals("https://www.one.com/some_path.html", from.getText().toString());
++        assertTrue(from.getAlpha() > 0.9f);
++        assertTrue(home.getAlpha() > 0.9f);
++        View ghost = findTag("morph_extra_icon");
++        assertNotNull(ghost);
++        assertEquals(View.VISIBLE, ghost.getVisibility());
++        assertTrue("ghost " + ghost.getAlpha(), ghost.getAlpha() > 0.9f);
++
++        mDrawer.updateToolbarPull(range * 0.05f);
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.05f);
++        assertTrue("home " + home.getAlpha(), home.getAlpha() > 0.55f && home.getAlpha() < 0.95f);
++        assertTrue(home.getScaleX() < 1f);
++        assertTrue("ghost " + ghost.getAlpha(), ghost.getAlpha() > 0.55f && ghost.getAlpha() < 0.98f);
++        assertEquals(View.INVISIBLE, bar.getVisibility());
++        assertEquals(1, countTag("sheet_origin_pill"));
++
++        mDrawer.updateToolbarPull(range * BareTabSheetSnap.HALF_RATIO);
++        android.widget.TextView origin = (android.widget.TextView) findTag("sheet_pill_origin");
++        assertEquals(mSecond.getUrl().getHost(), origin.getText().toString());
++        assertEquals(1f, origin.getAlpha(), 0.02f);
++        assertTrue(from.getVisibility() != View.VISIBLE || from.getAlpha() < 0.02f);
++        assertEquals(0f, home.getAlpha(), 0.02f);
++        assertTrue(ghost.getVisibility() != View.VISIBLE || ghost.getAlpha() < 0.02f);
++
++        mDrawer.updateToolbarPull(-range);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.VISIBLE, bar.getVisibility());
++        assertEquals(1f, home.getAlpha(), 0.001f);
++        assertEquals(1f, home.getScaleX(), 0.001f);
++        assertEquals(View.GONE, originPill().getVisibility());
++        assertTrue(ghost.getVisibility() != View.VISIBLE);
++    }
++
++    @Test
++    public void testTheBottomSheetWindowDoesNotAnimate() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        android.app.Dialog dialog = mDrawer.glassWindowForTesting();
++        assertNotNull(dialog);
++        assertEquals(0, dialog.getWindow().getAttributes().windowAnimations);
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++    }
++
++    @Test
++    public void testTheFiveButtonBarFadesOnABottomSheetAndStaysPutOnTop() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View buttons = new View(mActivity);
++        buttons.setId(BareVerticalTabsDrawer.bottomBarIdForTesting());
++        buttons.setAlpha(1f);
++        buttons.setVisibility(View.VISIBLE);
++        content().addView(buttons, new FrameLayout.LayoutParams(px(400), px(56), Gravity.BOTTOM));
++        android.widget.TextView bar = new android.widget.TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/path");
++        content().addView(bar, new FrameLayout.LayoutParams(px(280), px(48), Gravity.BOTTOM));
++
++        mDrawer.beginToolbarPull();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        content().measure(
++                View.MeasureSpec.makeMeasureSpec(px(400), View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(px(800), View.MeasureSpec.EXACTLY));
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        int range = root.getHeight() - sheetGap();
++        mDrawer.updateToolbarPull(range * 0.2f);
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.2f);
++
++        View cover = findTag("sheet_bottom_bar_cover");
++        assertEquals(View.VISIBLE, cover.getVisibility());
++        assertEquals(1f, cover.getAlpha(), 0.001f);
++        View buttonCover = findTag("sheet_bottom_button_cover");
++        assertTrue(buttonCover == null || buttonCover.getVisibility() == View.GONE);
++        assertEquals(1f, buttons.getAlpha(), 0.001f);
++        assertEquals(View.VISIBLE, buttons.getVisibility());
++        View pill = originPill();
++        android.view.ViewGroup host = (android.view.ViewGroup) root;
++        assertTrue(host.indexOfChild(pill) > host.indexOfChild(cover));
++
++        mDrawer.updateToolbarPull(-range);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, buttons.getAlpha(), 0.001f);
++        assertEquals(View.VISIBLE, buttons.getVisibility());
++        assertEquals(View.GONE, cover.getVisibility());
++        assertTrue(buttonCover == null || buttonCover.getVisibility() == View.GONE);
++
++        // Top address bar: the five-button row is not part of that morph.
++        setAddressBarOnTop(true);
++        buttons.setAlpha(1f);
++        mDrawer.beginToolbarPull();
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.2f);
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.2f);
++        assertEquals(1f, buttons.getAlpha(), 0.001f);
++        assertEquals(View.VISIBLE, buttons.getVisibility());
++    }
++
+     public void testLettingGoOfAToolbarPullSnapsToTheNearestStop() {
+         setAddressBarOnTop(false);
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+-- 
+2.34.1
+
