@@ -1,0 +1,812 @@
+From f4be37f79fdb40352929d1d7e39c67dc6f157179 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:12:37 +0000
+Subject: [PATCH] Bare: show the keyboard for tab search and focus the omnibox
+ from the pill
+
+Opening tab search from the sheet now clears the IME suppression flag and
+defers showing the keyboard until the sheet window has focus, so the soft
+keyboard reliably appears and results stay above it. Tapping the origin
+pill closes the sheet and defers focusing the omnibox until the activity
+window regains focus, so the address bar is focused with the keyboard up.
+
+Back still hides the keyboard first, then clears the search and returns the sheet
+to its stop, then closes it.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 420 ++++++++++++++++--
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 164 ++++++-
+ 2 files changed, 551 insertions(+), 33 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index f178085602..3e3d407581 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -65,6 +65,7 @@ import androidx.core.view.NestedScrollingParent3;
+ import androidx.core.view.NestedScrollingParentHelper;
+ import androidx.core.view.ViewCompat;
+ import androidx.core.view.WindowInsetsCompat;
++import androidx.core.view.WindowInsetsControllerCompat;
+ import androidx.core.view.accessibility.AccessibilityNodeInfoCompat.AccessibilityActionCompat;
+ import androidx.recyclerview.widget.DefaultItemAnimator;
+ import androidx.recyclerview.widget.DiffUtil;
+@@ -155,6 +156,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final float PILL_MAX_WIDTH_DP = 280f;
+     /** The real bar is gone by this fraction of the shrink, so its text never sits under the pill. */
+     private static final float TOOLBAR_FADE_SHRINK = 0.35f;
++    // Posts while waiting for window focus before showing a keyboard or focusing the
++    // omnibox. The focus listener is the real signal; these cover a missed event.
++    private static final int FOCUS_IME_ATTEMPTS = 8;
+ 
+     /** Address-bar tab swipes are off while a sheet is on screen. The side drawer leaves them. */
+     private static boolean sSuppressAddressBarTabSwipe;
+@@ -213,6 +217,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private final ViewTreeObserver.OnGlobalFocusChangeListener mFocusListener =
+             (oldFocus, newFocus) -> onFocusMoved(newFocus);
+     private @Nullable ViewTreeObserver mFocusObserver;
++    private @Nullable ViewTreeObserver mDialogLayoutObserver;
+     // While the sheet is open, follows the keyboard so it does not cover the sheet or the field.
+     private final ViewTreeObserver.OnGlobalLayoutListener mLayoutListener = this::onWindowLayout;
+     // The address bar, shrunk to a 32dp origin pill. It rides the sheet's top edge and is the
+@@ -273,6 +278,30 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private BareTabSheetSnap.@Nullable State mStopBeforeSearch;
+     // How many times a pill tap has asked the omnibox to take focus.
+     private int mOmniboxFocusRequests;
++    // Set by a pill tap. Cleared if the sheet opens again before the close finishes.
++    private boolean mPendingOmniboxFocus;
++    private boolean mOmniboxFocusWaiting;
++    private int mOmniboxFocusAttemptsLeft;
++    private @Nullable Runnable mOmniboxFocusRetry;
++    private @Nullable View mOmniboxFocusPostTarget;
++    private ViewTreeObserver.@Nullable OnWindowFocusChangeListener mOmniboxFocusListener;
++    private @Nullable View mOmniboxFocusView;
++    // One keyboard request per time the search field takes focus.
++    private int mSearchImeShows;
++    private boolean mSearchImeWanted;
++    private boolean mSearchImeShownThisFocus;
++    private boolean mSearchImeWaiting;
++    private boolean mRequestingSearchIme;
++    private int mSearchImeAttemptsLeft;
++    private @Nullable Runnable mSearchImeRetry;
++    private @Nullable View mSearchImePostTarget;
++    private ViewTreeObserver.@Nullable OnWindowFocusChangeListener mSearchImeFocusListener;
++    private @Nullable View mSearchImeFocusView;
++    private boolean mSoftInputModeSaved;
++    private int mSavedSoftInputMode;
++    // Screen Y of the keyboard's top while it is showing. -1 when it is not.
++    private int mLatchedImeTop = -1;
++    private boolean mInWindowLayout;
+     // How far the keyboard lifts the bottom search field, and the sheet with it; and how much of
+     // a sheet dropped from the top it would otherwise cover.
+     private int mImeLift;
+@@ -446,6 +475,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mRefreshPending = false;
+         setBackProgress(0f);
+         mOpen = true;
++        // A pill tap's omnibox request belongs to a close that stays closed.
++        cancelPendingOmniboxFocus();
+         watchFocus(true);
+         mObservedSelector = selector;
+         selector.getCurrentTabModelSupplier().addSyncObserverAndCallIfNonNull(mModelSwitched);
+@@ -498,6 +529,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (!mOpen) return;
+         mOpen = false;
+         watchFocus(false);
++        watchDialogLayout(false);
+         // The search goes with the sheet: the next open lists every tab again.
+         clearSearch();
+         if (mBackCallback != null) mBackCallback.setEnabled(false);
+@@ -512,11 +544,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         mSettledState = null;
+                         mImeLift = 0;
+                         mImeCover = 0;
++                        mLatchedImeTop = -1;
+                         updateHandleAccessibility();
+                     }
+                     Dialog glass = mGlassWindow;
+                     if (glass != null && !mOpen && glass.isShowing()) glass.dismiss();
+                     releaseObservers();
++                    // The dialog is gone. Focus the omnibox only if this close stuck.
++                    if (!mOpen) deliverPendingOmniboxFocus();
+                 });
+     }
+ 
+@@ -525,6 +560,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (mAnimator != null) mAnimator.cancel();
+         if (mBackAnimator != null) mBackAnimator.cancel();
+         watchFocus(false);
++        watchDialogLayout(false);
++        cancelPendingOmniboxFocus();
++        cancelSearchImeWait();
+         releaseObservers();
+         if (mBackCallback != null) mBackCallback.remove();
+         mBackCallback = null;
+@@ -567,6 +605,24 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mFocusObserver = observer;
+     }
+ 
++    /** The glass dialog's decor, so a keyboard on that window still moves the sheet. */
++    private void watchDialogLayout(boolean watch) {
++        ViewTreeObserver current = mDialogLayoutObserver;
++        if (current != null && current.isAlive()) {
++            current.removeOnGlobalLayoutListener(mLayoutListener);
++        }
++        mDialogLayoutObserver = null;
++        if (!watch) return;
++        Dialog dialog = mGlassWindow;
++        Window window = dialog != null ? dialog.getWindow() : null;
++        View decor = window != null ? window.getDecorView() : null;
++        if (decor == null) return;
++        ViewTreeObserver observer = decor.getViewTreeObserver();
++        if (!observer.isAlive()) return;
++        observer.addOnGlobalLayoutListener(mLayoutListener);
++        mDialogLayoutObserver = observer;
++    }
++
+     private void onFocusMoved(@Nullable View focused) {
+         if (!mOpen || !isSheetChrome() || focused == null || !focused.onCheckIsTextEditor()) {
+             return;
+@@ -1656,6 +1712,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 shapeGlassWindow();
+                 if (!mGlassWindow.isShowing()) mGlassWindow.show();
+             }
++            watchDialogLayout(glass && isSheetChrome());
+             return;
+         }
+         if (root.getParent() instanceof ViewGroup parent) parent.removeView(root);
+@@ -1671,6 +1728,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             }
+             Dialog old = mGlassWindow;
+             if (old != null && old.isShowing()) old.dismiss();
++            watchDialogLayout(false);
+             return;
+         }
+         Dialog window = mGlassWindow;
+@@ -1722,6 +1780,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         shapeGlassWindow();
+         setBlur(mProgress);
+         window.show();
++        watchDialogLayout(isSheetChrome());
+     }
+ 
+     /**
+@@ -1736,7 +1795,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (isSheetChrome()) {
+             // Not focusable puts a window above the keyboard; the sheet's goes behind it, so a
+             // search's keyboard is never hidden. The drawer's window is left as it was.
+-            w.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
++            // A running search cleared both flags so the field can take the keyboard.
++            // Putting this one back would make the window ignore the keyboard again.
++            if (!mSearchExpanded) {
++                w.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
++            }
+             applySheetInsets();
+             return;
+         }
+@@ -3150,13 +3213,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void closeAndFocusOmnibox() {
+-        mOmniboxFocusRequests++;
++        // The glass dialog is still up here. Focusing now loses to its teardown, so remember
++        // the request and run it once the close has finished and the activity window is focused.
++        mPendingOmniboxFocus = true;
+         close();
+-        if (!(mActivity instanceof ChromeActivity chromeActivity)) return;
+-        if (chromeActivity.getToolbarManager() == null) return;
+-        chromeActivity
+-                .getToolbarManager()
+-                .focusAndSelectAllUrlBarText(OmniboxFocusReason.OMNIBOX_TAP);
+     }
+ 
+     /** The magnifier's field, in the action row, hidden until the magnifier is tapped. */
+@@ -3271,9 +3331,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         beginSearchRowTransition();
+         applySearchRow();
+         setSheetWindowFocusForSearch(true);
++        mSearchImeWanted = true;
+         if (!mSearchField.requestFocus()) onSearchFocused();
+-        InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
+-        if (imm != null) imm.showSoftInput(mSearchField, InputMethodManager.SHOW_IMPLICIT);
++        requestSearchIme();
+     }
+ 
+     private void onSearchChanged(String text) {
+@@ -3296,7 +3356,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             applySearchRow();
+             setSheetWindowFocusForSearch(true);
+         }
++        mSearchImeWanted = true;
+         settleSheet(BareTabSheetSnap.State.FULL, /* announce= */ true);
++        requestSearchIme();
+     }
+ 
+     private static @Nullable Boolean sImeVisibleForTesting;
+@@ -3306,6 +3368,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         sImeVisibleForTesting = visible;
+     }
+ 
++    /**
++     * Robolectric windows are not always focused. Tests set this to hold a keyboard or omnibox
++     * request until they say the window has focus. Null uses {@link View#hasWindowFocus}.
++     */
++    private static @Nullable Boolean sWindowFocusedForTesting;
++
++    static void setWindowFocusedForTesting(@Nullable Boolean focused) {
++        sWindowFocusedForTesting = focused;
++    }
++
++    int searchImeShowsForTesting() {
++        return mSearchImeShows;
++    }
++
+     private boolean searchImeVisible() {
+         if (sImeVisibleForTesting != null) return sImeVisibleForTesting;
+         EditText field = mSearchField;
+@@ -3316,6 +3392,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Puts the keyboard away and moves focus off the field, keeping its text and the row. */
+     private void dropSearchFocus() {
++        mSearchImeWanted = false;
++        mSearchImeShownThisFocus = false;
++        cancelSearchImeWait();
+         EditText field = mSearchField;
+         if (field == null || !field.hasFocus()) return;
+         InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
+@@ -3390,6 +3469,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         applySearchRow();
+         dropSearchFocus();
+         setSheetWindowFocusForSearch(false);
++        if (mLatchedImeTop >= 0 || mImeLift != 0 || mImeCover != 0) {
++            mLatchedImeTop = -1;
++            mImeLift = 0;
++            mImeCover = 0;
++            if (mOpen) applySheetInsets();
++        }
+         if (mOpen) {
+             mSnapNext = true;
+             refresh();
+@@ -3402,23 +3487,281 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     /**
+-     * The sheet's glass window is not focusable, which keeps taps outside it working, but a
+-     * not-focusable window cannot take the keyboard. While the in-row field is up, that one
+-     * window accepts text. {@code FLAG_ALT_FOCUSABLE_IM} stays set so the keyboard is not covered.
++     * The sheet's glass window is not focusable, which keeps taps outside it working, and
++     * {@code FLAG_ALT_FOCUSABLE_IM} keeps that not-focusable window behind the keyboard. Those
++     * two flags together mean "behind the keyboard". Clearing only {@code FLAG_NOT_FOCUSABLE}
++     * inverts the other flag: the window then refuses the keyboard and {@code showSoftInput} is
++     * ignored. While the in-row field is up, clear both and do not let the system resize the
++     * window. {@link #onWindowLayout} keeps the sheet above the keyboard. Ending the search puts
++     * both flags, and the previous soft-input mode, back.
+      */
+     private void setSheetWindowFocusForSearch(boolean allow) {
+         Dialog dialog = mGlassWindow;
+         Window w = dialog != null ? dialog.getWindow() : null;
+         if (w == null || !mGlass || !isSheetChrome()) return;
+         if (allow) {
+-            w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
++            if (!mSoftInputModeSaved) {
++                mSavedSoftInputMode = w.getAttributes().softInputMode;
++                mSoftInputModeSaved = true;
++            }
++            w.clearFlags(
++                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++                            | WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
++            w.setSoftInputMode(
++                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
++                            | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED);
++            return;
++        }
++        cancelSearchImeWait();
++        if (mSoftInputModeSaved) {
++            w.setSoftInputMode(mSavedSoftInputMode);
++            mSoftInputModeSaved = false;
++        }
++        int restore = 0;
++        int flags = w.getAttributes().flags;
++        if ((flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) == 0) {
++            restore |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
++        }
++        if ((flags & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) == 0) {
++            restore |= WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM;
++        }
++        if (restore != 0) w.addFlags(restore);
++    }
++
++    /** Asks for the search keyboard once the sheet's window is focused. No-glass uses the activity. */
++    private void requestSearchIme() {
++        if (mSearchImeShownThisFocus) return;
++        EditText field = mSearchField;
++        if (field == null || !mOpen || !mSearchExpanded || !mSearchImeWanted) return;
++        pumpSearchIme();
++    }
++
++    private void pumpSearchIme() {
++        if (mSearchImeShownThisFocus) return;
++        EditText field = mSearchField;
++        if (field == null || !mOpen || !mSearchExpanded || !mSearchImeWanted) {
++            cancelSearchImeWait();
++            return;
++        }
++        if (!field.hasFocus() && !mRequestingSearchIme) {
++            mRequestingSearchIme = true;
++            try {
++                field.requestFocus();
++            } finally {
++                mRequestingSearchIme = false;
++            }
++        }
++        if (mSearchImeShownThisFocus || !mSearchImeWanted) return;
++        View decor = searchImeDecor();
++        if (field.hasFocus() && decor != null && windowIsFocused(decor)) {
++            showSearchImeNow(field);
++            return;
++        }
++        if (!mSearchImeWaiting) {
++            mSearchImeWaiting = true;
++            mSearchImeAttemptsLeft = FOCUS_IME_ATTEMPTS;
++            registerSearchImeFocusListener(decor);
++        }
++        if (mSearchImeRetry != null || mSearchImeAttemptsLeft <= 0) return;
++        mSearchImeAttemptsLeft--;
++        View target = decor != null ? decor : field;
++        Runnable retry =
++                new Runnable() {
++                    @Override
++                    public void run() {
++                        if (mSearchImeRetry != this) return;
++                        mSearchImeRetry = null;
++                        pumpSearchIme();
++                    }
++                };
++        mSearchImeRetry = retry;
++        mSearchImePostTarget = target;
++        target.post(retry);
++    }
++
++    private void registerSearchImeFocusListener(@Nullable View decor) {
++        if (decor == null || mSearchImeFocusListener != null) return;
++        ViewTreeObserver observer = decor.getViewTreeObserver();
++        if (!observer.isAlive()) return;
++        ViewTreeObserver.OnWindowFocusChangeListener listener =
++                hasFocus -> {
++                    if (hasFocus) requestSearchIme();
++                };
++        observer.addOnWindowFocusChangeListener(listener);
++        mSearchImeFocusListener = listener;
++        mSearchImeFocusView = decor;
++    }
++
++    private void showSearchImeNow(EditText field) {
++        if (mSearchImeShownThisFocus) return;
++        mSearchImeShownThisFocus = true;
++        cancelSearchImeWait();
++        Window window = searchImeWindow();
++        if (window != null
++                && (Build.VERSION.SDK_INT < Build.VERSION_CODES.R
++                        || window.getInsetsController() != null)) {
++            new WindowInsetsControllerCompat(window, field).show(WindowInsetsCompat.Type.ime());
++        }
++        InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
++        if (imm != null) imm.showSoftInput(field, InputMethodManager.SHOW_IMPLICIT);
++        mSearchImeShows++;
++        View decor = window == null ? null : window.getDecorView();
++        if (decor != null) decor.post(this::onWindowLayout);
++    }
++
++    private void cancelSearchImeWait() {
++        mSearchImeWaiting = false;
++        Runnable retry = mSearchImeRetry;
++        mSearchImeRetry = null;
++        View postTarget = mSearchImePostTarget;
++        mSearchImePostTarget = null;
++        if (retry != null && postTarget != null) postTarget.removeCallbacks(retry);
++        View focusView = mSearchImeFocusView;
++        ViewTreeObserver.OnWindowFocusChangeListener listener = mSearchImeFocusListener;
++        mSearchImeFocusListener = null;
++        mSearchImeFocusView = null;
++        if (focusView != null && listener != null) {
++            ViewTreeObserver observer = focusView.getViewTreeObserver();
++            if (observer.isAlive()) observer.removeOnWindowFocusChangeListener(listener);
++        }
++    }
++
++    private @Nullable Window searchImeWindow() {
++        if (mGlass) {
++            Dialog dialog = mGlassWindow;
++            Window window = dialog != null ? dialog.getWindow() : null;
++            if (window != null) return window;
++        }
++        return mActivity.getWindow();
++    }
++
++    private @Nullable View searchImeDecor() {
++        Window window = searchImeWindow();
++        return window == null ? null : window.getDecorView();
++    }
++
++    private boolean windowIsFocused(@Nullable View decor) {
++        if (sWindowFocusedForTesting != null) return sWindowFocusedForTesting;
++        return decor != null && decor.hasWindowFocus();
++    }
++
++    /** Runs a remembered pill tap once the activity window has focus. */
++    private void deliverPendingOmniboxFocus() {
++        if (!mPendingOmniboxFocus || mOpen) return;
++        pumpOmniboxFocus();
++    }
++
++    private void pumpOmniboxFocus() {
++        if (!mPendingOmniboxFocus || mOpen) {
++            cancelPendingOmniboxFocus();
+             return;
+         }
+-        if ((w.getAttributes().flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) == 0) {
+-            w.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
++        Window window = mActivity.getWindow();
++        View decor = window == null ? null : window.getDecorView();
++        if (decor != null && windowIsFocused(decor)) {
++            runPendingOmniboxFocus();
++            return;
++        }
++        if (!mOmniboxFocusWaiting) {
++            mOmniboxFocusWaiting = true;
++            mOmniboxFocusAttemptsLeft = FOCUS_IME_ATTEMPTS;
++            if (decor != null) {
++                ViewTreeObserver observer = decor.getViewTreeObserver();
++                if (observer.isAlive()) {
++                    ViewTreeObserver.OnWindowFocusChangeListener listener =
++                            hasFocus -> {
++                                if (hasFocus) pumpOmniboxFocus();
++                            };
++                    observer.addOnWindowFocusChangeListener(listener);
++                    mOmniboxFocusListener = listener;
++                    mOmniboxFocusView = decor;
++                }
++            }
++        }
++        if (decor == null || mOmniboxFocusRetry != null || mOmniboxFocusAttemptsLeft <= 0) return;
++        mOmniboxFocusAttemptsLeft--;
++        Runnable retry =
++                new Runnable() {
++                    @Override
++                    public void run() {
++                        if (mOmniboxFocusRetry != this) return;
++                        mOmniboxFocusRetry = null;
++                        pumpOmniboxFocus();
++                    }
++                };
++        mOmniboxFocusRetry = retry;
++        mOmniboxFocusPostTarget = decor;
++        decor.post(retry);
++    }
++
++    private void runPendingOmniboxFocus() {
++        if (!mPendingOmniboxFocus || mOpen) {
++            cancelPendingOmniboxFocus();
++            return;
++        }
++        mPendingOmniboxFocus = false;
++        cancelOmniboxFocusWait();
++        mOmniboxFocusRequests++;
++        if (!(mActivity instanceof ChromeActivity chromeActivity)) return;
++        if (chromeActivity.getToolbarManager() == null) return;
++        chromeActivity
++                .getToolbarManager()
++                .focusAndSelectAllUrlBarText(OmniboxFocusReason.OMNIBOX_TAP);
++    }
++
++    private void cancelPendingOmniboxFocus() {
++        mPendingOmniboxFocus = false;
++        cancelOmniboxFocusWait();
++    }
++
++    private void cancelOmniboxFocusWait() {
++        mOmniboxFocusWaiting = false;
++        Runnable retry = mOmniboxFocusRetry;
++        mOmniboxFocusRetry = null;
++        View postTarget = mOmniboxFocusPostTarget;
++        mOmniboxFocusPostTarget = null;
++        if (retry != null && postTarget != null) postTarget.removeCallbacks(retry);
++        View focusView = mOmniboxFocusView;
++        ViewTreeObserver.OnWindowFocusChangeListener listener = mOmniboxFocusListener;
++        mOmniboxFocusListener = null;
++        mOmniboxFocusView = null;
++        if (focusView != null && listener != null) {
++            ViewTreeObserver observer = focusView.getViewTreeObserver();
++            if (observer.isAlive()) observer.removeOnWindowFocusChangeListener(listener);
+         }
+     }
+ 
++    /** Glass search reads the dialog window. Any other keyboard is on the activity window. */
++    private @Nullable View imeInsetDecor() {
++        View activityDecor =
++                mActivity.getWindow() == null ? null : mActivity.getWindow().getDecorView();
++        if (!(mGlass && mSearchExpanded)) return activityDecor;
++        Dialog dialog = mGlassWindow;
++        Window window = dialog != null ? dialog.getWindow() : null;
++        View dialogDecor = window != null ? window.getDecorView() : null;
++        if (dialogDecor == null) return activityDecor;
++        if (imeInsetBottom(dialogDecor) > 0 || imeInsetVisible(dialogDecor)) return dialogDecor;
++        return activityDecor;
++    }
++
++    private static int imeInsetBottom(@Nullable View decor) {
++        if (decor == null) return 0;
++        WindowInsets raw = decor.getRootWindowInsets();
++        if (raw == null) return 0;
++        return WindowInsetsCompat.toWindowInsetsCompat(raw)
++                .getInsets(WindowInsetsCompat.Type.ime())
++                .bottom;
++    }
++
++    private static boolean imeInsetVisible(@Nullable View decor) {
++        if (sImeVisibleForTesting != null) return sImeVisibleForTesting;
++        if (decor == null) return false;
++        WindowInsets raw = decor.getRootWindowInsets();
++        if (raw == null) return false;
++        return WindowInsetsCompat.toWindowInsetsCompat(raw)
++                .isVisible(WindowInsetsCompat.Type.ime());
++    }
++
+     /** Whether a search is up: the row is expanded, the field has the keyboard, or there is text. */
+     private boolean searching() {
+         return mSearchExpanded || searchFieldFocused() || !mQuery.isEmpty();
+@@ -3431,22 +3774,38 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Follows the keyboard while the sheet is open, so it never covers the field or the list. */
+     private void onWindowLayout() {
+-        if (!mOpen || !isSheetChrome()) return;
++        if (mInWindowLayout || !mOpen || !isSheetChrome()) return;
++        mInWindowLayout = true;
++        try {
++            applyImeLiftFromInsets();
++        } finally {
++            mInWindowLayout = false;
++        }
++    }
++
++    /**
++     * Reads the keyboard from the window that has it. A glass search uses the dialog window;
++     * otherwise the activity window. The top of the keyboard is latched in screen Y so a later
++     * pass, after the sheet has moved up, does not treat the smaller overlap as a shorter
++     * keyboard and drop the sheet back onto it.
++     */
++    private void applyImeLiftFromInsets() {
+         int lift = 0;
+         int cover = 0;
+-        View decor = mActivity.getWindow().getDecorView();
+-        WindowInsets raw = decor.getRootWindowInsets();
+-        int ime =
+-                raw == null
+-                        ? 0
+-                        : WindowInsetsCompat.toWindowInsetsCompat(raw)
+-                                .getInsets(WindowInsetsCompat.Type.ime())
+-                                .bottom;
+-        View content = mActivity.findViewById(android.R.id.content);
+-        if (ime > 0 && content != null) {
++        View decor = imeInsetDecor();
++        int ime = imeInsetBottom(decor);
++        boolean imeVisible = imeInsetVisible(decor);
++        if (!imeVisible) {
++            mLatchedImeTop = -1;
++        } else if (ime > 0 && decor != null) {
+             int[] decorLoc = new int[2];
+             decor.getLocationOnScreen(decorLoc);
+-            int imeTop = decorLoc[1] + decor.getHeight() - ime;
++            int imeTopNow = decorLoc[1] + decor.getHeight() - ime;
++            if (mLatchedImeTop < 0 || imeTopNow < mLatchedImeTop) mLatchedImeTop = imeTopNow;
++        }
++        int imeTop = mLatchedImeTop;
++        View content = mActivity.findViewById(android.R.id.content);
++        if (imeTop >= 0 && content != null) {
+             int[] contentLoc = new int[2];
+             content.getLocationOnScreen(contentLoc);
+             if (sheetFromTop()) {
+@@ -3459,7 +3818,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 if (anchor != null && anchor.getHeight() > 0) {
+                     int[] anchorLoc = new int[2];
+                     anchor.getLocationOnScreen(anchorLoc);
+-                    lift = Math.max(0, anchorLoc[1] + anchor.getHeight() - imeTop);
++                    int remaining = anchorLoc[1] + anchor.getHeight() - imeTop;
++                    // The anchor moves up with the lift already applied, so this pass only
++                    // sees what is still covered. Add that to the lift already in place.
++                    lift = remaining > 0 ? remaining + mImeLift : mImeLift;
++                } else {
++                    lift = mImeLift;
+                 }
+             }
+         }
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 2536c21e15..b691b9388d 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -121,6 +121,8 @@ public class BareVerticalTabsDrawerUnitTest {
+     @After
+     public void tearDown() {
+         BareVerticalTabsDrawer.setGlassForTesting(null);
++        BareVerticalTabsDrawer.setImeVisibleForTesting(null);
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
+         org.chromium.chrome.browser.preferences.ChromeSharedPreferences.getInstance()
+                 .removeKey(
+                         org.chromium.chrome.browser.preferences.ChromePreferenceKeys
+@@ -1740,11 +1742,73 @@ public class BareVerticalTabsDrawerUnitTest {
+         setAddressBarOnTop(false);
+         openSheetLaidOut(px(400), px(800));
+         assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
+-        originPill().performClick();
+-        mDrawer.finishAnimationForTesting();
+-        assertFalse(mDrawer.isOpen());
+-        assertEquals(1, mDrawer.omniboxFocusRequestsForTesting());
+-        assertEquals(View.GONE, originPill().getVisibility());
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++        try {
++            originPill().performClick();
++            // The request waits until the close animation has dismissed the sheet.
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++            mDrawer.finishAnimationForTesting();
++            assertFalse(mDrawer.isOpen());
++            assertEquals(1, mDrawer.omniboxFocusRequestsForTesting());
++            assertEquals(View.GONE, originPill().getVisibility());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
++    }
++
++    @Test
++    public void testAPillTapDoesNotAskForTheOmniboxIfTheSheetReopens() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++        try {
++            originPill().performClick();
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            assertTrue(mDrawer.isOpen());
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
++    }
++
++    @Test
++    public void testAPillTapWaitsForTheActivityWindowToFocus() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(false);
++        try {
++            originPill().performClick();
++            mDrawer.finishAnimationForTesting();
++            assertFalse(mDrawer.isOpen());
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++            ShadowLooper.idleMainLooper();
++            assertEquals(1, mDrawer.omniboxFocusRequestsForTesting());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
++    }
++
++    @Test
++    public void testReopeningCancelsAnOmniboxFocusThatIsStillWaiting() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(false);
++        try {
++            originPill().performClick();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++            ShadowLooper.idleMainLooper();
++            assertTrue(mDrawer.isOpen());
++            assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
+     }
+ 
+     @Test
+@@ -1805,6 +1869,96 @@ public class BareVerticalTabsDrawerUnitTest {
+         }
+     }
+ 
++    @Test
++    public void testGlassSearchClearsBothFocusFlagsAndRestoresThem() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        Dialog glass = mDrawer.glassWindowForTesting();
++        assertNotNull(glass);
++        int before = glass.getWindow().getAttributes().flags;
++        assertTrue((before & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0);
++        assertTrue((before & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) != 0);
++        View decor = glass.getWindow().getDecorView();
++        View search = findTag(decor, "sheet_search");
++        assertNotNull(search);
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++        try {
++            search.performClick();
++            ShadowLooper.idleMainLooper();
++            mDrawer.finishAnimationForTesting();
++            int during = glass.getWindow().getAttributes().flags;
++            assertTrue((during & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) == 0);
++            assertTrue((during & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) == 0);
++            assertEquals(
++                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING,
++                    glass.getWindow().getAttributes().softInputMode
++                            & WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST);
++            assertEquals(1, mDrawer.searchImeShowsForTesting());
++
++            // No keyboard: the first Back clears the search and puts both flags back.
++            BareVerticalTabsDrawer.setImeVisibleForTesting(false);
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue(mDrawer.isOpen());
++            int after = glass.getWindow().getAttributes().flags;
++            assertTrue((after & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0);
++            assertTrue((after & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) != 0);
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++            BareVerticalTabsDrawer.setImeVisibleForTesting(null);
++            mDrawer.destroy();
++        }
++    }
++
++    @Test
++    public void testGlassSearchShowsTheKeyboardOnlyAfterTheWindowIsFocused() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        Dialog glass = mDrawer.glassWindowForTesting();
++        assertNotNull(glass);
++        View search = findTag(glass.getWindow().getDecorView(), "sheet_search");
++        assertNotNull(search);
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(false);
++        try {
++            search.performClick();
++            assertEquals(0, mDrawer.searchImeShowsForTesting());
++            int during = glass.getWindow().getAttributes().flags;
++            assertTrue((during & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) == 0);
++            assertTrue((during & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) == 0);
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++            ShadowLooper.idleMainLooper();
++            assertEquals(1, mDrawer.searchImeShowsForTesting());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++            mDrawer.destroy();
++        }
++    }
++
++    @Test
++    public void testNoGlassSearchShowsTheKeyboardOnceTheWindowIsFocused() {
++        BareVerticalTabsDrawer.setGlassForTesting(false);
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        BareVerticalTabsDrawer.setWindowFocusedForTesting(false);
++        try {
++            findTag("sheet_search").performClick();
++            assertEquals(0, mDrawer.searchImeShowsForTesting());
++            assertTrue(searchField().hasFocus());
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(true);
++            ShadowLooper.idleMainLooper();
++            assertEquals(1, mDrawer.searchImeShowsForTesting());
++            assertTrue(mDrawer.isOpen());
++        } finally {
++            BareVerticalTabsDrawer.setWindowFocusedForTesting(null);
++        }
++    }
++
+     @Test
+     public void testOnlyABottomBarSheetLeavesAGapAboveTheToolbar() {
+         setAddressBarOnTop(false);
+-- 
+2.34.1
+
