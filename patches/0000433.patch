@@ -1,0 +1,835 @@
+From 4079aaab16ae93ccb13554e1f572a854da0d1d36 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:51:26 +0000
+Subject: [PATCH] Pull the tab sheet out by dragging the address bar.
+
+With the sheet as the tabs style, a vertical drag that starts on the
+address bar and moves away from it (up from a bottom bar, down from a top
+bar) opens the sheet under the finger. Letting go uses the sheet's snap
+and fling rules, so it settles at half, full or closed.
+
+This wraps the toolbar's existing swipe handler instead of adding another
+touch listener. SwipeGestureListener already locks the direction once, so
+a sideways drag stays the tab switching swipe and a vertical one never
+switches tabs. Taps and long presses are not swipes and are unchanged.
+Drags toward the bar, and every drag with the side drawer, go to the
+toolbar's handler as before.
+
+RootUiCoordinator gets a hook that returns the handler unchanged, and
+TabbedRootUiCoordinator wraps it. The drawer is made the first time it is
+needed, in one place, for both the button and the pull.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ chrome/android/chrome_java_sources.gni        |   1 +
+ .../chrome/browser/app/ChromeActivity.java    |   3 +-
+ .../bare/BareTabSheetToolbarSwipe.java        | 124 +++++++++
+ .../browser/bare/BareVerticalTabsDrawer.java  |  75 ++++-
+ .../tabbed_mode/TabbedRootUiCoordinator.java  |  72 ++++-
+ .../chrome/browser/ui/RootUiCoordinator.java  |   9 +
+ chrome/android/junit/BUILD.gn                 |   1 +
+ .../BareTabSheetToolbarSwipeUnitTest.java     | 262 ++++++++++++++++++
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 100 +++++++
+ 9 files changed, 624 insertions(+), 23 deletions(-)
+ create mode 100644 chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+ create mode 100644 chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java
+
+diff --git a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+index 5f3235bea9..f381590998 100644
+--- a/chrome/android/chrome_java_sources.gni
++++ b/chrome/android/chrome_java_sources.gni
+@@ -303,6 +303,7 @@ chrome_java_sources = [
+   "java/src/org/chromium/chrome/browser/bare/BareLauncherIcon.java",
+   "java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java",
+   "java/src/org/chromium/chrome/browser/bare/BareTabSheetSnap.java",
++  "java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java",
+   "java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java",
+   "java/src/org/chromium/chrome/browser/bare/BareMinimalLeftButton.java",
+   "java/src/org/chromium/chrome/browser/bare/BareMinimalRightButton.java",
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+index 6863a8b2ef..102e18ffd6 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/app/ChromeActivity.java
+@@ -2805,7 +2805,8 @@ public abstract class ChromeActivity extends AsyncInitializationActivity
+         if (controlContainer != null
+                 && DeviceClassManager.enableToolbarSwipe()
+                 && swipeHandler != null) {
+-            controlContainer.setSwipeHandler(swipeHandler);
++            controlContainer.setSwipeHandler(
++                    mRootUiCoordinator.wrapToolbarSwipeHandler(swipeHandler));
+         }
+ 
+         mActivityTabProvider.setLayoutStateProvider(layoutManager);
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+new file mode 100644
+index 0000000000..15dfbfacde
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+@@ -0,0 +1,124 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.bare;
++
++import android.view.MotionEvent;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.ScrollDirection;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.SwipeHandler;
++
++/**
++ * Lets a vertical drag on the address bar pull the tab sheet out with the finger.
++ *
++ * <p>It wraps the toolbar's own swipe handler instead of listening to touches itself. The
++ * toolbar's gesture listener already settles a drag's direction once, when the finger has moved
++ * far enough: a sideways drag goes on to switch tabs as before and never reaches the sheet, and a
++ * drag that started vertical stays with the sheet even if it later drifts sideways. Taps and long
++ * presses never become a swipe, so they reach the address bar and its buttons untouched.
++ *
++ * <p>Only the drag away from the address bar is taken, and only while the sheet is the chosen
++ * tabs style: up from a bottom address bar, down from a top one. Every other gesture, and every
++ * gesture with the side drawer, goes to the wrapped handler unchanged.
++ */
++@NullMarked
++public final class BareTabSheetToolbarSwipe implements SwipeHandler {
++    /** The sheet a toolbar drag moves. */
++    public interface Sheet {
++        /** Whether a drag on the toolbar should move the sheet now. */
++        boolean wantsToolbarPull();
++
++        /** Whether the sheet opens downward, from a top address bar. */
++        boolean opensDownward();
++
++        /** The drag has started: show the sheet where it is, without animating. */
++        void beginToolbarPull();
++
++        /** The finger is {@code openingPx} pixels past where the drag started, away from the bar. */
++        void updateToolbarPull(float openingPx);
++
++        /**
++         * The finger has lifted. {@code velocityY} is in pixels per second on the screen, positive
++         * downward, or 0 when the finger was not flung.
++         */
++        void endToolbarPull(float velocityY);
++    }
++
++    private final @Nullable SwipeHandler mDelegate;
++    private final Sheet mSheet;
++    private boolean mPulling;
++    private boolean mDownward;
++    private float mFlingVelocityY;
++
++    public BareTabSheetToolbarSwipe(@Nullable SwipeHandler delegate, Sheet sheet) {
++        mDelegate = delegate;
++        mSheet = sheet;
++    }
++
++    /** The direction that pulls the sheet out, or UNKNOWN when the sheet does not want drags. */
++    private @ScrollDirection int pullDirection() {
++        if (!mSheet.wantsToolbarPull()) return ScrollDirection.UNKNOWN;
++        return mSheet.opensDownward() ? ScrollDirection.DOWN : ScrollDirection.UP;
++    }
++
++    @Override
++    public boolean isSwipeEnabled(@ScrollDirection int direction, MotionEvent triggerEvent) {
++        if (direction != ScrollDirection.UNKNOWN && direction == pullDirection()) return true;
++        return mDelegate != null && mDelegate.isSwipeEnabled(direction, triggerEvent);
++    }
++
++    @Override
++    public void onSwipeStarted(@ScrollDirection int direction, MotionEvent triggerEvent) {
++        mPulling = false;
++        mFlingVelocityY = 0f;
++        if (direction != ScrollDirection.UNKNOWN && direction == pullDirection()) {
++            mPulling = true;
++            mDownward = direction == ScrollDirection.DOWN;
++            mSheet.beginToolbarPull();
++            return;
++        }
++        if (mDelegate != null) mDelegate.onSwipeStarted(direction, triggerEvent);
++    }
++
++    @Override
++    public void onSwipeUpdated(
++            MotionEvent current, float tx, float ty, float distanceX, float distanceY) {
++        if (mPulling) {
++            mSheet.updateToolbarPull(mDownward ? ty : -ty);
++            return;
++        }
++        if (mDelegate != null) mDelegate.onSwipeUpdated(current, tx, ty, distanceX, distanceY);
++    }
++
++    @Override
++    public void onFling(
++            @ScrollDirection int direction,
++            MotionEvent current,
++            float tx,
++            float ty,
++            float velocityX,
++            float velocityY) {
++        if (mPulling) {
++            mFlingVelocityY = velocityY;
++            return;
++        }
++        if (mDelegate != null) {
++            mDelegate.onFling(direction, current, tx, ty, velocityX, velocityY);
++        }
++    }
++
++    @Override
++    public void onSwipeFinished() {
++        if (mPulling) {
++            mPulling = false;
++            float velocity = mFlingVelocityY;
++            mFlingVelocityY = 0f;
++            mSheet.endToolbarPull(velocity);
++            return;
++        }
++        if (mDelegate != null) mDelegate.onSwipeFinished();
++    }
++}
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 8012505b9a..e8fe9a8c98 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -100,12 +100,14 @@ import java.util.function.Supplier;
+  * swipe-to-close. In sheet mode the sheet opens to a half-height stop, and the handle (or an
+  * over-pull at the list's end next to the handle) moves it between hidden, half and full. With
+  * the address bar at the bottom the sheet rises from above the toolbar; with it on top the sheet
+- * drops down from below the address bar, mirrored. It is a view over
++ * drops down from below the address bar, mirrored. A vertical drag on the address bar, away from
++ * it, also pulls the sheet out with the finger (see {@link BareTabSheetToolbarSwipe}). It is a
++ * view over
+  * the browser's own tab model: selecting, closing, adding and closing all go through the same
+  * operations the tab overview uses. It keeps no tabs of its own.
+  */
+ @NullMarked
+-public final class BareVerticalTabsDrawer {
++public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sheet {
+     private static final long DURATION_MS = 380;
+     private static final long SHEET_DURATION_MS = 320;
+     private static final float SHEET_FULL_GAP_DP = 8f;
+@@ -280,6 +282,14 @@ public final class BareVerticalTabsDrawer {
+     }
+ 
+     public void open() {
++        show(/* animate= */ true);
++    }
++
++    /**
++     * Shows the drawer or the sheet. Animated, it travels to its first stop. Not animated, it
++     * stays where it is, closed, for a drag to move it.
++     */
++    private void show(boolean animate) {
+         if (mOpen) return;
+         TabModelSelector selector = mSelectorSupplier.get();
+         if (selector == null) return;
+@@ -323,11 +333,13 @@ public final class BareVerticalTabsDrawer {
+                     applyProgress(mProgress);
+                 });
+         if (mBackCallback != null) mBackCallback.setEnabled(true);
+-        animateTo(
+-                isSheetChrome()
+-                        ? BareTabSheetSnap.progressOf(BareTabSheetSnap.State.HALF)
+-                        : 1f,
+-                null);
++        if (animate) {
++            animateTo(
++                    isSheetChrome()
++                            ? BareTabSheetSnap.progressOf(BareTabSheetSnap.State.HALF)
++                            : 1f,
++                    null);
++        }
+         Panel panel = mPanel;
+         if (panel != null) {
+             panel.announceForAccessibility(
+@@ -1415,6 +1427,16 @@ public final class BareVerticalTabsDrawer {
+         if (root != null && root.getHeight() > 0) {
+             return Math.max(1, root.getHeight() - dp(SHEET_FULL_GAP_DP));
+         }
++        // Pulled from the toolbar, the sheet moves before the overlay has been laid out the
++        // first time. Its margins are already set, so its height can be worked out.
++        View content = mActivity.findViewById(android.R.id.content);
++        if (root != null
++                && content != null
++                && content.getHeight() > 0
++                && root.getLayoutParams() instanceof FrameLayout.LayoutParams params) {
++            int height = content.getHeight() - params.topMargin - params.bottomMargin;
++            return Math.max(1, height - dp(SHEET_FULL_GAP_DP));
++        }
+         return 1;
+     }
+ 
+@@ -1534,6 +1556,45 @@ public final class BareVerticalTabsDrawer {
+         }
+     }
+ 
++    // Pulled from the toolbar.
++
++    @Override
++    public boolean wantsToolbarPull() {
++        // The side drawer keeps every toolbar gesture as it was. A card being dragged keeps the
++        // sheet where it is.
++        return isSheetChrome() && !mDragging && mSelectorSupplier.get() != null;
++    }
++
++    @Override
++    public boolean opensDownward() {
++        return sheetFromTop();
++    }
++
++    @Override
++    public void beginToolbarPull() {
++        if (mAnimator != null) mAnimator.cancel();
++        if (!mOpen) {
++            // A close cut short by this drag never let go of the tab model; let go now, so
++            // showing again does not watch it twice.
++            releaseObservers();
++            show(/* animate= */ false);
++        }
++        mSheetDragStartProgress = mProgress;
++    }
++
++    @Override
++    public void updateToolbarPull(float openingPx) {
++        if (!mOpen) return;
++        if (mAnimator != null) mAnimator.cancel();
++        applyProgress(mSheetDragStartProgress + openingPx / sheetRangeHeight());
++    }
++
++    @Override
++    public void endToolbarPull(float velocityY) {
++        if (!mOpen) return;
++        finishSheetDrag(velocityY);
++    }
++
+     // Tabs.
+ 
+     private @Nullable TabModel currentModel() {
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
+index fe10ee0f81..b4a149d350 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
+@@ -73,6 +73,8 @@ import org.chromium.chrome.browser.app.ChromeActivity;
+ import org.chromium.chrome.browser.app.tabwindow.TabWindowManagerSingleton;
+ import org.chromium.chrome.browser.back_press.BackPressManager;
+ import org.chromium.chrome.browser.bare.BareToolbarActionCatalogue;
++import org.chromium.chrome.browser.bare.BareTabSheetToolbarSwipe;
++import org.chromium.chrome.browser.bare.BareTabsStyle;
+ import org.chromium.chrome.browser.bare.BareVerticalTabsDrawer;
+ import org.chromium.chrome.browser.bookmarks.BookmarkManagerOpener;
+ import org.chromium.chrome.browser.bookmarks.BookmarkManagerOpenerImpl;
+@@ -283,6 +285,7 @@ import org.chromium.chrome.browser.ui.web_content_hairline.WebContentHairlineCoo
+ import org.chromium.chrome.browser.ui.web_content_hairline.WebContentHairlineCoordinatorFactory;
+ import org.chromium.chrome.browser.user_education.UserEducationUtils;
+ import org.chromium.chrome.browser.user_education.UserEducationUtils.OptionalPromoType;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.SwipeHandler;
+ import org.chromium.components.bookmarks.BookmarkBarVisibilityState;
+ import org.chromium.components.browser_ui.accessibility.PageZoomUtils;
+ import org.chromium.components.browser_ui.bottomsheet.BottomSheetObserver;
+@@ -1208,21 +1211,7 @@ public class TabbedRootUiCoordinator extends RootUiCoordinator {
+                                 Tab tab = mActivityTabProvider.get();
+                                 if (tab != null && tab.canGoForward()) tab.goForward();
+                             },
+-                            () -> {
+-                                if (mBareVerticalTabsDrawer == null) {
+-                                    mBareVerticalTabsDrawer =
+-                                            new BareVerticalTabsDrawer(
+-                                                    mActivity,
+-                                                    () -> mTabModelSelectorSupplier.get(),
+-                                                    () -> mTabCreatorManagerSupplier.get(),
+-                                                    () -> mTabContentManagerSupplier.get());
+-                                    // The sheet's scrim tints the status bar the way
+-                                    // Chrome's own scrim does.
+-                                    mBareVerticalTabsDrawer.setStatusBarScrimObserver(
+-                                            this::onScrimColorChanged);
+-                                }
+-                                mBareVerticalTabsDrawer.toggle();
+-                            },
++                            () -> getBareVerticalTabsDrawer().toggle(),
+                             () ->
+                                     // The card is opened by the activity, which the root
+                                     // coordinator's own handler does not reach.
+@@ -1232,6 +1221,59 @@ public class TabbedRootUiCoordinator extends RootUiCoordinator {
+         }
+     }
+ 
++    /** The vertical tabs drawer, or sheet, made the first time it is asked for. */
++    private BareVerticalTabsDrawer getBareVerticalTabsDrawer() {
++        if (mBareVerticalTabsDrawer == null) {
++            mBareVerticalTabsDrawer =
++                    new BareVerticalTabsDrawer(
++                            mActivity,
++                            () -> mTabModelSelectorSupplier.get(),
++                            () -> mTabCreatorManagerSupplier.get(),
++                            () -> mTabContentManagerSupplier.get());
++            // The sheet's scrim tints the status bar the way Chrome's own scrim does.
++            mBareVerticalTabsDrawer.setStatusBarScrimObserver(this::onScrimColorChanged);
++        }
++        return mBareVerticalTabsDrawer;
++    }
++
++    /**
++     * With the sheet as the tabs style, a vertical drag on the address bar, away from it, pulls the
++     * sheet out. Sideways drags, taps and the side drawer go to the toolbar's handler as before.
++     */
++    @Override
++    public SwipeHandler wrapToolbarSwipeHandler(SwipeHandler handler) {
++        return new BareTabSheetToolbarSwipe(
++                handler,
++                new BareTabSheetToolbarSwipe.Sheet() {
++                    @Override
++                    public boolean wantsToolbarPull() {
++                        // The drawer is only made once the sheet is the chosen style.
++                        return BareTabsStyle.isSheet()
++                                && getBareVerticalTabsDrawer().wantsToolbarPull();
++                    }
++
++                    @Override
++                    public boolean opensDownward() {
++                        return getBareVerticalTabsDrawer().opensDownward();
++                    }
++
++                    @Override
++                    public void beginToolbarPull() {
++                        getBareVerticalTabsDrawer().beginToolbarPull();
++                    }
++
++                    @Override
++                    public void updateToolbarPull(float openingPx) {
++                        getBareVerticalTabsDrawer().updateToolbarPull(openingPx);
++                    }
++
++                    @Override
++                    public void endToolbarPull(float velocityY) {
++                        getBareVerticalTabsDrawer().endToolbarPull(velocityY);
++                    }
++                });
++    }
++
+     @Override
+     protected void onFindToolbarShown() {
+         super.onFindToolbarShown();
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/ui/RootUiCoordinator.java b/chrome/android/java/src/org/chromium/chrome/browser/ui/RootUiCoordinator.java
+index 4be1a0050d..ec6d4f03e3 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/ui/RootUiCoordinator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/ui/RootUiCoordinator.java
+@@ -242,6 +242,7 @@ import org.chromium.components.browser_ui.device_lock.DeviceLockActivityLauncher
+ import org.chromium.components.browser_ui.util.ComposedBrowserControlsVisibilityDelegate;
+ import org.chromium.components.browser_ui.widget.MenuOrKeyboardActionController;
+ import org.chromium.components.browser_ui.widget.gesture.BackPressHandler;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.SwipeHandler;
+ import org.chromium.components.browser_ui.widget.scrim.ScrimManager;
+ import org.chromium.components.browser_ui.widget.scrim.ScrimManager.ScrimClient;
+ import org.chromium.components.dom_distiller.core.DomDistillerUrlUtils;
+@@ -923,6 +924,14 @@ public class RootUiCoordinator
+         return mStatusBarColorController;
+     }
+ 
++    /**
++     * Gives a subclass the chance to wrap the toolbar's swipe handler before the toolbar gets it.
++     * Returns the handler unchanged by default.
++     */
++    public SwipeHandler wrapToolbarSwipeHandler(SwipeHandler handler) {
++        return handler;
++    }
++
+     // TODO(jinsukkim): remove this in favor of wiring it directly.
+     /**
+      * @return {@link ThemeColorProvider} for top UI.
+diff --git a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+index c5283e6668..059f436635 100644
+--- a/chrome/android/junit/BUILD.gn
++++ b/chrome/android/junit/BUILD.gn
+@@ -452,6 +452,7 @@ if (is_android) {
+       "src/org/chromium/chrome/browser/bare/BareToolbarActionCatalogueUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareTabSheetSnapUnitTest.java",
++      "src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/settings/BareSettingsLayoutUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareCrxDownloadWatcherUnitTest.java",
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java
+new file mode 100644
+index 0000000000..6356dcb684
+--- /dev/null
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java
+@@ -0,0 +1,262 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.bare;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import android.app.Activity;
++import android.os.SystemClock;
++import android.view.MotionEvent;
++
++import androidx.test.ext.junit.rules.ActivityScenarioRule;
++
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.shadows.ShadowLooper;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.ScrollDirection;
++import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.SwipeHandler;
++import org.chromium.ui.base.TestActivity;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Unit tests for {@link BareTabSheetToolbarSwipe}, driven through the toolbar's real {@link
++ * SwipeGestureListener} so the direction lock is the one the address bar uses.
++ */
++@RunWith(BaseRobolectricTestRunner.class)
++public class BareTabSheetToolbarSwipeUnitTest {
++    @Rule
++    public ActivityScenarioRule<TestActivity> mActivityScenarioRule =
++            new ActivityScenarioRule<>(TestActivity.class);
++
++    /** Stands in for the toolbar's own handler: takes every direction and records what it gets. */
++    private static final class Delegate implements SwipeHandler {
++        final List<Integer> mStarted = new ArrayList<>();
++        int mUpdates;
++        int mFinished;
++        int mFlings;
++
++        @Override
++        public void onSwipeStarted(@ScrollDirection int direction, MotionEvent triggerEvent) {
++            mStarted.add(direction);
++        }
++
++        @Override
++        public void onSwipeUpdated(MotionEvent current, float tx, float ty, float dx, float dy) {
++            mUpdates++;
++        }
++
++        @Override
++        public void onSwipeFinished() {
++            mFinished++;
++        }
++
++        @Override
++        public void onFling(
++                @ScrollDirection int direction,
++                MotionEvent current,
++                float tx,
++                float ty,
++                float vx,
++                float vy) {
++            mFlings++;
++        }
++    }
++
++    private static final class FakeSheet implements BareTabSheetToolbarSwipe.Sheet {
++        boolean mWants = true;
++        boolean mDownward;
++        int mBegun;
++        int mEnded;
++        final List<Float> mOpenings = new ArrayList<>();
++        float mEndVelocity = Float.NaN;
++
++        @Override
++        public boolean wantsToolbarPull() {
++            return mWants;
++        }
++
++        @Override
++        public boolean opensDownward() {
++            return mDownward;
++        }
++
++        @Override
++        public void beginToolbarPull() {
++            mBegun++;
++        }
++
++        @Override
++        public void updateToolbarPull(float openingPx) {
++            mOpenings.add(openingPx);
++        }
++
++        @Override
++        public void endToolbarPull(float velocityY) {
++            mEnded++;
++            mEndVelocity = velocityY;
++        }
++    }
++
++    private Activity mActivity;
++    private Delegate mDelegate;
++    private FakeSheet mSheet;
++    private SwipeGestureListener mListener;
++    private long mDownTime;
++    private long mTime;
++
++    @Before
++    public void setUp() {
++        mActivityScenarioRule.getScenario().onActivity(activity -> mActivity = activity);
++        mDelegate = new Delegate();
++        mSheet = new FakeSheet();
++        mListener =
++                new SwipeGestureListener(
++                        mActivity, new BareTabSheetToolbarSwipe(mDelegate, mSheet));
++    }
++
++    private void send(int action, float x, float y) {
++        MotionEvent event = MotionEvent.obtain(mDownTime, mTime, action, x, y, 0);
++        mListener.onTouchEvent(event);
++        event.recycle();
++    }
++
++    private void down(float x, float y) {
++        mDownTime = SystemClock.uptimeMillis();
++        mTime = mDownTime;
++        send(MotionEvent.ACTION_DOWN, x, y);
++    }
++
++    private void move(float x, float y) {
++        mTime += 16;
++        send(MotionEvent.ACTION_MOVE, x, y);
++    }
++
++    private void up(float x, float y) {
++        mTime += 16;
++        send(MotionEvent.ACTION_UP, x, y);
++        ShadowLooper.idleMainLooper();
++    }
++
++    @Test
++    public void testASidewaysDragSwitchesTabsAndNeverReachesTheSheet() {
++        down(500, 1000);
++        move(560, 1002);
++        move(700, 1004);
++        // Once sideways, a later turn upward still belongs to the tab switch.
++        move(720, 700);
++        up(720, 600);
++
++        assertEquals(1, mDelegate.mStarted.size());
++        assertEquals(ScrollDirection.RIGHT, (int) mDelegate.mStarted.get(0));
++        assertTrue(mDelegate.mUpdates > 0);
++        assertEquals(1, mDelegate.mFinished);
++        assertEquals(0, mSheet.mBegun);
++        assertTrue(mSheet.mOpenings.isEmpty());
++        assertEquals(0, mSheet.mEnded);
++    }
++
++    @Test
++    public void testAnUpwardDragFromABottomBarPullsTheSheetWithTheFinger() {
++        down(500, 1000);
++        move(502, 960);
++        float lockY = 960;
++        move(504, 900);
++        move(506, 800);
++        // Drifting sideways after the lock does not hand the drag to the tab switch.
++        move(800, 790);
++        up(800, 790);
++
++        assertEquals(1, mSheet.mBegun);
++        assertEquals(1, mSheet.mEnded);
++        assertTrue(mDelegate.mStarted.isEmpty());
++        assertEquals(0, mDelegate.mUpdates);
++        assertEquals(0, mDelegate.mFinished);
++        assertEquals(0, mDelegate.mFlings);
++        // The opening distance is how far the finger has gone up since the lock.
++        assertEquals(0f, mSheet.mOpenings.get(0), 0.5f);
++        assertEquals(lockY - 800, mSheet.mOpenings.get(mSheet.mOpenings.size() - 2), 0.5f);
++        assertEquals(lockY - 790, mSheet.mOpenings.get(mSheet.mOpenings.size() - 1), 0.5f);
++    }
++
++    @Test
++    public void testAFlingIsPassedOnWhenTheFingerLifts() {
++        down(500, 1000);
++        move(500, 960);
++        mTime += 4;
++        move(500, 700);
++        mTime += 4;
++        up(500, 400);
++
++        assertEquals(1, mSheet.mEnded);
++        // Flung upward: negative on the screen.
++        assertTrue(mSheet.mEndVelocity < 0f);
++    }
++
++    @Test
++    public void testADownwardDragOnABottomBarIsLeftToTheToolbar() {
++        down(500, 1000);
++        move(500, 1040);
++        move(500, 1200);
++        up(500, 1200);
++
++        assertEquals(0, mSheet.mBegun);
++        assertEquals(1, mDelegate.mStarted.size());
++        assertEquals(ScrollDirection.DOWN, (int) mDelegate.mStarted.get(0));
++    }
++
++    @Test
++    public void testWithATopBarADownwardDragPullsTheSheetAndAnUpwardOneDoesNot() {
++        mSheet.mDownward = true;
++        down(500, 300);
++        move(500, 340);
++        move(500, 600);
++        up(500, 600);
++        assertEquals(1, mSheet.mBegun);
++        assertEquals(600 - 340, mSheet.mOpenings.get(mSheet.mOpenings.size() - 1), 0.5f);
++        assertTrue(mDelegate.mStarted.isEmpty());
++
++        down(500, 300);
++        move(500, 260);
++        move(500, 100);
++        up(500, 100);
++        assertEquals(1, mSheet.mBegun);
++        assertEquals(ScrollDirection.UP, (int) mDelegate.mStarted.get(0));
++    }
++
++    @Test
++    public void testWithTheSideDrawerEveryDragGoesToTheToolbar() {
++        mSheet.mWants = false;
++        down(500, 1000);
++        move(500, 960);
++        move(500, 700);
++        up(500, 700);
++
++        assertEquals(0, mSheet.mBegun);
++        assertEquals(ScrollDirection.UP, (int) mDelegate.mStarted.get(0));
++        assertEquals(1, mDelegate.mFinished);
++    }
++
++    @Test
++    public void testATapIsNotASwipe() {
++        down(500, 1000);
++        up(500, 1000);
++        down(500, 1000);
++        move(501, 1001);
++        up(501, 1001);
++
++        assertEquals(0, mSheet.mBegun);
++        assertTrue(mDelegate.mStarted.isEmpty());
++        assertFalse(mSheet.mEnded > 0);
++    }
++}
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 26e361bd29..94c4dca1d7 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -781,6 +781,106 @@ public class BareVerticalTabsDrawerUnitTest {
+         for (int color : colors) assertEquals(android.graphics.Color.TRANSPARENT, color);
+     }
+ 
++    /** Starts a toolbar pull and lays the overlay out at 1080 by 2000. Returns the sheet's range. */
++    private int beginPullAndLayOut() {
++        mDrawer.beginToolbarPull();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        layoutOverlay(root, 1080, 2000);
++        return 2000 - sheetGap();
++    }
++
++    @Test
++    public void testTheSideDrawerDoesNotTakeToolbarDrags() {
++        assertFalse(mDrawer.wantsToolbarPull());
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        assertTrue(mDrawer.wantsToolbarPull());
++    }
++
++    @Test
++    public void testAToolbarPullOpensTheSheetWhereTheFingerIs() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        assertFalse(mDrawer.opensDownward());
++        int range = beginPullAndLayOut();
++        assertTrue(mDrawer.isOpen());
++        // Nothing animates: it starts closed and follows the finger.
++        mDrawer.finishAnimationForTesting();
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++
++        mDrawer.updateToolbarPull(range * 0.2f);
++        assertEquals(0.2f, mDrawer.progressForTesting(), 0.01f);
++        mDrawer.updateToolbarPull(range * 0.35f);
++        assertEquals(0.35f, mDrawer.progressForTesting(), 0.01f);
++        mDrawer.updateToolbarPull(range * 2f);
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++        mDrawer.updateToolbarPull(-range);
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++    }
++
++    @Test
++    public void testLettingGoOfAToolbarPullSnapsToTheNearestStop() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.35f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++
++        // A second pull starts from half.
++        mDrawer.beginToolbarPull();
++        mDrawer.updateToolbarPull(range * 0.4f);
++        assertEquals(0.9f, mDrawer.progressForTesting(), 0.01f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testAShortToolbarPullCloses() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.1f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++    }
++
++    @Test
++    public void testAFlungToolbarPullGoesToTheNextStop() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.1f);
++        // Flung up, away from a bottom bar.
++        mDrawer.endToolbarPull(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testWithATopBarAToolbarPullOpensDownward() {
++        setAddressBarOnTop(true);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        assertTrue(mDrawer.opensDownward());
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.1f);
++        // Flung down, away from a top bar.
++        mDrawer.endToolbarPull(10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++        View panel = (View) findTag("sheet_actions").getParent();
++        assertEquals(
++                Gravity.TOP,
++                ((FrameLayout.LayoutParams) panel.getLayoutParams()).gravity
++                        & Gravity.VERTICAL_GRAVITY_MASK);
++    }
++
+     private void layoutOverlay(View root, int width, int height) {
+         root.measure(
+                 View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+-- 
+2.34.1
+
