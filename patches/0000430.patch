@@ -1,0 +1,1044 @@
+From fb227e208b2d1f25a37b07da965473062a27fa1d Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:00:20 +0000
+Subject: [PATCH] Offer a sheet style for the tabs drawer, behind a setting.
+
+Settings > Appearance > Address bar & toolbar now has a Tabs style
+choice. Side drawer is the default and keeps the existing drawer. Sheet
+opens the same list from the Vertical tabs button, laid out as a sheet
+above the real bottom toolbar: a handle and the current tab's domain at
+the top, and the tab count, list/grid, new tab, and close-all actions
+at the bottom of the sheet. The address bar and the five toolbar
+buttons stay visible and tappable.
+
+The sheet reuses the drawer's RecyclerView, adapter, drag-reorder,
+swipe-to-close, list/grid, and pinned-group rules. Glass blur is off in
+sheet mode so it does not cover the toolbar. With the address bar on
+top, the sheet fills the gap between the two bars; a full visual mirror
+is a later step.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ chrome/android/chrome_java_sources.gni        |   1 +
+ .../java/res/xml/bare_toolbar_preferences.xml |  12 +-
+ .../values/channel_constants.xml              |   7 +
+ .../chrome/browser/bare/BareTabsStyle.java    |  46 ++
+ .../browser/bare/BareVerticalTabsDrawer.java  | 392 +++++++++++++++++-
+ .../settings/BareToolbarSettingsFragment.java |  35 ++
+ chrome/android/junit/BUILD.gn                 |   1 +
+ .../browser/bare/BareTabsStyleUnitTest.java   |  56 +++
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 113 +++++
+ .../settings/BareToolbarSettingsUnitTest.java |  28 ++
+ .../preferences/ChromePreferenceKeys.java     |   7 +
+ 11 files changed, 682 insertions(+), 16 deletions(-)
+ create mode 100644 chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java
+ create mode 100644 chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java
+
+diff --git a/chrome/android/chrome_java_sources.gni b/chrome/android/chrome_java_sources.gni
+index 7a6d83dbca..73169ac8e1 100644
+--- a/chrome/android/chrome_java_sources.gni
++++ b/chrome/android/chrome_java_sources.gni
+@@ -301,6 +301,7 @@ chrome_java_sources = [
+   "java/src/org/chromium/chrome/browser/bare/BareAddressBarPreviewView.java",
+   "java/src/org/chromium/chrome/browser/bare/BareGoldenGateView.java",
+   "java/src/org/chromium/chrome/browser/bare/BareLauncherIcon.java",
++  "java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java",
+   "java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java",
+   "java/src/org/chromium/chrome/browser/bare/BareMinimalLeftButton.java",
+   "java/src/org/chromium/chrome/browser/bare/BareMinimalRightButton.java",
+diff --git a/chrome/android/java/res/xml/bare_toolbar_preferences.xml b/chrome/android/java/res/xml/bare_toolbar_preferences.xml
+index 90a4dab722..9fd3ccb9ce 100644
+--- a/chrome/android/java/res/xml/bare_toolbar_preferences.xml
++++ b/chrome/android/java/res/xml/bare_toolbar_preferences.xml
+@@ -18,23 +18,29 @@ found in the LICENSE file.
+             android:persistent="false"
+             android:title="@string/address_bar_settings" />
+ 
++        <ListPreference
++            android:key="bare_tabs_style"
++            android:order="1"
++            android:persistent="false"
++            android:title="@string/bare_tabs_style_title" />
++
+         <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
+             android:key="bare_toolbar_minimal"
+-            android:order="1"
++            android:order="2"
+             android:persistent="false"
+             android:title="@string/bare_welcome_opt_minimal"
+             android:summary="@string/bare_welcome_hint_minimal" />
+ 
+         <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
+             android:key="bare_toolbar_always_visible"
+-            android:order="2"
++            android:order="3"
+             android:persistent="false"
+             android:title="@string/bare_toolbar_always_visible_title"
+             android:summary="@string/bare_toolbar_always_visible_summary" />
+ 
+         <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
+             android:key="bare_address_bar_back_button"
+-            android:order="3"
++            android:order="4"
+             android:persistent="false"
+             android:title="@string/bare_pref_addressbar_back_title"
+             android:summary="@string/bare_pref_addressbar_back_summary" />
+diff --git a/chrome/android/java/res_chromium_base/values/channel_constants.xml b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+index 620236e710..351c13cd44 100644
+--- a/chrome/android/java/res_chromium_base/values/channel_constants.xml
++++ b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+@@ -219,6 +219,13 @@ found in the LICENSE file.
+     <string name="bare_vtabs_empty">No open tabs</string>
+     <string name="bare_vtabs_new_tab">New tab</string>
+     <string name="bare_vtabs_close_all">Close all</string>
++    <string name="bare_tabs_style_title">Tabs style</string>
++    <string name="bare_tabs_style_drawer">Side drawer</string>
++    <string name="bare_tabs_style_sheet">Sheet</string>
++    <plurals name="bare_vtabs_sheet_count">
++        <item quantity="one">%d tab</item>
++        <item quantity="other">%d tabs</item>
++    </plurals>
+     <string name="bare_vtabs_close_tab">Close %1$s</string>
+     <string name="bare_vtabs_move_up">Move up</string>
+     <string name="bare_vtabs_move_down">Move down</string>
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java
+new file mode 100644
+index 0000000000..05f631c651
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabsStyle.java
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.bare;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
++import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
++
++/**
++ * Whether the Vertical tabs button opens the side drawer or the tab sheet.
++ *
++ * <p>The side drawer is the default, and is what Bare ships: nothing is stored until the user
++ * picks the sheet. The two UIs share the same tab list; this only says which chrome it sits in.
++ */
++@NullMarked
++public final class BareTabsStyle {
++    /** Stored value, and the default, for the side drawer. */
++    public static final String DRAWER = "drawer";
++
++    /** Stored value for the bottom (or top) tab sheet. */
++    public static final String SHEET = "sheet";
++
++    private BareTabsStyle() {}
++
++    /** Whether the Vertical tabs button should open the sheet rather than the side drawer. */
++    public static boolean isSheet() {
++        return SHEET.equals(
++                ChromeSharedPreferences.getInstance()
++                        .readString(ChromePreferenceKeys.BARE_TABS_STYLE, DRAWER));
++    }
++
++    /**
++     * Records the style, or forgets it when the user is back on the default drawer so a reset and
++     * a fresh profile look the same.
++     */
++    public static void setStyle(String style) {
++        if (SHEET.equals(style)) {
++            ChromeSharedPreferences.getInstance()
++                    .writeString(ChromePreferenceKeys.BARE_TABS_STYLE, SHEET);
++        } else {
++            ChromeSharedPreferences.getInstance().removeKey(ChromePreferenceKeys.BARE_TABS_STYLE);
++        }
++    }
++}
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 58fb6994dd..b2f7b8f15d 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -91,12 +91,12 @@ import java.util.Objects;
+ import java.util.function.Supplier;
+ 
+ /**
+- * A drawer of the open tabs that slides in from the left, opened by the Vertical tabs toolbar
+- * button.
++ * The list of open tabs, shown either as a side drawer or as a sheet above (or below) the toolbar.
+  *
+- * <p>It is a view over the browser's own tab model: it lists the tabs of the window the user is in,
+- * and selecting, closing, adding and closing all go through the same operations the tab overview
+- * uses. It keeps no tabs of its own.
++ * <p>The Vertical tabs button opens it. Which chrome it uses is {@link BareTabsStyle}: the side
++ * drawer is the default; the sheet is opt-in. Both share this class's list, its reorder and its
++ * swipe-to-close. It is a view over the browser's own tab model: selecting, closing, adding and
++ * closing all go through the same operations the tab overview uses. It keeps no tabs of its own.
+  */
+ @NullMarked
+ public final class BareVerticalTabsDrawer {
+@@ -131,6 +131,13 @@ public final class BareVerticalTabsDrawer {
+     private @Nullable TextView mEmpty;
+     private @Nullable LinearLayout mHeader;
+     private @Nullable LinearLayout mFooter;
++    private @Nullable View mDivider;
++    private @Nullable View mHandleRow;
++    private @Nullable TextView mDomain;
++    private @Nullable LinearLayout mSheetActions;
++    private @Nullable TextView mSheetCount;
++    private @Nullable ImageButton mSheetList;
++    private @Nullable ImageButton mSheetGrid;
+     private @Nullable TabAdapter mAdapter;
+     private @Nullable OnBackPressedCallback mBackCallback;
+     private @Nullable ValueAnimator mAnimator;
+@@ -253,6 +260,7 @@ public final class BareVerticalTabsDrawer {
+         if (layoutManager != null) stackFromBottomIfListed(layoutManager);
+         applyListPlacement();
+         updateSide();
++        applyChrome();
+         mScrollToSelected = true;
+         mSnapNext = true;
+         refresh();
+@@ -263,8 +271,18 @@ public final class BareVerticalTabsDrawer {
+             applyInsets(WindowInsetsCompat.toWindowInsetsCompat(windowInsets));
+         }
+         hostRoot(root, glassWanted());
++        applySheetInsets();
++        applySheetBackground();
+         root.setVisibility(View.VISIBLE);
+         root.requestApplyInsets();
++        // The toolbars may not have been laid out on the first pass, so re-measure after.
++        root.post(
++                () -> {
++                    applySheetInsets();
++                    applySheetBackground();
++                    applyChromeInsets();
++                    applyProgress(mProgress);
++                });
+         if (mBackCallback != null) mBackCallback.setEnabled(true);
+         animateTo(1f, null);
+         Panel panel = mPanel;
+@@ -348,6 +366,7 @@ public final class BareVerticalTabsDrawer {
+                     @Override
+                     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+                         super.onSizeChanged(w, h, oldw, oldh);
++                        applySheetInsets();
+                         sizePanel(w);
+                     }
+                 };
+@@ -372,6 +391,39 @@ public final class BareVerticalTabsDrawer {
+         panel.setTranslationX(-dp(MAX_WIDTH_DP));
+         root.addView(panel, new FrameLayout.LayoutParams(dp(MAX_WIDTH_DP), ViewGroup.LayoutParams.MATCH_PARENT));
+ 
++        // Sheet chrome: a handle and the current tab's domain. Hidden in the drawer.
++        LinearLayout handleRow = new LinearLayout(mActivity);
++        handleRow.setOrientation(LinearLayout.VERTICAL);
++        handleRow.setGravity(Gravity.CENTER_HORIZONTAL);
++        handleRow.setTag("sheet_handle_row");
++        View handle = new View(mActivity);
++        handle.setTag("sheet_handle");
++        handle.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        GradientDrawable handleShape = new GradientDrawable();
++        handleShape.setCornerRadius(dp(2));
++        handleShape.setColor(color(0xFF6B6773, 0xFFC8C4D0));
++        handle.setBackground(handleShape);
++        LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(dp(36), dp(4));
++        handleParams.gravity = Gravity.CENTER_HORIZONTAL;
++        handleParams.topMargin = dp(2);
++        handleRow.addView(handle, handleParams);
++        TextView domain = new TextView(mActivity);
++        domain.setTag("sheet_domain");
++        domain.setTextColor(color(0xFFA4A5AC, 0xFF6B6B73));
++        domain.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
++        domain.setGravity(Gravity.CENTER);
++        domain.setMaxLines(1);
++        domain.setEllipsize(TextUtils.TruncateAt.END);
++        domain.setPadding(dp(16), dp(6), dp(16), dp(8));
++        handleRow.addView(
++                domain,
++                new LinearLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        panel.addView(
++                handleRow,
++                new LinearLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++
+         // Header: the wordmark and a close button. Fixed.
+         LinearLayout header = new LinearLayout(mActivity);
+         header.setOrientation(LinearLayout.HORIZONTAL);
+@@ -442,6 +494,7 @@ public final class BareVerticalTabsDrawer {
+         View divider = new View(mActivity);
+         divider.setBackgroundColor(color(0xFF343439, 0xFFD9D9DE));
+         panel.addView(divider, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)));
++        mDivider = divider;
+         LinearLayout footer = new LinearLayout(mActivity);
+         footer.setOrientation(LinearLayout.VERTICAL);
+         LinearLayout buttons = new LinearLayout(mActivity);
+@@ -486,6 +539,66 @@ public final class BareVerticalTabsDrawer {
+         footer.addView(toggle, toggleParams);
+         panel.addView(footer);
+ 
++        // Sheet actions: count, list/grid, new tab, close all. Hidden in the drawer.
++        LinearLayout sheetActions = new LinearLayout(mActivity);
++        sheetActions.setOrientation(LinearLayout.HORIZONTAL);
++        sheetActions.setGravity(Gravity.CENTER_VERTICAL);
++        sheetActions.setTag("sheet_actions");
++        TextView sheetCount = new TextView(mActivity);
++        sheetCount.setTag("sheet_count");
++        sheetCount.setTextColor(color(0xFFA4A5AC, 0xFF6B6B73));
++        sheetCount.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
++        sheetCount.setMaxLines(1);
++        sheetActions.addView(
++                sheetCount,
++                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
++        ImageButton sheetList =
++                sheetActionButton(
++                        R.drawable.bare_menu_view_list,
++                        R.string.bare_vtabs_list_view,
++                        "sheet_list",
++                        v -> {
++                            ActionHaptics.tick(v);
++                            setGrid(false);
++                        });
++        ImageButton sheetGrid =
++                sheetActionButton(
++                        R.drawable.ic_grid_view_24dp,
++                        R.string.bare_vtabs_grid_view,
++                        "sheet_grid",
++                        v -> {
++                            ActionHaptics.tick(v);
++                            setGrid(true);
++                        });
++        ImageButton sheetNew =
++                sheetActionButton(
++                        R.drawable.ic_add_box_rounded_corner,
++                        R.string.bare_vtabs_new_tab,
++                        "sheet_new",
++                        v -> {
++                            ActionHaptics.tick(v);
++                            addTab();
++                        });
++        ImageButton sheetCloseAll =
++                sheetActionButton(
++                        R.drawable.ic_close_all_tabs,
++                        R.string.bare_vtabs_close_all,
++                        "sheet_close_all",
++                        v -> {
++                            ActionHaptics.tick(v);
++                            closeAllTabs();
++                        });
++        LinearLayout.LayoutParams actionBtn =
++                new LinearLayout.LayoutParams(dp(40), dp(40));
++        sheetActions.addView(sheetList, actionBtn);
++        sheetActions.addView(sheetGrid, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        sheetActions.addView(sheetNew, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        sheetActions.addView(sheetCloseAll, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        panel.addView(
++                sheetActions,
++                new LinearLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++
+         panel.setOnDismissListener(this::close);
+         panel.setDragListener(this::dragTo, this::finishDrag);
+ 
+@@ -520,7 +633,14 @@ public final class BareVerticalTabsDrawer {
+         mEmpty = empty;
+         mHeader = header;
+         mFooter = footer;
++        mHandleRow = handleRow;
++        mDomain = domain;
++        mSheetActions = sheetActions;
++        mSheetCount = sheetCount;
++        mSheetList = sheetList;
++        mSheetGrid = sheetGrid;
+         mAdapter = adapter;
++        applyChrome();
+         sizePanel(root.getWidth() > 0 ? root.getWidth() : mActivity.getResources().getDisplayMetrics().widthPixels);
+     }
+ 
+@@ -534,8 +654,28 @@ public final class BareVerticalTabsDrawer {
+         // system's own bar sizes are the floor.
+         mTopInset = Math.max(bars.top, systemDimension("status_bar_height"));
+         mBottomInset = Math.max(bars.bottom, systemDimension("navigation_bar_height"));
++        applyChromeInsets();
++    }
++
++    /**
++     * In the drawer, the header sits below the status bar and the footer above the nav bar. In
++     * the sheet, the root is already inset to clear the toolbar, so only a status-bar inset is
++     * added when the sheet reaches the top of the window.
++     */
++    private void applyChromeInsets() {
+         LinearLayout header = mHeader;
+         LinearLayout footer = mFooter;
++        if (isSheetChrome()) {
++            View handleRow = mHandleRow;
++            if (handleRow != null) {
++                int top = sheetTopClearance() + dp(10);
++                handleRow.setPadding(dp(16), top, dp(16), dp(2));
++            }
++            if (mSheetActions != null) {
++                mSheetActions.setPadding(dp(16), dp(8), dp(8), dp(10));
++            }
++            return;
++        }
+         if (header != null) header.setPadding(dp(15), mTopInset + dp(12), dp(15), dp(6));
+         if (footer != null) footer.setPadding(0, 0, 0, mBottomInset);
+     }
+@@ -608,6 +748,7 @@ public final class BareVerticalTabsDrawer {
+         list.setAdapter(adapter);
+         mScrollToSelected = true;
+         mSnapNext = true;
++        updateSheetButtons();
+         refresh();
+     }
+ 
+@@ -651,15 +792,217 @@ public final class BareVerticalTabsDrawer {
+     private void sizePanel(int rootWidth) {
+         Panel panel = mPanel;
+         if (panel == null) return;
+-        mPanelWidth = Math.min(Math.round(rootWidth * WIDTH_FRACTION), dp(MAX_WIDTH_DP));
+         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
+-        if (params.width != mPanelWidth) {
+-            params.width = mPanelWidth;
+-            panel.setLayoutParams(params);
++        if (isSheetChrome()) {
++            int width = rootWidth > 0 ? rootWidth : params.width;
++            mPanelWidth = width;
++            boolean changed =
++                    params.width != ViewGroup.LayoutParams.MATCH_PARENT
++                            || params.height != ViewGroup.LayoutParams.MATCH_PARENT
++                            || params.gravity != Gravity.FILL;
++            if (changed) {
++                params.width = ViewGroup.LayoutParams.MATCH_PARENT;
++                params.height = ViewGroup.LayoutParams.MATCH_PARENT;
++                params.gravity = Gravity.FILL;
++                panel.setLayoutParams(params);
++            }
++            applySheetBackground();
++        } else {
++            mPanelWidth = Math.min(Math.round(rootWidth * WIDTH_FRACTION), dp(MAX_WIDTH_DP));
++            if (params.width != mPanelWidth
++                    || params.height != ViewGroup.LayoutParams.MATCH_PARENT) {
++                params.width = mPanelWidth;
++                params.height = ViewGroup.LayoutParams.MATCH_PARENT;
++                panel.setLayoutParams(params);
++            }
+         }
+         applyProgress(mProgress);
+     }
+ 
++    /** Whether the current style is the sheet. Read at layout time so a setting change applies. */
++    private boolean isSheetChrome() {
++        return BareTabsStyle.isSheet();
++    }
++
++    /**
++     * Shows the drawer chrome or the sheet chrome, and sizes the panel for that mode. The list
++     * itself is not rebuilt.
++     */
++    private void applyChrome() {
++        boolean sheet = isSheetChrome();
++        if (mHandleRow != null) mHandleRow.setVisibility(sheet ? View.VISIBLE : View.GONE);
++        if (mDomain != null) mDomain.setVisibility(sheet ? View.VISIBLE : View.GONE);
++        if (mSheetActions != null) mSheetActions.setVisibility(sheet ? View.VISIBLE : View.GONE);
++        if (mHeader != null) mHeader.setVisibility(sheet ? View.GONE : View.VISIBLE);
++        if (mCount != null) mCount.setVisibility(sheet ? View.GONE : View.VISIBLE);
++        if (mDivider != null) mDivider.setVisibility(sheet ? View.GONE : View.VISIBLE);
++        if (mFooter != null) mFooter.setVisibility(sheet ? View.GONE : View.VISIBLE);
++        Panel panel = mPanel;
++        if (panel != null) {
++            if (sheet) {
++                panel.setDragListener(null, null);
++            } else {
++                panel.setDragListener(this::dragTo, this::finishDrag);
++            }
++        }
++        applySheetInsets();
++        FrameLayout root = mRoot;
++        int width =
++                root != null && root.getWidth() > 0
++                        ? root.getWidth()
++                        : mActivity.getResources().getDisplayMetrics().widthPixels;
++        sizePanel(width);
++        applySheetBackground();
++        applyChromeInsets();
++        updateSheetButtons();
++    }
++
++    /** Insets the overlay so it does not cover the real toolbar, which stays tappable. */
++    private void applySheetInsets() {
++        FrameLayout root = mRoot;
++        if (root == null || !(root.getLayoutParams() instanceof FrameLayout.LayoutParams)) return;
++        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) root.getLayoutParams();
++        int top = 0;
++        int bottom = 0;
++        if (isSheetChrome()) {
++            int[] inset = toolbarInsets();
++            top = inset[0];
++            bottom = inset[1];
++        }
++        if (params.topMargin == top && params.bottomMargin == bottom) return;
++        params.topMargin = top;
++        params.bottomMargin = bottom;
++        root.setLayoutParams(params);
++    }
++
++    /**
++     * How much of the activity's content the top and bottom toolbars occupy, so the sheet can sit
++     * in the gap. When the address bar is on top, this also leaves that bar clear (the five-button
++     * bar stays at the bottom). Full visual mirroring of the sheet is a later step.
++     */
++    private int[] toolbarInsets() {
++        View content = mActivity.findViewById(android.R.id.content);
++        if (content == null) return new int[] {0, 0};
++        int[] contentLoc = new int[2];
++        content.getLocationOnScreen(contentLoc);
++        int contentTop = contentLoc[1];
++        int contentBottom = contentLoc[1] + content.getHeight();
++        if (content.getHeight() <= 0) return new int[] {0, 0};
++        int top = 0;
++        int bottom = 0;
++        int[] ids =
++                new int[] {
++                    R.id.control_container,
++                    org.chromium.chrome.browser.ui.bottombar.R.id.bottom_bar_container
++                };
++        // The edge-to-edge chin sits below the bottom bar, so the bar's bottom is not flush
++        // with the content's bottom. Treat a bar as bottom chrome if it lives in the lower
++        // third of the window, and as top chrome if it lives in the upper third.
++        int third = Math.max(dp(80), content.getHeight() / 3);
++        int[] loc = new int[2];
++        for (int id : ids) {
++            View bar = mActivity.findViewById(id);
++            if (bar == null || bar.getVisibility() != View.VISIBLE || bar.getHeight() <= 0) {
++                continue;
++            }
++            bar.getLocationOnScreen(loc);
++            int barTop = loc[1];
++            int barBottom = loc[1] + bar.getHeight();
++            if (barTop <= contentTop + third) {
++                top = Math.max(top, barBottom - contentTop);
++            }
++            if (barBottom >= contentBottom - third) {
++                bottom = Math.max(bottom, contentBottom - barTop);
++            }
++        }
++        return new int[] {Math.max(0, top), Math.max(0, bottom)};
++    }
++
++    /** Status-bar inset only when the sheet reaches the top of the window. */
++    private int sheetTopClearance() {
++        FrameLayout root = mRoot;
++        if (root != null
++                && root.getLayoutParams() instanceof FrameLayout.LayoutParams params
++                && params.topMargin > 0) {
++            return 0;
++        }
++        return mTopInset;
++    }
++
++    private void applySheetBackground() {
++        Panel panel = mPanel;
++        if (panel == null) return;
++        if (!isSheetChrome()) {
++            panel.setBackgroundColor(
++                    mGlass ? color(0xA61B1B1E, 0xB8F4F4F7) : color(0xFF1B1B1E, 0xFFF4F4F7));
++            panel.setClipToOutline(false);
++            panel.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
++            return;
++        }
++        int radius = dp(20);
++        GradientDrawable background = new GradientDrawable();
++        background.setColor(color(0xFF1C1A20, 0xFFF1EDF6));
++        background.setCornerRadii(
++                new float[] {radius, radius, radius, radius, 0f, 0f, 0f, 0f});
++        panel.setBackground(background);
++        panel.setClipToOutline(true);
++        panel.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
++    }
++
++    private void updateSheetButtons() {
++        if (mSheetList == null || mSheetGrid == null) return;
++        int active = color(0xFFEEEEEE, 0xFF1B1B1F);
++        int muted = color(0xFF7A7A82, 0xFF8A8A92);
++        mSheetList.setColorFilter(mGrid ? muted : active);
++        mSheetGrid.setColorFilter(mGrid ? active : muted);
++        mSheetList.setSelected(!mGrid);
++        mSheetGrid.setSelected(mGrid);
++    }
++
++    private ImageButton sheetActionButton(
++            int drawable, int description, String tag, View.OnClickListener listener) {
++        ImageButton button = new ImageButton(mActivity);
++        button.setTag(tag);
++        button.setImageResource(drawable);
++        button.setColorFilter(color(0xFFEEEEEE, 0xFF1B1B1F));
++        button.setBackground(null);
++        button.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
++        button.setPadding(dp(8), dp(8), dp(8), dp(8));
++        button.setContentDescription(mActivity.getString(description));
++        button.setOnClickListener(listener);
++        return button;
++    }
++
++    private void updateDomainAndSheetCount(TabModel model, @Nullable Tab selected, int n) {
++        TextView domain = mDomain;
++        if (domain != null) {
++            String label = "";
++            if (selected != null
++                    && selected.getUrl() != null
++                    && !UrlUtilities.isNtpUrl(selected.getUrl())
++                    && !TextUtils.isEmpty(selected.getUrl().getSpec())) {
++                String host = selected.getUrl().getHost();
++                label = TextUtils.isEmpty(host) ? selected.getUrl().getSpec() : host;
++            }
++            domain.setText(label);
++            domain.setVisibility(
++                    isSheetChrome()
++                            ? (label.isEmpty() ? View.INVISIBLE : View.VISIBLE)
++                            : View.GONE);
++        }
++        TextView sheetCount = mSheetCount;
++        if (sheetCount != null) {
++            boolean incognito = model.isIncognito();
++            sheetCount.setText(
++                    incognito
++                            ? mActivity.getResources()
++                                    .getQuantityString(R.plurals.bare_vtabs_private_count, n, n)
++                            : mActivity.getResources()
++                                    .getQuantityString(R.plurals.bare_vtabs_sheet_count, n, n));
++        }
++        updateSheetButtons();
++    }
++
+     private ImageButton iconButton(int drawable) {
+         ImageButton button = new ImageButton(mActivity);
+         button.setImageResource(drawable);
+@@ -694,6 +1037,9 @@ public final class BareVerticalTabsDrawer {
+      * Android 12 or newer, and the system allows blurring what is behind a window.
+      */
+     private boolean glassWanted() {
++        // The glass window is a full-screen dialog and would cover the toolbar the sheet must
++        // leave tappable, so the sheet stays in the activity without blur for now.
++        if (isSheetChrome()) return false;
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
+         if (!ChromeSharedPreferences.getInstance()
+                 .readBoolean(ChromePreferenceKeys.BARE_GLASS, true)) {
+@@ -709,7 +1055,7 @@ public final class BareVerticalTabsDrawer {
+      */
+     private void hostRoot(FrameLayout root, boolean glass) {
+         Panel panel = mPanel;
+-        if (panel != null) {
++        if (panel != null && !isSheetChrome()) {
+             panel.setBackgroundColor(
+                     glass ? color(0xA61B1B1E, 0xB8F4F4F7) : color(0xFF1B1B1E, 0xFFF4F4F7));
+         }
+@@ -815,9 +1161,26 @@ public final class BareVerticalTabsDrawer {
+         View scrim = mScrim;
+         Panel panel = mPanel;
+         if (scrim != null) scrim.setAlpha(mProgress * (mGlass ? GLASS_SCRIM : 1f));
+-        setBlur(mProgress);
+-        if (panel != null) panel.setTranslationX(-mSide * (1f - mProgress) * (mPanelWidth > 0 ? mPanelWidth : panel.getWidth()));
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
++        if (isSheetChrome()) {
++            setBlur(0f);
++            if (panel != null) {
++                panel.setTranslationX(0f);
++                int height = panel.getHeight() > 0 ? panel.getHeight() : 1;
++                panel.setTranslationY((1f - mProgress) * height);
++            }
++            // The sheet overlays the page; it does not push it aside the way the drawer does.
++            if (page != null) page.setTranslationX(0f);
++            return;
++        }
++        setBlur(mProgress);
++        if (panel != null) {
++            panel.setTranslationY(0f);
++            panel.setTranslationX(
++                    -mSide
++                            * (1f - mProgress)
++                            * (mPanelWidth > 0 ? mPanelWidth : panel.getWidth()));
++        }
+         if (page != null) page.setTranslationX(mSide * mProgress * dp(PAGE_SHIFT_DP));
+     }
+ 
+@@ -924,6 +1287,7 @@ public final class BareVerticalTabsDrawer {
+                                 .getQuantityString(R.plurals.bare_vtabs_private_count, n, n)
+                         : mActivity.getResources()
+                                 .getQuantityString(R.plurals.bare_vtabs_count, n, n));
++        updateDomainAndSheetCount(model, selected, n);
+         empty.setVisibility(n == 0 ? View.VISIBLE : View.GONE);
+     }
+ 
+@@ -2072,13 +2436,14 @@ public final class BareVerticalTabsDrawer {
+             mSide = side;
+         }
+ 
+-        void setDragListener(Drag drag, Release release) {
++        void setDragListener(@Nullable Drag drag, @Nullable Release release) {
+             mDrag = drag;
+             mRelease = release;
+         }
+ 
+         @Override
+         public boolean onInterceptTouchEvent(MotionEvent ev) {
++            if (mDrag == null) return super.onInterceptTouchEvent(ev);
+             switch (ev.getActionMasked()) {
+                 case MotionEvent.ACTION_DOWN:
+                     mDownX = ev.getRawX();
+@@ -2111,6 +2476,7 @@ public final class BareVerticalTabsDrawer {
+ 
+         @Override
+         public boolean onTouchEvent(MotionEvent ev) {
++            if (mDrag == null) return super.onTouchEvent(ev);
+             track(ev);
+             switch (ev.getActionMasked()) {
+                 case MotionEvent.ACTION_MOVE:
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsFragment.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsFragment.java
+index 7d4024746c..f8f1803299 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsFragment.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsFragment.java
+@@ -18,6 +18,7 @@ import org.chromium.base.supplier.SettableMonotonicObservableSupplier;
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+ import org.chromium.chrome.R;
++import org.chromium.chrome.browser.bare.BareTabsStyle;
+ import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
+ import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
+ import org.chromium.chrome.browser.settings.ChromeBaseSettingsFragment;
+@@ -74,6 +75,7 @@ public class BareToolbarSettingsFragment extends ChromeBaseSettingsFragment {
+     static final String PREF_SWIPE = "bare_toolbar_swipe_action";
+     static final String PREF_ADDRESS_BAR_SWIPE = "bare_address_bar_swipe_tabs";
+     static final String PREF_ADDRESS_BAR_BACK = "bare_address_bar_back_button";
++    static final String PREF_TABS_STYLE = "bare_tabs_style";
+ 
+     private final SettableMonotonicObservableSupplier<String> mPageTitle =
+             ObservableSuppliers.createMonotonic();
+@@ -91,6 +93,7 @@ public class BareToolbarSettingsFragment extends ChromeBaseSettingsFragment {
+         updateShortcutInPreview();
+ 
+         initAddressBarPositionPref();
++        initTabsStylePref();
+         initGeneralPrefs();
+         initSwipeActionPref();
+ 
+@@ -140,6 +143,8 @@ public class BareToolbarSettingsFragment extends ChromeBaseSettingsFragment {
+         }
+         ListPreference position = findPreference(PREF_ADDRESS_BAR_POSITION);
+         if (position != null && position.isVisible()) updateAddressBarPositionPref(position);
++        ListPreference tabsStyle = findPreference(PREF_TABS_STYLE);
++        if (tabsStyle != null) updateTabsStylePref(tabsStyle);
+         updateShortcutInPreview();
+         updateMenuLeftAvailability();
+     }
+@@ -202,6 +207,36 @@ public class BareToolbarSettingsFragment extends ChromeBaseSettingsFragment {
+                 top ? R.string.address_bar_settings_top : R.string.address_bar_settings_bottom);
+     }
+ 
++    /** Side drawer or sheet, defaulting to the drawer. */
++    private void initTabsStylePref() {
++        ListPreference style = findPreference(PREF_TABS_STYLE);
++        assert style != null;
++        style.setEntries(
++                new CharSequence[] {
++                    getString(R.string.bare_tabs_style_drawer),
++                    getString(R.string.bare_tabs_style_sheet)
++                });
++        style.setEntryValues(new CharSequence[] {BareTabsStyle.DRAWER, BareTabsStyle.SHEET});
++        updateTabsStylePref(style);
++        style.setOnPreferenceChangeListener(
++                (pref, newValue) -> {
++                    String value = String.valueOf(newValue);
++                    BareTabsStyle.setStyle(value);
++                    pref.setSummary(
++                            BareTabsStyle.SHEET.equals(value)
++                                    ? R.string.bare_tabs_style_sheet
++                                    : R.string.bare_tabs_style_drawer);
++                    return true;
++                });
++    }
++
++    private void updateTabsStylePref(ListPreference style) {
++        boolean sheet = BareTabsStyle.isSheet();
++        style.setValue(sheet ? BareTabsStyle.SHEET : BareTabsStyle.DRAWER);
++        style.setSummary(
++                sheet ? R.string.bare_tabs_style_sheet : R.string.bare_tabs_style_drawer);
++    }
++
+     /** The same test the Address bar row in Settings uses. */
+     private boolean canMoveAddressBar() {
+         return !DeviceInfo.isAutomotive()
+diff --git a/chrome/android/junit/BUILD.gn b/chrome/android/junit/BUILD.gn
+index dfdeefe676..a9ab3b38b6 100644
+--- a/chrome/android/junit/BUILD.gn
++++ b/chrome/android/junit/BUILD.gn
+@@ -450,6 +450,7 @@ if (is_android) {
+       "src/org/chromium/chrome/browser/bare/settings/BareTranslateSettingsScreenUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareTabSwitcherUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareToolbarActionCatalogueUnitTest.java",
++      "src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/settings/BareSettingsLayoutUnitTest.java",
+       "src/org/chromium/chrome/browser/bare/BareCrxDownloadWatcherUnitTest.java",
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java
+new file mode 100644
+index 0000000000..dd6112d521
+--- /dev/null
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabsStyleUnitTest.java
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.bare;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import org.junit.After;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.preferences.ChromePreferenceKeys;
++import org.chromium.chrome.browser.preferences.ChromeSharedPreferences;
++
++/** Unit tests for {@link BareTabsStyle}. */
++@RunWith(BaseRobolectricTestRunner.class)
++public class BareTabsStyleUnitTest {
++
++    @After
++    public void tearDown() {
++        BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++    }
++
++    @Test
++    public void testDefaultIsTheSideDrawer() {
++        ChromeSharedPreferences.getInstance().removeKey(ChromePreferenceKeys.BARE_TABS_STYLE);
++        assertFalse(BareTabsStyle.isSheet());
++    }
++
++    @Test
++    public void testSheetIsOptInAndClearingRestoresTheDrawer() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        assertTrue(BareTabsStyle.isSheet());
++        assertEquals(
++                BareTabsStyle.SHEET,
++                ChromeSharedPreferences.getInstance()
++                        .readString(ChromePreferenceKeys.BARE_TABS_STYLE, BareTabsStyle.DRAWER));
++
++        BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++        assertFalse(BareTabsStyle.isSheet());
++        assertFalse(
++                ChromeSharedPreferences.getInstance()
++                        .contains(ChromePreferenceKeys.BARE_TABS_STYLE));
++    }
++
++    @Test
++    public void testUnknownValueIsTreatedAsTheDrawer() {
++        ChromeSharedPreferences.getInstance()
++                .writeString(ChromePreferenceKeys.BARE_TABS_STYLE, "unknown");
++        assertFalse(BareTabsStyle.isSheet());
++    }
++}
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 44936ef907..e932a2311d 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -38,6 +38,7 @@ import org.chromium.base.Token;
+ import org.chromium.base.test.BaseRobolectricTestRunner;
+ import org.chromium.chrome.browser.tab.Tab;
+ import org.chromium.chrome.browser.tab.TabFavicon;
++import org.chromium.chrome.browser.tab.TabLaunchType;
+ import org.chromium.chrome.browser.tab.TabSelectionType;
+ import org.chromium.chrome.browser.tabmodel.TabCreator;
+ import org.chromium.chrome.browser.tabmodel.TabCreatorManager;
+@@ -95,6 +96,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         mCreators = mock(TabCreatorManager.class);
+         when(mCreators.getTabCreator(false)).thenReturn(mCreator);
+ 
++        BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
+         mDrawer = new BareVerticalTabsDrawer(mActivity, () -> mSelector, () -> mCreators);
+     }
+ 
+@@ -444,4 +446,115 @@ public class BareVerticalTabsDrawerUnitTest {
+         node.recycle();
+         return labels;
+     }
++
++    private View findTag(String tag) {
++        return findTag(content(), tag);
++    }
++
++    private View findTag(View view, String tag) {
++        if (tag.equals(view.getTag())) return view;
++        if (view instanceof ViewGroup group) {
++            for (int i = 0; i < group.getChildCount(); i++) {
++                View found = findTag(group.getChildAt(i), tag);
++                if (found != null) return found;
++            }
++        }
++        return null;
++    }
++
++    private RecyclerView openSheetAndGetList() {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        return openAndGetList();
++    }
++
++    @Test
++    public void testTheDefaultStyleKeepsTheSideDrawerChrome() {
++        BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++        openAndGetList();
++        assertFalse(findTag("sheet_handle_row").isShown());
++        assertFalse(findTag("sheet_actions").isShown());
++        assertTrue(button("New tab").isShown());
++        assertTrue(button("Close all").isShown());
++    }
++
++    @Test
++    public void testTheSheetHidesTheDrawerChromeAndShowsTheHandleAndActions() {
++        RecyclerView list = openSheetAndGetList();
++        assertTrue(mDrawer.isOpen());
++        assertTrue(findTag("sheet_handle_row").isShown());
++        assertTrue(findTag("sheet_handle").isShown());
++        assertTrue(findTag("sheet_actions").isShown());
++        assertFalse(button("New tab").isShown());
++        assertFalse(button("Close all").isShown());
++        assertNotNull(list);
++        assertEquals(2, list.getAdapter().getItemCount());
++    }
++
++    @Test
++    public void testTheSheetListsTheSameTabsAndClosesOnToggle() {
++        RecyclerView list = openSheetAndGetList();
++        assertEquals(2, list.getAdapter().getItemCount());
++        assertEquals(1L, list.getAdapter().getItemId(0));
++        assertEquals(2L, list.getAdapter().getItemId(1));
++        mDrawer.toggle();
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testTheSheetNewTabButtonOpensANewTabPageAndCloses() {
++        openSheetAndGetList();
++        findTag("sheet_new").performClick();
++        verify(mCreator).launchNtp(TabLaunchType.FROM_CHROME_UI);
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testTheSheetCloseAllButtonClosesEveryTab() {
++        openSheetAndGetList();
++        findTag("sheet_close_all").performClick();
++        verify(mRemover).closeTabs(any(), eq(true));
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testTheSheetCanSwitchBetweenListAndGrid() {
++        org.chromium.chrome.browser.preferences.ChromeSharedPreferences.getInstance()
++                .writeBoolean(
++                        org.chromium.chrome.browser.preferences.ChromePreferenceKeys
++                                .BARE_VERTICAL_TABS_GRID,
++                        false);
++        try {
++            RecyclerView list = openSheetAndGetList();
++            assertFalse(
++                    list.getLayoutManager()
++                            instanceof androidx.recyclerview.widget.GridLayoutManager);
++            findTag("sheet_grid").performClick();
++            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
++            assertTrue(
++                    list.getLayoutManager()
++                            instanceof androidx.recyclerview.widget.GridLayoutManager);
++            findTag("sheet_list").performClick();
++            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
++            assertFalse(
++                    list.getLayoutManager()
++                            instanceof androidx.recyclerview.widget.GridLayoutManager);
++        } finally {
++            org.chromium.chrome.browser.preferences.ChromeSharedPreferences.getInstance()
++                    .removeKey(
++                            org.chromium.chrome.browser.preferences.ChromePreferenceKeys
++                                    .BARE_VERTICAL_TABS_GRID);
++        }
++    }
++
++    @Test
++    public void testTheSheetShowsTheCurrentTabDomain() {
++        openSheetAndGetList();
++        TextView domain = (TextView) findTag("sheet_domain");
++        assertNotNull(domain);
++        assertEquals(View.VISIBLE, domain.getVisibility());
++        assertEquals(mSecond.getUrl().getHost(), domain.getText().toString());
++        TextView count = (TextView) findTag("sheet_count");
++        assertNotNull(count);
++        assertTrue(count.getText().toString().contains("2"));
++    }
+ }
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsUnitTest.java
+index 0bf929a37c..fb39324763 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/settings/BareToolbarSettingsUnitTest.java
+@@ -179,4 +179,32 @@ public class BareToolbarSettingsUnitTest {
+         assertFalse(
+                 preview.findViewById(R.id.bare_preview_slot_app_menu).isFocusable());
+     }
++
++    @Test
++    public void testToolbarScreenOffersTabsStyle() {
++        assertTrue(
++                "Toolbar settings should offer the Tabs style preference",
++                toolbarXmlContainsKey("bare_tabs_style"));
++    }
++
++    private boolean toolbarXmlContainsKey(String key) {
++        try (XmlResourceParser parser =
++                mContext.getResources().getXml(R.xml.bare_toolbar_preferences)) {
++            int event = parser.getEventType();
++            while (event != XmlPullParser.END_DOCUMENT) {
++                if (event == XmlPullParser.START_TAG) {
++                    for (int i = 0; i < parser.getAttributeCount(); i++) {
++                        if ("key".equals(parser.getAttributeName(i))
++                                && key.equals(parser.getAttributeValue(i))) {
++                            return true;
++                        }
++                    }
++                }
++                event = parser.next();
++            }
++        } catch (Exception e) {
++            throw new AssertionError("could not read the Toolbar screen", e);
++        }
++        return false;
++    }
+ }
+diff --git a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java
+index 1dc8781dc3..4d33d1adaf 100644
+--- a/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java
++++ b/chrome/browser/preferences/android/java/src/org/chromium/chrome/browser/preferences/ChromePreferenceKeys.java
+@@ -504,6 +504,12 @@ public final class ChromePreferenceKeys {
+     /** Whether the vertical tabs drawer shows its tabs as a grid, two to a row. */
+     public static final String BARE_VERTICAL_TABS_GRID = "Chrome.Bare.VerticalTabsGrid";
+ 
++    /**
++     * How the Vertical tabs button presents the tab list: "drawer" (the default side panel) or
++     * "sheet" (the pull-up sheet). Missing means the drawer.
++     */
++    public static final String BARE_TABS_STYLE = "Bare.Tabs.Style";
++
+     /** Which launcher icon is in use: 0 the leaf on light (default), 1 the leaf on dark, 2 retro. */
+     public static final String BARE_LAUNCHER_ICON = "Chrome.Bare.LauncherIcon";
+ 
+@@ -1554,6 +1560,7 @@ public final class ChromePreferenceKeys {
+                 BARE_CLEAR_VEIL_PENDING,
+                 BARE_LAUNCHER_ICON,
+                 BARE_VERTICAL_TABS_GRID,
++                BARE_TABS_STYLE,
+                 BARE_NEW_ICON_UNLOCKED,
+                 BARE_NEW_ICON_IN_USE,
+                 BARE_MINIMAL_LAYOUT,
+-- 
+2.34.1
+
