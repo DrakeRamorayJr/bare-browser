@@ -1,0 +1,942 @@
+From de87da6accf064ad3e02f5f0cc4f31abe6b9cd72 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:53:59 +0000
+Subject: [PATCH] Bare: morph the bottom address bar into the sheet's origin
+ pill
+
+In bottom-bar Sheet mode the address bar no longer swaps for a second
+pill. One view starts on the location bar's rect and interpolates its
+width, height, corner radius, colour and text with the sheet's progress,
+riding the sheet's top edge until it parks in the handle row at half.
+Drag, open, close and Back all drive the same per-frame update, so it
+reverses exactly.
+
+- The travelling pill re-asserts its elevation above the panel and stays
+  the root's last child every frame; closing used to drop it to 0, so the
+  next open drew it under the actions row and the cards.
+- Below half it stays on the root and never trails below the sheet's
+  top edge; it parks in the handle row only from half up.
+- Opening and closing within the morph range use a standard ease
+  (0.4, 0, 0.2, 1) and start on the sheet window's first pre-draw, so
+  the slow first frame no longer swallows the morph.
+
+Top-bar mode and the side drawer keep their existing behaviour.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 620 +++++++++++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 136 +++-
+ 2 files changed, 740 insertions(+), 16 deletions(-)
+ mode change 100644 => 100755 chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+old mode 100644
+new mode 100755
+index c5b3e7de0f..e938d23b71
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -96,6 +96,7 @@ import org.chromium.chrome.browser.tabmodel.TabModel;
+ import org.chromium.chrome.browser.tabmodel.TabModelObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
+ import org.chromium.components.embedder_support.util.UrlUtilities;
++import org.chromium.chrome.browser.omnibox.LocationBarBackgroundDrawable;
+ import org.chromium.components.omnibox.OmniboxFocusReason;
+ import org.chromium.url.GURL;
+ 
+@@ -117,7 +118,8 @@ import java.util.function.Supplier;
+  * drops down from below the address bar, mirrored. A vertical drag on the address bar, away from
+  * it, also pulls the sheet out with the finger (see {@link BareTabSheetToolbarSwipe}). Back closes
+  * the sheet, shrinking it with the predictive back gesture. On a wide screen the sheet is capped
+- * in width and centered. As the sheet opens, the address bar shrinks into a small origin pill
++ * in width and centered. As the sheet opens from a bottom address bar, that bar itself shrinks and travels
++ * into a small origin pill
+  * that rides the sheet's top edge and is the drag handle. Search lives on the bottom action row,
+  * not in the address bar. The address bar's own text is hidden while the pill is showing and
+  * comes back as it was when the sheet closes. It is a view over
+@@ -216,6 +218,36 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private @Nullable ImageView mPillLock;
+     private @Nullable ImageView mPillIcon;
+     private @Nullable TextView mPillOrigin;
++    /** Host the settled pill shows. The morph owns the text view while it travels. */
++    private String mOriginLabel = "";
++    private int mPillLockVisibility = View.GONE;
++    private int mPillIconVisibility = View.GONE;
++    /** True while the bottom-bar morph is on screen, so leaving that path can restore the pill. */
++    private boolean mMorphActive;
++    /**
++     * How far the panel and the scrim sit above the overlay bottom. The overlay covers the
++     * address-bar slot so the morph can draw there; the sheet itself stays where it was.
++     */
++    private int mSheetBottomLift;
++    private boolean mAddressCaptured;
++    private int mSavedLocationVis = View.VISIBLE;
++    private int mSavedUrlVis = View.VISIBLE;
++    private int mSavedBgVis = View.GONE;
++    private int mBarWidthPx;
++    private int mBarHeightPx;
++    private float mBarLeftPx;
++    private float mBarTopPx;
++    private int mBarFillColor;
++    private float mBarCornerRadius;
++    private float mModernBarRadiusPx = -1f;
++    private int mBarTextColor;
++    private int mBarTextPadStart = -1;
++    private int mBarTextPadEnd = -1;
++    private float mBarTextSizePx;
++    private @Nullable String mCachedBarUrl;
++    private final int[] mHostOnScreen = new int[2];
++    private final int[] mBarOnScreen = new int[2];
++    private final int[] mUrlOnScreen = new int[2];
+     private @Nullable EditText mSearchField;
+     private @Nullable View mSearchClear;
+     // Takes focus from the field, as the address bar's own focus thief does, so clearing the
+@@ -1280,6 +1312,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) root.getLayoutParams();
+         int top = 0;
+         int bottom = 0;
++        mSheetBottomLift = 0;
+         if (isSheetChrome()) {
+             int[] inset = toolbarInsets();
+             top = inset[0];
+@@ -1305,7 +1338,17 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 int address = addressBarSlotInset();
+                 int buttons = bottomButtonsInset();
+                 int slot = Math.round(address + (buttons - address) * fade);
+-                bottom = Math.max(buttons, slot) + mImeLift;
++                int resting = Math.max(buttons, slot) + mImeLift;
++                // The morph paints on the address bar from the first frame, so the sheet
++                // window includes that slot immediately. mSheetBottomLift keeps the panel
++                // on the old boundary until the slot is given up.
++                int covered = buttons + mImeLift;
++                if (bottomBarMorph() && mProgress > 0.001f && covered < resting) {
++                    bottom = covered;
++                    mSheetBottomLift = resting - covered;
++                } else {
++                    bottom = resting;
++                }
+             }
+         }
+         mOverlayTop = top;
+@@ -1317,12 +1360,25 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             top = 0;
+             bottom = 0;
+         }
++        applyScrimLift();
+         if (params.topMargin == top && params.bottomMargin == bottom) return;
+         params.topMargin = top;
+         params.bottomMargin = bottom;
+         root.setLayoutParams(params);
+     }
+ 
++    /** Keeps the dim off the address-bar slot until the sheet has taken that slot. */
++    private void applyScrimLift() {
++        View scrim = mScrim;
++        if (!(scrim != null
++                && scrim.getLayoutParams() instanceof FrameLayout.LayoutParams params)) {
++            return;
++        }
++        if (params.bottomMargin == mSheetBottomLift) return;
++        params.bottomMargin = mSheetBottomLift;
++        scrim.setLayoutParams(params);
++    }
++
+     /**
+      * How much of the activity's content the top and bottom toolbars occupy, so the sheet can sit
+      * in the gap. When the address bar is on top, this also leaves that bar clear (the five-button
+@@ -1498,7 +1554,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             domain.setText(label);
+             domain.setVisibility(View.GONE);
+         }
+-        if (mPillOrigin != null) mPillOrigin.setText(label);
++        mOriginLabel = label;
++        // While the morph is showing the full URL, the text view is not the host yet.
++        if (mPillOrigin != null && !(bottomBarMorph() && mProgress > 0.001f)) {
++            mPillOrigin.setText(label);
++        }
+         bindPillIcons(selected);
+         TextView sheetCount = mSheetCount;
+         if (sheetCount != null) {
+@@ -1717,7 +1777,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (mAnimator != null) mAnimator.cancel();
+         ValueAnimator animator = ValueAnimator.ofFloat(mProgress, target);
+         float distance = Math.abs(target - mProgress);
+-        if (isSheetChrome()) {
++        float half = BareTabSheetSnap.HALF_RATIO + 0.001f;
++        boolean morphRange = bottomBarMorph() && mProgress <= half && target <= half;
++        if (morphRange) {
++            // The bar-to-pill morph is driven by this progress every frame. An expo-out curve
++            // put almost all of it in the first frames, so the morph looked like a swap.
++            animator.setDuration(SHEET_DURATION_MS);
++            animator.setInterpolator(new PathInterpolator(0.4f, 0f, 0.2f, 1f));
++        } else if (isSheetChrome()) {
+             animator.setDuration(Math.round(200 + (SHEET_DURATION_MS - 200) * distance));
+             animator.setInterpolator(new PathInterpolator(0.16f, 1f, 0.3f, 1f));
+         } else {
+@@ -1744,7 +1811,29 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     }
+                 });
+         mAnimator = animator;
+-        animator.start();
++        FrameLayout root = mRoot;
++        if (morphRange && mProgress <= 0.001f && target > 0f && root != null) {
++            // Opening creates or shows the sheet window. Start once it is about to draw, so
++            // that slow first frame does not swallow the start of the morph.
++            Runnable start =
++                    () -> {
++                        if (mAnimator == animator && !animator.isStarted()) animator.start();
++                    };
++            root.getViewTreeObserver()
++                    .addOnPreDrawListener(
++                            new ViewTreeObserver.OnPreDrawListener() {
++                                @Override
++                                public boolean onPreDraw() {
++                                    root.getViewTreeObserver().removeOnPreDrawListener(this);
++                                    root.post(start);
++                                    return true;
++                                }
++                            });
++            root.invalidate();
++            root.postDelayed(start, 150);
++        } else {
++            animator.start();
++        }
+     }
+ 
+     /** 0 is closed and 1 is open. Drives the scrim, the panel and the shift of the page. */
+@@ -1848,13 +1937,17 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private int sheetRangeHeight() {
+         FrameLayout root = mRoot;
+         if (root != null && root.getHeight() > 0) {
+-            return Math.max(1, root.getHeight() - dp(SHEET_FULL_GAP_DP));
++            int height = root.getHeight();
++            // Once the overlay has grown over the address bar, the sheet still travels the
++            // shorter distance it had before that growth.
++            if (mSheetBottomLift > 0 && morphHostCoversBar()) height -= mSheetBottomLift;
++            return Math.max(1, height - dp(SHEET_FULL_GAP_DP));
+         }
+         // Pulled from the toolbar, the sheet moves before the overlay has been laid out the
+         // first time. Its margins are already set, so its height can be worked out.
+         View content = mActivity.findViewById(android.R.id.content);
+         if (root != null && content != null && content.getHeight() > 0) {
+-            int height = content.getHeight() - mOverlayTop - mOverlayBottom;
++            int height = content.getHeight() - mOverlayTop - mOverlayBottom - mSheetBottomLift;
+             return Math.max(1, height - dp(SHEET_FULL_GAP_DP));
+         }
+         return 1;
+@@ -1877,14 +1970,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                                 ? root.getWidth()
+                                 : mActivity.getResources().getDisplayMetrics().widthPixels);
+         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        int lift = isSheetChrome() && !sheetFromTop() ? mSheetBottomLift : 0;
+         if (params.width != width
+                 || params.height != height
+                 || params.gravity != gravity
+-                || params.bottomMargin != 0) {
++                || params.bottomMargin != lift) {
+             params.width = width;
+             params.height = height;
+             params.gravity = gravity;
+-            params.bottomMargin = 0;
++            params.bottomMargin = lift;
+             panel.setLayoutParams(params);
+         }
+     }
+@@ -2271,6 +2365,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             boolean secure = "https".equalsIgnoreCase(scheme) && lock.getDrawable() != null;
+             lock.setVisibility(secure ? View.VISIBLE : View.GONE);
+         }
++        if (icon != null) mPillIconVisibility = icon.getVisibility();
++        if (lock != null) mPillLockVisibility = lock.getVisibility();
++        // Icons belong to the settled pill. During the URL part of the morph they stay out.
++        if (bottomBarMorph()
++                && mProgress > 0.001f
++                && mProgress / BareTabSheetSnap.HALF_RATIO < 0.2f) {
++            if (icon != null) icon.setVisibility(View.GONE);
++            if (lock != null) lock.setVisibility(View.GONE);
++        }
+     }
+ 
+     /**
+@@ -2329,8 +2432,505 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * Sizes the pill from the address bar toward 32dp as the sheet opens, and parks it. At progress
+      * 0 the real bar is untouched and the pill is gone. Side buttons fade with the shrink.
+      */
++
++    /** Bottom-bar sheet only. The top-bar sheet and the side drawer keep the anchored pill. */
++    private boolean bottomBarMorph() {
++        return isSheetChrome() && !sheetFromTop();
++    }
++
++    /** Smoothstep. Flat at both ends, so a capture slowed to 10x stays on one path. */
++    private static float morphEase(float t) {
++        if (t <= 0f) return 0f;
++        if (t >= 1f) return 1f;
++        return t * t * (3f - 2f * t);
++    }
++
++    private static float lerp(float from, float to, float t) {
++        return from + (to - from) * t;
++    }
++
++    private static @ColorInt int blendColor(@ColorInt int from, @ColorInt int to, float t) {
++        float u = 1f - t;
++        return Color.argb(
++                Math.round(Color.alpha(from) * u + Color.alpha(to) * t),
++                Math.round(Color.red(from) * u + Color.red(to) * t),
++                Math.round(Color.green(from) * u + Color.green(to) * t),
++                Math.round(Color.blue(from) * u + Color.blue(to) * t));
++    }
++
++    private float modernBarRadiusPx() {
++        if (mModernBarRadiusPx >= 0f) return mModernBarRadiusPx;
++        int id =
++                mActivity
++                        .getResources()
++                        .getIdentifier(
++                                "modern_toolbar_background_corner_radius",
++                                "dimen",
++                                mActivity.getPackageName());
++        mModernBarRadiusPx = id == 0 ? dp(16) : mActivity.getResources().getDimension(id);
++        return mModernBarRadiusPx;
++    }
++
++    /** True once the sheet window includes the bottom of the real address bar. */
++    private boolean morphHostCoversBar() {
++        FrameLayout root = mRoot;
++        View bar = mActivity.findViewById(R.id.location_bar);
++        if (root == null || bar == null || root.getHeight() <= 0 || bar.getHeight() <= 0) {
++            return false;
++        }
++        if (!root.isAttachedToWindow() || !bar.isAttachedToWindow()) return false;
++        root.getLocationOnScreen(mHostOnScreen);
++        bar.getLocationOnScreen(mBarOnScreen);
++        return mHostOnScreen[1] + root.getHeight() + 1 >= mBarOnScreen[1] + bar.getHeight();
++    }
++
++    /** Copies the real bar rect, fill and corner radius. Positions are in the host space. */
++    private void readBarChrome(@Nullable View location) {
++        FrameLayout root = mRoot;
++        mBarWidthPx = 0;
++        mBarHeightPx = 0;
++        mBarTextPadStart = dp(10);
++        mBarTextPadEnd = dp(12);
++        mBarTextColor = color(0xFFE6E1E5, 0xFF1C1B1F);
++        mBarTextSizePx =
++                TypedValue.applyDimension(
++                        TypedValue.COMPLEX_UNIT_SP,
++                        16f,
++                        mActivity.getResources().getDisplayMetrics());
++        Drawable bg = null;
++        View bgView = mActivity.findViewById(R.id.location_bar_background_view);
++        if (bgView != null && bgView.getBackground() != null && !isInside(bgView, root)) {
++            bg = bgView.getBackground();
++        } else if (location != null) {
++            bg = location.getBackground();
++        }
++        mBarFillColor = color(0xFF2B2930, 0xFFE8EAED);
++        mBarCornerRadius = modernBarRadiusPx();
++        GradientDrawable gradient = null;
++        if (bg instanceof LocationBarBackgroundDrawable drawable) {
++            gradient = drawable.getBackgroundGradient();
++        } else if (bg instanceof GradientDrawable shape) {
++            gradient = shape;
++        }
++        if (gradient != null) {
++            if (gradient.getColor() != null) {
++                mBarFillColor = gradient.getColor().getDefaultColor();
++            }
++            if (gradient.getCornerRadius() > 0f) mBarCornerRadius = gradient.getCornerRadius();
++        }
++        View url = mActivity.findViewById(R.id.url_bar);
++        TextView text = null;
++        if (url instanceof TextView urlText) {
++            text = urlText;
++        } else if (location instanceof TextView locationText) {
++            text = locationText;
++        }
++        if (text != null) {
++            mBarTextColor = text.getCurrentTextColor();
++            if (text.getTextSize() > 0f) mBarTextSizePx = text.getTextSize();
++        }
++        if (location == null
++                || root == null
++                || location.getWidth() <= 0
++                || location.getHeight() <= 0
++                || root.getWidth() <= 0
++                || isInside(location, root)
++                || !root.isAttachedToWindow()
++                || !location.isAttachedToWindow()) {
++            return;
++        }
++        location.getLocationOnScreen(mBarOnScreen);
++        root.getLocationOnScreen(mHostOnScreen);
++        mBarWidthPx = location.getWidth();
++        mBarHeightPx = location.getHeight();
++        mBarLeftPx = mBarOnScreen[0] - mHostOnScreen[0];
++        mBarTopPx = mBarOnScreen[1] - mHostOnScreen[1];
++        if (url != null && url.getWidth() > 0 && url.isAttachedToWindow()) {
++            url.getLocationOnScreen(mUrlOnScreen);
++            mBarTextPadStart = Math.max(0, mUrlOnScreen[0] - mBarOnScreen[0]);
++            mBarTextPadEnd =
++                    Math.max(
++                            0,
++                            mBarOnScreen[0]
++                                    + location.getWidth()
++                                    - (mUrlOnScreen[0] + url.getWidth()));
++        }
++    }
++
++    private CharSequence cachedBarUrl() {
++        String cached = mCachedBarUrl;
++        if (cached != null) return cached;
++        View url = mActivity.findViewById(R.id.url_bar);
++        if (url instanceof TextView urlText) {
++            CharSequence shown = urlText.getText();
++            if (shown != null && shown.length() > 0) {
++                cached = shown.toString();
++                mCachedBarUrl = cached;
++                return cached;
++            }
++        }
++        View location = mActivity.findViewById(R.id.location_bar);
++        if (location instanceof TextView locationText) {
++            CharSequence shown = locationText.getText();
++            if (shown != null && shown.length() > 0) {
++                cached = shown.toString();
++                mCachedBarUrl = cached;
++                return cached;
++            }
++        }
++        TabModel model = currentModel();
++        if (model != null) {
++            int index = model.index();
++            if (index >= 0 && index < model.getCount()) {
++                Tab tab = model.getTabAt(index);
++                if (tab != null
++                        && tab.getUrl() != null
++                        && !TextUtils.isEmpty(tab.getUrl().getSpec())) {
++                    cached = tab.getUrl().getSpec();
++                    mCachedBarUrl = cached;
++                    return cached;
++                }
++            }
++        }
++        cached = mOriginLabel;
++        mCachedBarUrl = cached;
++        return cached;
++    }
++
++    /** Width of the 32dp pill from the host, not from the full URL shown mid-morph. */
++    private int settledPillWidth() {
++        TextView origin = mPillOrigin;
++        float endSize =
++                TypedValue.applyDimension(
++                        TypedValue.COMPLEX_UNIT_SP,
++                        13f,
++                        mActivity.getResources().getDisplayMetrics());
++        int text = dp(48);
++        if (origin != null) {
++            float saved = origin.getPaint().getTextSize();
++            origin.getPaint().setTextSize(endSize);
++            text = Math.round(origin.getPaint().measureText(mOriginLabel));
++            origin.getPaint().setTextSize(saved);
++        }
++        int icons = 0;
++        if (mPillLockVisibility == View.VISIBLE) icons += dp(20);
++        if (mPillIconVisibility == View.VISIBLE) icons += dp(20);
++        int width = text + icons + dp(28);
++        int min = dp(PILL_MIN_WIDTH_DP);
++        int max = dp(PILL_MAX_WIDTH_DP);
++        if (width < min) width = min;
++        if (width > max) width = max;
++        return width;
++    }
++
++    private void applyMorphText(float shrink, float eased) {
++        TextView origin = mPillOrigin;
++        LinearLayout pill = mOriginPill;
++        if (origin == null || pill == null) return;
++        float endSize =
++                TypedValue.applyDimension(
++                        TypedValue.COMPLEX_UNIT_SP,
++                        13f,
++                        mActivity.getResources().getDisplayMetrics());
++        float size = lerp(mBarTextSizePx, endSize, eased);
++        if (Math.abs(origin.getTextSize() - size) > 0.25f) {
++            origin.setTextSize(TypedValue.COMPLEX_UNIT_PX, size);
++        }
++        boolean host = shrink >= 0.2f;
++        CharSequence want = host ? mOriginLabel : cachedBarUrl();
++        if (!TextUtils.equals(origin.getText(), want)) origin.setText(want);
++        float textAlpha = 1f;
++        if (shrink < 0.2f) {
++            if (shrink > 0.12f) textAlpha = (0.2f - shrink) / 0.08f;
++        } else if (shrink < 0.28f) {
++            textAlpha = (shrink - 0.2f) / 0.08f;
++        }
++        if (origin.getAlpha() != textAlpha) origin.setAlpha(textAlpha);
++        int endColor = color(0xFFE6E1E5, 0xFF1C1B1F);
++        origin.setTextColor(eased >= 1f ? endColor : blendColor(mBarTextColor, endColor, eased));
++        int lockVis = host ? mPillLockVisibility : View.GONE;
++        int iconVis = host ? mPillIconVisibility : View.GONE;
++        if (mPillLock != null && mPillLock.getVisibility() != lockVis) {
++            mPillLock.setVisibility(lockVis);
++        }
++        if (mPillIcon != null && mPillIcon.getVisibility() != iconVis) {
++            mPillIcon.setVisibility(iconVis);
++        }
++        int padStart = Math.round(lerp(Math.max(0, mBarTextPadStart), dp(10), eased));
++        int padEnd = Math.round(lerp(Math.max(0, mBarTextPadEnd), dp(12), eased));
++        if (pill.getPaddingStart() != padStart || pill.getPaddingEnd() != padEnd) {
++            pill.setPaddingRelative(padStart, 0, padEnd, 0);
++        }
++    }
++
++    /** Holds the handle row height while the pill is drawn outside it. */
++    private void ensurePillSlot() {
++        if (!(mHandleRow instanceof LinearLayout row)) return;
++        if (row.findViewWithTag("sheet_pill_slot") != null) return;
++        View slot = new View(mActivity);
++        slot.setTag("sheet_pill_slot");
++        slot.setVisibility(View.INVISIBLE);
++        slot.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        LinearLayout.LayoutParams params =
++                new LinearLayout.LayoutParams(dp(PILL_MIN_WIDTH_DP), dp(PILL_HEIGHT_DP));
++        params.gravity = Gravity.CENTER_HORIZONTAL;
++        row.addView(slot, 0, params);
++    }
++
++    private void removePillSlot() {
++        if (!(mHandleRow instanceof ViewGroup row)) return;
++        View slot = row.findViewWithTag("sheet_pill_slot");
++        if (slot != null) row.removeView(slot);
++    }
++
++    private void placePillOnRoot(
++            LinearLayout pill, FrameLayout root, int width, int height, float left, float top) {
++        ensurePillSlot();
++        if (pill.getParent() != root) {
++            if (pill.getParent() instanceof ViewGroup parent) parent.removeView(pill);
++            pill.setElevation(dp(24));
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                pill.setOutlineAmbientShadowColor(Color.TRANSPARENT);
++                pill.setOutlineSpotShadowColor(Color.TRANSPARENT);
++            }
++            root.setClipChildren(false);
++            root.setClipToPadding(false);
++            root.addView(
++                    pill,
++                    new FrameLayout.LayoutParams(width, height, Gravity.TOP | Gravity.START));
++        }
++        // Re-asserted on every frame: closing resets the elevation while the pill can stay on
++        // the root, and the list or actions row can be re-added after it. The travelling pill
++        // must draw above every sheet child at every progress.
++        float z = morphPillZ();
++        if (pill.getElevation() != z) pill.setElevation(z);
++        if (root.indexOfChild(pill) != root.getChildCount() - 1) pill.bringToFront();
++        FrameLayout.LayoutParams params;
++        if (pill.getLayoutParams() instanceof FrameLayout.LayoutParams existing) {
++            params = existing;
++        } else {
++            params = new FrameLayout.LayoutParams(width, height, Gravity.TOP | Gravity.START);
++            pill.setLayoutParams(params);
++        }
++        if (params.width != width
++                || params.height != height
++                || params.gravity != (Gravity.TOP | Gravity.START)
++                || params.leftMargin != 0
++                || params.topMargin != 0) {
++            params.width = width;
++            params.height = height;
++            params.gravity = Gravity.TOP | Gravity.START;
++            params.leftMargin = 0;
++            params.topMargin = 0;
++        }
++        pill.measure(
++                View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY));
++        pill.layout(0, 0, width, height);
++        pill.setTranslationX(left);
++        pill.setTranslationY(top);
++    }
++
++    /** Above the sheet panel (and its cards and actions row) while the pill travels on root. */
++    private float morphPillZ() {
++        Panel panel = mPanel;
++        float panelZ = panel != null ? panel.getElevation() + panel.getTranslationZ() : 0f;
++        return Math.max(dp(24), panelZ + dp(8));
++    }
++
++    /** Puts the pill back where it sits today: first child of the handle row, centred. */
++    private void parkPillInHandleRow(LinearLayout pill, int width, int height) {
++        removePillSlot();
++        if (!(mHandleRow instanceof LinearLayout row)) return;
++        pill.setTranslationX(0f);
++        pill.setTranslationY(0f);
++        if (pill.getElevation() != 0f) pill.setElevation(0f);
++        if (pill.getParent() != row) {
++            if (pill.getParent() instanceof ViewGroup parent) parent.removeView(pill);
++            LinearLayout.LayoutParams created = new LinearLayout.LayoutParams(width, height);
++            created.gravity = Gravity.CENTER_HORIZONTAL;
++            row.addView(pill, 0, created);
++        }
++        if (pill.getLayoutParams() instanceof LinearLayout.LayoutParams params
++                && (params.width != width
++                        || params.height != height
++                        || params.gravity != Gravity.CENTER_HORIZONTAL
++                        || params.topMargin != 0)) {
++            params.width = width;
++            params.height = height;
++            params.gravity = Gravity.CENTER_HORIZONTAL;
++            params.topMargin = 0;
++            params.leftMargin = 0;
++            params.rightMargin = 0;
++            pill.setLayoutParams(params);
++        }
++    }
++
++    private void resetMorphPillLook() {
++        TextView origin = mPillOrigin;
++        if (origin != null) {
++            origin.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
++            origin.setTextColor(color(0xFFE6E1E5, 0xFF1C1B1F));
++            origin.setAlpha(1f);
++            if (!TextUtils.equals(origin.getText(), mOriginLabel)) origin.setText(mOriginLabel);
++        }
++        if (mPillLock != null && mPillLock.getVisibility() != mPillLockVisibility) {
++            mPillLock.setVisibility(mPillLockVisibility);
++        }
++        if (mPillIcon != null && mPillIcon.getVisibility() != mPillIconVisibility) {
++            mPillIcon.setVisibility(mPillIconVisibility);
++        }
++        LinearLayout pill = mOriginPill;
++        if (pill == null) return;
++        pill.setPaddingRelative(dp(10), 0, dp(12), 0);
++        pill.setAlpha(1f);
++        pill.setTranslationX(0f);
++        pill.setTranslationY(0f);
++        if (pill.getElevation() != 0f) pill.setElevation(0f);
++        if (pill.getBackground() instanceof GradientDrawable background) {
++            background.setColor(color(0xFF2B2930, 0xFFE8EAED));
++            background.setCornerRadius(dp(PILL_HEIGHT_DP) / 2f);
++        }
++    }
++
++    private void hideAddressView(@Nullable View view) {
++        if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) return;
++        if (view.getAlpha() != 0f) view.setAlpha(0f);
++        // The pull is delivered to the toolbar containers, which stay visible. The location
++        // bar itself is hidden immediately so it cannot show under the morph.
++        if (view.getVisibility() != View.INVISIBLE) view.setVisibility(View.INVISIBLE);
++    }
++
++    private void restoreAddressView(@Nullable View view, int visibility) {
++        if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) return;
++        if (view.getAlpha() != 1f) view.setAlpha(1f);
++        if (view.getVisibility() != visibility) view.setVisibility(visibility);
++    }
++
++    /**
++     * Hides the real bar in the same frame the morph appears, and shows it again in the frame
++     * the morph leaves. Visibility is put back to whatever it was.
++     */
++    private void setAddressSurfaceHidden(boolean hidden) {
++        View location = mActivity.findViewById(R.id.location_bar);
++        View url = mActivity.findViewById(R.id.url_bar);
++        View background = mActivity.findViewById(R.id.location_bar_background_view);
++        if (hidden) {
++            if (!mAddressCaptured) {
++                mAddressCaptured = true;
++                if (location != null) mSavedLocationVis = location.getVisibility();
++                if (url != null) mSavedUrlVis = url.getVisibility();
++                if (background != null) mSavedBgVis = background.getVisibility();
++            }
++            hideAddressView(location);
++            hideAddressView(url);
++            hideAddressView(background);
++            return;
++        }
++        if (!mAddressCaptured) return;
++        restoreAddressView(location, mSavedLocationVis);
++        restoreAddressView(url, mSavedUrlVis);
++        restoreAddressView(background, mSavedBgVis);
++        mAddressCaptured = false;
++    }
++
++    /**
++     * One object, from the location bar rect to the 32dp pill on the sheet top. The real bar is
++     * hidden while this is up. At the half detent the pill is parked in the handle row.
++     */
++    private void layoutBottomBarMorph() {
++        LinearLayout pill = mOriginPill;
++        FrameLayout root = mRoot;
++        if (pill == null || root == null) return;
++        applySheetInsets();
++        boolean show = mProgress > 0.001f && root.getVisibility() == View.VISIBLE;
++        if (!show) {
++            if (mMorphActive) {
++                mMorphActive = false;
++                resetMorphPillLook();
++            }
++            removePillSlot();
++            if (pill.getVisibility() != View.GONE) pill.setVisibility(View.GONE);
++            if (pill.getAlpha() != 1f) pill.setAlpha(1f);
++            pill.setTranslationX(0f);
++            pill.setTranslationY(0f);
++            fadeToolbarChrome(0f);
++            setAddressSurfaceHidden(false);
++            mCachedBarUrl = null;
++            return;
++        }
++        mMorphActive = true;
++        float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++        float eased = morphEase(shrink);
++        View location = mActivity.findViewById(R.id.location_bar);
++        readBarChrome(location);
++        int endW = settledPillWidth();
++        int endH = dp(PILL_HEIGHT_DP);
++        int startW =
++                mBarWidthPx > 0 ? mBarWidthPx : (root.getWidth() > 0 ? root.getWidth() : endW);
++        int startH = mBarHeightPx > 0 ? mBarHeightPx : dp(56);
++        int width = Math.max(1, Math.round(lerp(startW, endW, eased)));
++        int height = Math.max(1, Math.round(lerp(startH, endH, eased)));
++        float radius = eased >= 1f ? height / 2f : lerp(mBarCornerRadius, height / 2f, eased);
++        int endFill = color(0xFF2B2930, 0xFFE8EAED);
++        int fill = eased >= 1f ? endFill : blendColor(mBarFillColor, endFill, eased);
++        if (pill.getBackground() instanceof GradientDrawable background) {
++            background.setCornerRadius(radius);
++            background.setColor(fill);
++        }
++        applyMorphText(shrink, eased);
++        // Below half the list can overlap the handle row, so the pill rides the sheet top on
++        // the root, above the cards, and is parked in the handle row only from half up.
++        if (eased >= 1f && mProgress >= BareTabSheetSnap.HALF_RATIO - 0.001f) {
++            parkPillInHandleRow(pill, width, height);
++        } else {
++            float startLeft = mBarLeftPx;
++            float startTop = mBarTopPx;
++            if (mBarWidthPx <= 0) {
++                startLeft = 0f;
++                startTop = Math.max(0, root.getHeight() - mSheetBottomLift - startH);
++            }
++            int rootW = Math.max(0, root.getWidth());
++            int rootH = Math.max(0, root.getHeight());
++            int panelW = mPanelWidth > 0 ? mPanelWidth : rootW;
++            if (rootW > 0 && panelW > rootW) panelW = rootW;
++            int panelLeft = rootW > 0 ? Math.max(0, (rootW - panelW) / 2) : 0;
++            int panelH = Math.max(1, Math.round(mProgress * sheetRangeHeight()));
++            int panelTop = rootH - mSheetBottomLift - panelH;
++            int pad = mHandleRow != null ? mHandleRow.getPaddingTop() : dp(10);
++            float left = lerp(startLeft + startW / 2f, panelLeft + panelW / 2f, eased) - width / 2f;
++            float top =
++                    lerp(startTop + startH / 2f, panelTop + pad + endH / 2f, eased) - height / 2f;
++            // Never trail below the sheet's top edge: once the edge has passed the bar the pill
++            // rides it, above the first cards, while its size keeps morphing.
++            top = Math.min(top, panelTop + pad);
++            placePillOnRoot(pill, root, width, height, left, top);
++        }
++        fadeToolbarChrome(shrink);
++        setAddressSurfaceHidden(true);
++        if (pill.getAlpha() != 1f) pill.setAlpha(1f);
++        if (pill.getVisibility() != View.VISIBLE) pill.setVisibility(View.VISIBLE);
++    }
++
+     private void layoutOriginPill() {
+         sSuppressAddressBarTabSwipe = isSheetChrome() && (mOpen || mProgress > 0.001f);
++        if (mOriginPill == null) return;
++        if (bottomBarMorph()) {
++            layoutBottomBarMorph();
++            return;
++        }
++        if (mMorphActive || mAddressCaptured) {
++            mMorphActive = false;
++            resetMorphPillLook();
++            removePillSlot();
++            setAddressSurfaceHidden(false);
++            mCachedBarUrl = null;
++        }
++        layoutAnchoredOriginPill();
++    }
++
++    /** Top address bar, and any path that is not the bottom-bar morph. */
++    private void layoutAnchoredOriginPill() {
+         LinearLayout pill = mOriginPill;
+         FrameLayout root = mRoot;
+         if (pill == null) return;
+@@ -2394,7 +2994,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             }
+         }
+         fadeToolbarChrome(shrink);
+-        // Cross-fade: the pill comes in exactly as the bar goes, so the two never show at once.
++        // Top address bar only: cross-fade so the bar text never sits under the pill.
+         float pillAlpha = Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
+         if (pill.getAlpha() != pillAlpha) pill.setAlpha(pillAlpha);
+         applySheetInsets();
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index fb3f81411f..3de690f9e6 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -836,18 +836,111 @@ public class BareVerticalTabsDrawerUnitTest {
+     }
+ 
+     @Test
+-    public void testThePillFadesInAsTheAddressBarFadesOutDuringAPull() {
++    public void testTheTravellingPillDrawsAboveTheSheetBelowHalfAndAfterAClose() {
+         setAddressBarOnTop(false);
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+         int range = beginPullAndLayOut();
+         mDrawer.finishAnimationForTesting();
++        // One pull and close first: closing used to drop the pill's elevation on the root.
+         mDrawer.updateToolbarPull(range * 0.05f);
+-        float early = findTag("sheet_origin_pill").getAlpha();
+-        assertTrue("pill alpha " + early, early > 0f && early < 0.99f);
+-        mDrawer.updateToolbarPull(range * 2f);
+-        assertEquals(1f, findTag("sheet_origin_pill").getAlpha(), 0.001f);
++        mDrawer.updateToolbarPull(-range);
+         mDrawer.endToolbarPull(0f);
+-        assertTrue(mDrawer.isOpen());
++        mDrawer.finishAnimationForTesting();
++        range = beginPullAndLayOut();
++        mDrawer.finishAnimationForTesting();
++        float half = BareTabSheetSnap.HALF_RATIO;
++        for (float at : new float[] {half * 0.2f, half * 0.6f, half * 0.95f}) {
++            mDrawer.updateToolbarPull(range * at);
++            View pill = originPill();
++            assertEquals(View.VISIBLE, pill.getVisibility());
++            ViewGroup host = (ViewGroup) pill.getParent();
++            assertTrue(
++                    "pill must not be parked in the handle row below half at " + at,
++                    !"sheet_handle_row".equals(host.getTag()) && host.findViewWithTag("sheet_actions") != null);
++            assertEquals("pill is the last child at " + at, pill, host.getChildAt(host.getChildCount() - 1));
++            for (int i = 0; i < host.getChildCount(); i++) {
++                View child = host.getChildAt(i);
++                if (child == pill) continue;
++                assertTrue(
++                        "pill z " + pill.getZ() + " vs sibling z " + child.getZ() + " at " + at,
++                        pill.getZ() > child.getZ());
++            }
++            // It rides the sheet's top edge and does not trail below it over the cards.
++            View actions = findTag("sheet_actions");
++            View panel = (View) actions.getParent();
++            int[] pillAt = new int[2];
++            int[] panelAt = new int[2];
++            pill.getLocationOnScreen(pillAt);
++            panel.getLocationOnScreen(panelAt);
++            int panelTop = panelAt[1];
++            assertTrue(
++                    "pill top " + pillAt[1] + " vs panel top " + panelTop + " at " + at,
++                    pillAt[1] <= panelTop + px(16));
++        }
++    }
++
++    @Test
++    public void testTheMorphStartsOnTheLocationBarWithoutACrossFade() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int barW = px(280);
++        int barH = px(48);
++        GradientDrawable barBackground = new GradientDrawable();
++        barBackground.setColor(0xFF123456);
++        barBackground.setCornerRadius(px(12));
++        android.widget.TextView bar = new android.widget.TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setBackground(barBackground);
++        bar.setText("https://example.com/path");
++        bar.setTextColor(0xFF111111);
++        bar.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16);
++        bar.setAlpha(1f);
++        FrameLayout.LayoutParams barParams =
++                new FrameLayout.LayoutParams(barW, barH, Gravity.BOTTOM);
++        barParams.leftMargin = px(40);
++        barParams.bottomMargin = px(64);
++        content().addView(bar, barParams);
++
++        mDrawer.beginToolbarPull();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        content().measure(
++                View.MeasureSpec.makeMeasureSpec(px(400), View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(px(800), View.MeasureSpec.EXACTLY));
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        int range = root.getHeight() - sheetGap();
++        // Small enough that the eased step is still on the bar's pixels.
++        mDrawer.updateToolbarPull(range * 0.004f);
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        mDrawer.updateToolbarPull(range * 0.004f);
++
++        View pill = originPill();
++        assertEquals(1f, pill.getAlpha(), 0.001f);
++        assertEquals(View.VISIBLE, pill.getVisibility());
++        assertEquals(1, countTag("sheet_origin_pill"));
++        int[] pillAt = new int[2];
++        int[] barAt = new int[2];
++        pill.getLocationOnScreen(pillAt);
++        bar.getLocationOnScreen(barAt);
++        assertTrue("left " + pillAt[0] + " vs " + barAt[0], Math.abs(pillAt[0] - barAt[0]) <= 1);
++        assertTrue("top " + pillAt[1] + " vs " + barAt[1], Math.abs(pillAt[1] - barAt[1]) <= 1);
++        assertTrue(Math.abs(pill.getWidth() - bar.getWidth()) <= 1);
++        assertTrue(Math.abs(pill.getHeight() - bar.getHeight()) <= 1);
++        assertEquals(0f, bar.getAlpha(), 0.001f);
++        GradientDrawable drawn = (GradientDrawable) pill.getBackground();
++        assertEquals(0xFF123456, drawn.getColor().getDefaultColor());
++        assertEquals(px(12), drawn.getCornerRadius(), 1f);
++        // The real bar is hidden and there is still only the one pill.
++        assertEquals(View.INVISIBLE, bar.getVisibility());
++
++        mDrawer.updateToolbarPull(-range);
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.GONE, pill.getVisibility());
++        assertEquals(1f, bar.getAlpha(), 0.001f);
++        assertEquals(View.VISIBLE, bar.getVisibility());
+     }
+ 
+     @Test
+@@ -1244,6 +1337,20 @@ public class BareVerticalTabsDrawerUnitTest {
+         return findTag("sheet_origin_pill");
+     }
+ 
++    private int countTag(String tag) {
++        return countTag(content(), tag);
++    }
++
++    private int countTag(View view, String tag) {
++        int count = tag.equals(view.getTag()) ? 1 : 0;
++        if (view instanceof ViewGroup group) {
++            for (int i = 0; i < group.getChildCount(); i++) {
++                count += countTag(group.getChildAt(i), tag);
++            }
++        }
++        return count;
++    }
++
+     @Test
+     public void testSearchMatchesEveryWordInTheTitleOrAddressIgnoringCase() {
+         String url = "https://en.wikipedia.org/wiki/Tide";
+@@ -1279,6 +1386,23 @@ public class BareVerticalTabsDrawerUnitTest {
+         // The real bar is hidden so its URL is not left under the pill.
+         assertEquals(0f, toolbar.getAlpha(), 0.001f);
+         assertTrue(mDrawer.suppressesAddressBarTabSwipe());
++        assertEquals(1, countTag("sheet_origin_pill"));
++        assertEquals(1f, pill.getAlpha(), 0.001f);
++        int[] pillAt = new int[2];
++        int[] panelAt = new int[2];
++        pill.getLocationOnScreen(pillAt);
++        panel.getLocationOnScreen(panelAt);
++        assertTrue(
++                Math.abs(
++                                (pillAt[0] + pill.getWidth() / 2f)
++                                        - (panelAt[0] + panel.getWidth() / 2f))
++                        <= 1f);
++        assertTrue(
++                Math.abs(
++                                pillAt[1]
++                                        - (panelAt[1]
++                                                + findTag("sheet_handle_row").getPaddingTop()))
++                        <= 1f);
+ 
+         // Part way back down, the pill is still shrinking toward the bar.
+         View root = (View) panel.getParent();
+-- 
+2.34.1
+
