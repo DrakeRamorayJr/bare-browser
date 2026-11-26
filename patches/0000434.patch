@@ -1,0 +1,1117 @@
+From ff2a1bf0faf49fdcbe9868dd90f3fe0e4010c869 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 03:49:51 +0000
+Subject: [PATCH] Give the tab sheet predictive back, a width cap, TalkBack and
+ glass.
+
+Back closes the sheet. It is modal, so like Material's modal bottom
+sheets it goes away rather than stepping down to half. While the back
+gesture is held the sheet shrinks toward its toolbar, and it springs
+back if the gesture is cancelled. The page never sees that back.
+
+From 600dp wide the sheet is at most 640dp and centered. A window under
+440dp tall, such as a phone on its side, has no room for a half stop, so
+the sheet opens full there, and one at half goes full when turned.
+
+The handle row is a 48dp target that TalkBack reaches as the drag
+handle, with its state and expand, collapse and dismiss actions, and
+settling at a stop is announced. The scrim and the overlay behind the
+sheet are skipped by TalkBack.
+
+Frosted glass now applies to the sheet. Its blur window ends at the
+toolbars, so they stay sharp, untinted and tappable. Focusing a text
+field outside the sheet, such as the address bar, closes it, so the
+keyboard and suggestions are not left under it.
+
+A rebind the tab list ran when its animations ended could land inside a
+layout pass and crash; it now runs after the pass.
+
+The side drawer is unchanged.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ .../values/channel_constants.xml              |   5 +
+ .../browser/bare/BareVerticalTabsDrawer.java  | 430 ++++++++++++++++--
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 334 ++++++++++++++
+ 3 files changed, 733 insertions(+), 36 deletions(-)
+
+diff --git a/chrome/android/java/res_chromium_base/values/channel_constants.xml b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+index 351c13cd44..733aead7d9 100644
+--- a/chrome/android/java/res_chromium_base/values/channel_constants.xml
++++ b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+@@ -222,6 +222,11 @@ found in the LICENSE file.
+     <string name="bare_tabs_style_title">Tabs style</string>
+     <string name="bare_tabs_style_drawer">Side drawer</string>
+     <string name="bare_tabs_style_sheet">Sheet</string>
++    <string name="bare_vtabs_sheet_handle">Tabs sheet drag handle</string>
++    <string name="bare_vtabs_sheet_expanded">Expanded</string>
++    <string name="bare_vtabs_sheet_half_expanded">Half expanded</string>
++    <string name="bare_vtabs_sheet_expanded_announcement">Tabs sheet expanded</string>
++    <string name="bare_vtabs_sheet_half_announcement">Tabs sheet half expanded</string>
+     <plurals name="bare_vtabs_sheet_count">
+         <item quantity="one">%d tab</item>
+         <item quantity="other">%d tabs</item>
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index e8fe9a8c98..8b5e92b0d3 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -33,6 +33,7 @@ import android.view.View;
+ import android.view.ViewConfiguration;
+ import android.view.ViewGroup;
+ import android.view.ViewOutlineProvider;
++import android.view.ViewTreeObserver;
+ import android.view.Window;
+ import android.view.WindowManager;
+ import android.view.WindowInsets;
+@@ -47,6 +48,7 @@ import android.graphics.Outline;
+ import android.util.Size;
+ import android.widget.TextView;
+ 
++import androidx.activity.BackEventCompat;
+ import androidx.activity.ComponentActivity;
+ import androidx.activity.OnBackPressedCallback;
+ import androidx.annotation.ColorInt;
+@@ -55,6 +57,7 @@ import androidx.core.view.NestedScrollingParent3;
+ import androidx.core.view.NestedScrollingParentHelper;
+ import androidx.core.view.ViewCompat;
+ import androidx.core.view.WindowInsetsCompat;
++import androidx.core.view.accessibility.AccessibilityNodeInfoCompat.AccessibilityActionCompat;
+ import androidx.recyclerview.widget.DefaultItemAnimator;
+ import androidx.recyclerview.widget.DiffUtil;
+ import androidx.recyclerview.widget.GridLayoutManager;
+@@ -101,8 +104,9 @@ import java.util.function.Supplier;
+  * over-pull at the list's end next to the handle) moves it between hidden, half and full. With
+  * the address bar at the bottom the sheet rises from above the toolbar; with it on top the sheet
+  * drops down from below the address bar, mirrored. A vertical drag on the address bar, away from
+- * it, also pulls the sheet out with the finger (see {@link BareTabSheetToolbarSwipe}). It is a
+- * view over
++ * it, also pulls the sheet out with the finger (see {@link BareTabSheetToolbarSwipe}). Back closes
++ * the sheet, shrinking it with the predictive back gesture. On a wide screen the sheet is capped
++ * in width and centered. It is a view over
+  * the browser's own tab model: selecting, closing, adding and closing all go through the same
+  * operations the tab overview uses. It keeps no tabs of its own.
+  */
+@@ -118,6 +122,18 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final float PAGE_SHIFT_DP = 30f;
+     private static final float GLASS_BLUR_DP = 22f;
+     private static final float GLASS_SCRIM = 0.45f;
++    // From this window width on, the sheet stops filling the width and is centered (Material's
++    // bottom sheet guidance: at most 640dp wide).
++    private static final float SHEET_WIDE_DP = 600f;
++    private static final float SHEET_MAX_WIDTH_DP = 640f;
++    // How far the predictive back gesture shrinks the sheet, as Material's bottom sheets do.
++    private static final float BACK_SHRINK_X_DP = 48f;
++    private static final float BACK_SHRINK_Y_DP = 24f;
++    private static final long BACK_CANCEL_MS = 150;
++    private static final float HANDLE_TOUCH_DP = 48f;
++    // Below this window height, such as a phone on its side, half a sheet leaves no room for a
++    // single card, so the sheet has no half stop (Material's skip-collapsed).
++    private static final int SHORT_WINDOW_DP = 440;
+     // Swiping a card away from the drawer's edge closes its tab.
+     private static final float SWIPE_CLOSE_FRACTION = 0.4f;
+     private static final float SWIPE_CLOSE_MIN_DP = 56f;
+@@ -153,6 +169,22 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private @Nullable TabAdapter mAdapter;
+     private @Nullable OnBackPressedCallback mBackCallback;
+     private @Nullable ValueAnimator mAnimator;
++    private @Nullable ValueAnimator mBackAnimator;
++    // How far the predictive back gesture has shrunk the sheet: 0 is not at all.
++    private float mBackProgress;
++    // The overlay's distance from the top and bottom of the content, which keeps the toolbars
++    // clear. Set as margins in the activity, or as the glass window's bounds.
++    private int mOverlayTop;
++    private int mOverlayBottom;
++    // The last stop the sheet settled at, for TalkBack.
++    private BareTabSheetSnap.@Nullable State mSettledState;
++    // Closes the sheet when a text field outside it, such as the address bar, takes focus: the
++    // keyboard and the address bar's suggestions would otherwise open under the sheet.
++    private final ViewTreeObserver.OnGlobalFocusChangeListener mFocusListener =
++            (oldFocus, newFocus) -> onFocusMoved(newFocus);
++    private @Nullable ViewTreeObserver mFocusObserver;
++    // Lets tests stand in for a device that can blur behind windows.
++    private static @Nullable Boolean sGlassForTesting;
+     private @Nullable TabModelSelector mObservedSelector;
+     private boolean mOpen;
+     private float mProgress;
+@@ -273,10 +305,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     void finishAnimationForTesting() {
++        ValueAnimator back = mBackAnimator;
++        if (back != null) back.end();
+         ValueAnimator animator = mAnimator;
+         if (animator != null) animator.end();
+     }
+ 
++    static void setGlassForTesting(@Nullable Boolean glass) {
++        sGlassForTesting = glass;
++    }
++
++    @Nullable Dialog glassWindowForTesting() {
++        return mGlassWindow;
++    }
++
+     void finishSheetDragForTesting(float velocityY) {
+         finishSheetDrag(velocityY);
+     }
+@@ -299,7 +341,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // A drag cut off when the drawer last went away must not hold back this fill.
+         cancelReorder();
+         mRefreshPending = false;
++        setBackProgress(0f);
+         mOpen = true;
++        watchFocus(true);
+         mObservedSelector = selector;
+         selector.getCurrentTabModelSupplier().addSyncObserverAndCallIfNonNull(mModelSwitched);
+         selector.addObserverToAllModels(mModelObserver);
+@@ -334,11 +378,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 });
+         if (mBackCallback != null) mBackCallback.setEnabled(true);
+         if (animate) {
+-            animateTo(
+-                    isSheetChrome()
+-                            ? BareTabSheetSnap.progressOf(BareTabSheetSnap.State.HALF)
+-                            : 1f,
+-                    null);
++            if (isSheetChrome()) {
++                settleSheet(BareTabSheetSnap.State.HALF, /* announce= */ false);
++            } else {
++                animateTo(1f, null);
++            }
+         }
+         Panel panel = mPanel;
+         if (panel != null) {
+@@ -350,6 +394,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     public void close() {
+         if (!mOpen) return;
+         mOpen = false;
++        watchFocus(false);
+         if (mBackCallback != null) mBackCallback.setEnabled(false);
+         animateTo(
+                 0f,
+@@ -357,6 +402,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     FrameLayout root = mRoot;
+                     if (root != null && !mOpen) foldHaptic(root);
+                     if (root != null && !mOpen) root.setVisibility(View.GONE);
++                    if (!mOpen) {
++                        setBackProgress(0f);
++                        mSettledState = null;
++                        updateHandleAccessibility();
++                    }
+                     Dialog glass = mGlassWindow;
+                     if (glass != null && !mOpen && glass.isShowing()) glass.dismiss();
+                     releaseObservers();
+@@ -366,6 +416,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** Releases everything. Called when the activity goes away. */
+     public void destroy() {
+         if (mAnimator != null) mAnimator.cancel();
++        if (mBackAnimator != null) mBackAnimator.cancel();
++        watchFocus(false);
+         releaseObservers();
+         if (mBackCallback != null) mBackCallback.remove();
+         mBackCallback = null;
+@@ -382,6 +434,30 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mRoot = null;
+     }
+ 
++    private void watchFocus(boolean watch) {
++        ViewTreeObserver current = mFocusObserver;
++        if (current != null && current.isAlive()) {
++            current.removeOnGlobalFocusChangeListener(mFocusListener);
++        }
++        mFocusObserver = null;
++        if (!watch) return;
++        ViewTreeObserver observer = mActivity.getWindow().getDecorView().getViewTreeObserver();
++        observer.addOnGlobalFocusChangeListener(mFocusListener);
++        mFocusObserver = observer;
++    }
++
++    private void onFocusMoved(@Nullable View focused) {
++        if (!mOpen || !isSheetChrome() || focused == null || !focused.onCheckIsTextEditor()) {
++            return;
++        }
++        FrameLayout root = mRoot;
++        for (View view = focused; view != null; ) {
++            if (view == root) return;
++            view = view.getParent() instanceof View parent ? parent : null;
++        }
++        close();
++    }
++
+     private void releaseObservers() {
+         TabModelSelector selector = mObservedSelector;
+         if (selector != null) {
+@@ -423,6 +499,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         super.onSizeChanged(w, h, oldw, oldh);
+                         applySheetInsets();
+                         sizePanel(w);
++                        // Turned on its side at half, the sheet goes full: the window is now
++                        // too short for a half stop. Done after this layout pass.
++                        if (mOpen
++                                && mSettledState == BareTabSheetSnap.State.HALF
++                                && skipsHalfStop()) {
++                            post(
++                                    () -> {
++                                        if (mOpen
++                                                && mSettledState
++                                                        == BareTabSheetSnap.State.HALF) {
++                                            settleSheet(BareTabSheetSnap.State.FULL, true);
++                                        }
++                                    });
++                        }
+                     }
+                 };
+         root.setVisibility(View.GONE);
+@@ -451,6 +541,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         handleRow.setOrientation(LinearLayout.VERTICAL);
+         handleRow.setGravity(Gravity.CENTER_HORIZONTAL);
+         handleRow.setTag("sheet_handle_row");
++        // The handle row is what TalkBack and a keyboard reach: it says what it is, where the
++        // sheet is, and offers expand, collapse and dismiss. It is at least a full touch target.
++        handleRow.setMinimumHeight(dp(HANDLE_TOUCH_DP));
++        handleRow.setFocusable(true);
++        handleRow.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
++        handleRow.setContentDescription(mActivity.getString(R.string.bare_vtabs_sheet_handle));
++        ViewCompat.setScreenReaderFocusable(handleRow, true);
+         View handle = new View(mActivity);
+         handle.setTag("sheet_handle");
+         handle.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+@@ -699,6 +796,21 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (mActivity instanceof ComponentActivity componentActivity) {
+             mBackCallback =
+                     new OnBackPressedCallback(false) {
++                        @Override
++                        public void handleOnBackStarted(BackEventCompat backEvent) {
++                            startBackPreview();
++                        }
++
++                        @Override
++                        public void handleOnBackProgressed(BackEventCompat backEvent) {
++                            previewBack(backEvent.getProgress());
++                        }
++
++                        @Override
++                        public void handleOnBackCancelled() {
++                            cancelBackPreview();
++                        }
++
+                         @Override
+                         public void handleOnBackPressed() {
+                             close();
+@@ -903,11 +1015,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
+         if (isSheetChrome()) {
+             int width = rootWidth > 0 ? rootWidth : params.width;
+-            mPanelWidth = width;
++            int sheetWidth = sheetWidthFor(width);
++            mPanelWidth = sheetWidth == ViewGroup.LayoutParams.MATCH_PARENT ? width : sheetWidth;
+             // Height and gravity are owned by layoutSheetPanel, so a resize does not
+             // stretch the sheet back to the top mid-drag.
+-            if (params.width != ViewGroup.LayoutParams.MATCH_PARENT) {
+-                params.width = ViewGroup.LayoutParams.MATCH_PARENT;
++            if (params.width != sheetWidth) {
++                params.width = sheetWidth;
+                 panel.setLayoutParams(params);
+             }
+             applySheetBackground();
+@@ -925,6 +1038,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         applyProgress(mProgress);
+     }
+ 
++    /**
++     * The sheet's width in a window {@code rootWidth} pixels wide: the full width on a phone, and
++     * at most {@link #SHEET_MAX_WIDTH_DP} on a window at least {@link #SHEET_WIDE_DP} wide, such
++     * as a tablet or a phone on its side.
++     */
++    private int sheetWidthFor(int rootWidth) {
++        float density = mActivity.getResources().getDisplayMetrics().density;
++        if (rootWidth <= 0 || rootWidth / density < SHEET_WIDE_DP) {
++            return ViewGroup.LayoutParams.MATCH_PARENT;
++        }
++        return Math.min(rootWidth, dp(SHEET_MAX_WIDTH_DP));
++    }
++
+     /** Whether the current style is the sheet. Read at layout time so a setting change applies. */
+     private boolean isSheetChrome() {
+         return BareTabsStyle.isSheet();
+@@ -1017,6 +1143,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         applyChromeInsets();
+         updateSheetButtons();
+         bindSheetHandle();
++        // The sheet's scrim is a full-screen tap target with nothing to say; TalkBack dismisses
++        // the sheet from the handle instead. The drawer's is left as it was.
++        // The overlay itself only swallows touches, so it is skipped as well; its sheet is not.
++        int importance =
++                sheet ? View.IMPORTANT_FOR_ACCESSIBILITY_NO : View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;
++        View scrim = mScrim;
++        if (scrim != null) scrim.setImportantForAccessibility(importance);
++        if (root != null) root.setImportantForAccessibility(importance);
++        updateHandleAccessibility();
+     }
+ 
+     /** Insets the overlay so it does not cover the real toolbar, which stays tappable. */
+@@ -1036,6 +1171,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             if (top <= 0) top = mTopInset;
+             if (bottom <= 0 && sheetFromTop()) bottom = mBottomInset;
+         }
++        mOverlayTop = top;
++        mOverlayBottom = bottom;
++        // In glass, the sheet's window itself ends at the toolbars, so the system's blur and the
++        // scrim stop there too, and the toolbars stay sharp, untinted and tappable.
++        if (mGlass && isSheetChrome()) {
++            placeSheetGlassWindow(top, bottom);
++            top = 0;
++            bottom = 0;
++        }
+         if (params.topMargin == top && params.bottomMargin == bottom) return;
+         params.topMargin = top;
+         params.bottomMargin = bottom;
+@@ -1087,13 +1231,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Status-bar inset only when the sheet reaches the top of the window. */
+     private int sheetTopClearance() {
+-        FrameLayout root = mRoot;
+-        if (root != null
+-                && root.getLayoutParams() instanceof FrameLayout.LayoutParams params
+-                && params.topMargin > 0) {
+-            return 0;
+-        }
+-        return mTopInset;
++        return mOverlayTop > 0 ? 0 : mTopInset;
+     }
+ 
+     private void applySheetBackground() {
+@@ -1108,7 +1246,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         int radius = dp(20);
+         GradientDrawable background = new GradientDrawable();
+-        background.setColor(color(0xFF1C1A20, 0xFFF1EDF6));
++        background.setColor(
++                mGlass ? color(0xA61C1A20, 0xB8F1EDF6) : color(0xFF1C1A20, 0xFFF1EDF6));
+         // The corners on the free edge are round: the top when rising, the bottom when dropping.
+         background.setCornerRadii(
+                 sheetFromTop()
+@@ -1207,9 +1346,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * Android 12 or newer, and the system allows blurring what is behind a window.
+      */
+     private boolean glassWanted() {
+-        // The glass window is a full-screen dialog and would cover the toolbar the sheet must
+-        // leave tappable, so the sheet stays in the activity without blur for now.
+-        if (isSheetChrome()) return false;
++        Boolean forTesting = sGlassForTesting;
++        if (forTesting != null) return forTesting;
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
+         if (!ChromeSharedPreferences.getInstance()
+                 .readBoolean(ChromePreferenceKeys.BARE_GLASS, true)) {
+@@ -1230,7 +1368,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     glass ? color(0xA61B1B1E, 0xB8F4F4F7) : color(0xFF1B1B1E, 0xFFF4F4F7));
+         }
+         if (glass == mGlass && (glass ? mGlassWindow != null : root.getParent() != null)) {
+-            if (glass && mGlassWindow != null && !mGlassWindow.isShowing()) mGlassWindow.show();
++            if (glass && mGlassWindow != null) {
++                shapeGlassWindow();
++                if (!mGlassWindow.isShowing()) mGlassWindow.show();
++            }
+             return;
+         }
+         if (root.getParent() instanceof ViewGroup parent) parent.removeView(root);
+@@ -1279,10 +1420,63 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             ViewGroup.LayoutParams.MATCH_PARENT,
+                             ViewGroup.LayoutParams.MATCH_PARENT));
+         }
++        shapeGlassWindow();
+         setBlur(mProgress);
+         window.show();
+     }
+ 
++    /**
++     * The drawer's glass window covers the screen. The sheet's ends at the toolbars (see
++     * applySheetInsets), so the bars are neither blurred nor dimmed and their taps reach the
++     * activity: the window is not focusable, which also lets touches outside it through.
++     */
++    private void shapeGlassWindow() {
++        Dialog window = mGlassWindow;
++        Window w = window != null ? window.getWindow() : null;
++        if (w == null) return;
++        if (isSheetChrome()) {
++            applySheetInsets();
++            return;
++        }
++        WindowManager.LayoutParams attributes = w.getAttributes();
++        if (attributes.y == 0
++                && attributes.height == ViewGroup.LayoutParams.MATCH_PARENT
++                && attributes.gravity == Gravity.NO_GRAVITY) {
++            return;
++        }
++        attributes.y = 0;
++        attributes.gravity = Gravity.NO_GRAVITY;
++        attributes.width = ViewGroup.LayoutParams.MATCH_PARENT;
++        attributes.height = ViewGroup.LayoutParams.MATCH_PARENT;
++        w.setAttributes(attributes);
++    }
++
++    /** Bounds the sheet's glass window to the content between the toolbars. */
++    private void placeSheetGlassWindow(int top, int bottom) {
++        Dialog window = mGlassWindow;
++        Window w = window != null ? window.getWindow() : null;
++        View content = mActivity.findViewById(android.R.id.content);
++        if (w == null || content == null) return;
++        int[] location = new int[2];
++        content.getLocationOnScreen(location);
++        int contentHeight =
++                content.getHeight() > 0
++                        ? content.getHeight()
++                        : mActivity.getResources().getDisplayMetrics().heightPixels;
++        int y = location[1] + top;
++        int height = Math.max(1, contentHeight - top - bottom);
++        WindowManager.LayoutParams attributes = w.getAttributes();
++        int gravity = Gravity.TOP | Gravity.FILL_HORIZONTAL;
++        if (attributes.y == y && attributes.height == height && attributes.gravity == gravity) {
++            return;
++        }
++        attributes.gravity = gravity;
++        attributes.y = y;
++        attributes.width = ViewGroup.LayoutParams.MATCH_PARENT;
++        attributes.height = height;
++        w.setAttributes(attributes);
++    }
++
+     /** How much of the blur is applied: 0 is none and 1 is full. */
+     private void setBlur(float progress) {
+         Dialog window = mGlassWindow;
+@@ -1341,7 +1535,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 // Dim the page from the first peek, and keep it dimmed from half onward.
+                 float half = BareTabSheetSnap.HALF_RATIO;
+                 float dim = half <= 0f ? mProgress : Math.min(1f, mProgress / half);
+-                scrim.setAlpha(dim);
++                // In glass the page is blurred as well as dimmed, so it is dimmed less.
++                float scrimAlpha = dim * (mGlass ? GLASS_SCRIM : 1f);
++                scrim.setAlpha(scrimAlpha);
++                setBlur(dim);
+                 // Rising from the bottom, the status bar is above the dimmed page, so it is
+                 // dimmed with it. Dropping from the top, it is above the address bar, which
+                 // stays bright, so it keeps the address bar's color.
+@@ -1349,7 +1546,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         sheetFromTop()
+                                 ? Color.TRANSPARENT
+                                 : Color.argb(
+-                                        Math.round(Color.alpha(SCRIM_COLOR) * dim), 0, 0, 0));
++                                        Math.round(Color.alpha(SCRIM_COLOR) * scrimAlpha),
++                                        0,
++                                        0,
++                                        0));
+             } else {
+                 scrim.setAlpha(mProgress * (mGlass ? GLASS_SCRIM : 1f));
+                 setStatusBarScrim(Color.TRANSPARENT);
+@@ -1359,7 +1559,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
+         if (isSheetChrome()) {
+-            setBlur(0f);
++            if (scrim == null) setBlur(0f);
+             if (panel != null) {
+                 panel.setTranslationX(0f);
+                 panel.setTranslationY(0f);
+@@ -1430,11 +1630,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // Pulled from the toolbar, the sheet moves before the overlay has been laid out the
+         // first time. Its margins are already set, so its height can be worked out.
+         View content = mActivity.findViewById(android.R.id.content);
+-        if (root != null
+-                && content != null
+-                && content.getHeight() > 0
+-                && root.getLayoutParams() instanceof FrameLayout.LayoutParams params) {
+-            int height = content.getHeight() - params.topMargin - params.bottomMargin;
++        if (root != null && content != null && content.getHeight() > 0) {
++            int height = content.getHeight() - mOverlayTop - mOverlayBottom;
+             return Math.max(1, height - dp(SHEET_FULL_GAP_DP));
+         }
+         return 1;
+@@ -1449,13 +1646,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      */
+     private void layoutSheetPanel(Panel panel) {
+         int height = Math.max(1, Math.round(mProgress * sheetRangeHeight()));
+-        int gravity = sheetFromTop() ? Gravity.TOP : Gravity.BOTTOM;
++        int gravity = (sheetFromTop() ? Gravity.TOP : Gravity.BOTTOM) | Gravity.CENTER_HORIZONTAL;
++        FrameLayout root = mRoot;
++        int width =
++                sheetWidthFor(
++                        root != null && root.getWidth() > 0
++                                ? root.getWidth()
++                                : mActivity.getResources().getDisplayMetrics().widthPixels);
+         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
+-        if (params.width != ViewGroup.LayoutParams.MATCH_PARENT
++        if (params.width != width
+                 || params.height != height
+                 || params.gravity != gravity
+                 || params.bottomMargin != 0) {
+-            params.width = ViewGroup.LayoutParams.MATCH_PARENT;
++            params.width = width;
+             params.height = height;
+             params.gravity = gravity;
+             params.bottomMargin = 0;
+@@ -1552,8 +1755,163 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (next == BareTabSheetSnap.State.HIDDEN) {
+             close();
+         } else {
+-            animateTo(BareTabSheetSnap.progressOf(next), null);
++            settleSheet(next, /* announce= */ true);
++        }
++    }
++
++    /** Moves the sheet to {@code state} and, once there, tells TalkBack if it changed. */
++    private void settleSheet(BareTabSheetSnap.State requested, boolean announce) {
++        if (requested == BareTabSheetSnap.State.HIDDEN) {
++            close();
++            return;
++        }
++        BareTabSheetSnap.State state =
++                requested == BareTabSheetSnap.State.HALF && skipsHalfStop()
++                        ? BareTabSheetSnap.State.FULL
++                        : requested;
++        animateTo(
++                BareTabSheetSnap.progressOf(state),
++                () -> {
++                    BareTabSheetSnap.State before = mSettledState;
++                    mSettledState = state;
++                    updateHandleAccessibility();
++                    Panel panel = mPanel;
++                    if (announce && before != state && panel != null) {
++                        panel.announceForAccessibility(
++                                mActivity.getString(
++                                        state == BareTabSheetSnap.State.FULL
++                                                ? R.string.bare_vtabs_sheet_expanded_announcement
++                                                : R.string.bare_vtabs_sheet_half_announcement));
++                    }
++                });
++    }
++
++    /**
++     * Gives the handle its state and the actions that make sense from it: expand from half,
++     * collapse to half from full, and dismiss. Nothing is offered while the sheet is closed or
++     * the side drawer is in use.
++     */
++    private void updateHandleAccessibility() {
++        View handleRow = mHandleRow;
++        if (handleRow == null) return;
++        ViewCompat.removeAccessibilityAction(
++                handleRow, AccessibilityActionCompat.ACTION_EXPAND.getId());
++        ViewCompat.removeAccessibilityAction(
++                handleRow, AccessibilityActionCompat.ACTION_COLLAPSE.getId());
++        ViewCompat.removeAccessibilityAction(
++                handleRow, AccessibilityActionCompat.ACTION_DISMISS.getId());
++        if (!isSheetChrome() || !mOpen) {
++            ViewCompat.setStateDescription(handleRow, null);
++            return;
++        }
++        boolean full =
++                mSettledState == BareTabSheetSnap.State.FULL
++                        || (mSettledState == null && mProgress > BareTabSheetSnap.HALF_RATIO);
++        ViewCompat.setStateDescription(
++                handleRow,
++                mActivity.getString(
++                        full
++                                ? R.string.bare_vtabs_sheet_expanded
++                                : R.string.bare_vtabs_sheet_half_expanded));
++        if (full && skipsHalfStop()) {
++            // Nothing to collapse to: the window is too short for a half stop.
++        } else if (full) {
++            ViewCompat.replaceAccessibilityAction(
++                    handleRow,
++                    AccessibilityActionCompat.ACTION_COLLAPSE,
++                    null,
++                    (view, arguments) -> {
++                        settleSheet(BareTabSheetSnap.State.HALF, true);
++                        return true;
++                    });
++        } else {
++            ViewCompat.replaceAccessibilityAction(
++                    handleRow,
++                    AccessibilityActionCompat.ACTION_EXPAND,
++                    null,
++                    (view, arguments) -> {
++                        settleSheet(BareTabSheetSnap.State.FULL, true);
++                        return true;
++                    });
++        }
++        ViewCompat.replaceAccessibilityAction(
++                handleRow,
++                AccessibilityActionCompat.ACTION_DISMISS,
++                null,
++                (view, arguments) -> {
++                    close();
++                    return true;
++                });
++    }
++
++    /**
++     * Runs {@code change} to the list now, or just after its layout pass if it is in one. The
++     * item animator can finish inside a layout (when the list is resized, say), and the list may
++     * not be changed then.
++     */
++    private void runOutsideLayout(Runnable change) {
++        RecyclerView list = mList;
++        if (list != null && list.isComputingLayout()) {
++            list.post(change);
++        } else {
++            change.run();
++        }
++    }
++
++    /** Whether the window is too short for a half stop, such as a phone on its side. */
++    private boolean skipsHalfStop() {
++        return isSheetChrome()
++                && mActivity.getResources().getConfiguration().screenHeightDp < SHORT_WINDOW_DP;
++    }
++
++    // Predictive back.
++
++    /**
++     * Back closes the sheet: it is modal, so like Material's modal bottom sheets it goes away
++     * rather than stepping down to half. While the back gesture is held the sheet shrinks toward
++     * its toolbar, and lets go of the shrink if the gesture is cancelled. The drawer does not
++     * shrink; Back closes it as before.
++     */
++    private void startBackPreview() {
++        if (mBackAnimator != null) mBackAnimator.cancel();
++    }
++
++    private void previewBack(float progress) {
++        if (!isSheetChrome() || !mOpen) return;
++        if (mBackAnimator != null) mBackAnimator.cancel();
++        setBackProgress(progress);
++    }
++
++    private void cancelBackPreview() {
++        if (mBackProgress == 0f) return;
++        if (mBackAnimator != null) mBackAnimator.cancel();
++        ValueAnimator animator = ValueAnimator.ofFloat(mBackProgress, 0f);
++        animator.setDuration(BACK_CANCEL_MS);
++        animator.addUpdateListener(a -> setBackProgress((float) a.getAnimatedValue()));
++        mBackAnimator = animator;
++        animator.start();
++    }
++
++    float backProgressForTesting() {
++        return mBackProgress;
++    }
++
++    private void setBackProgress(float progress) {
++        mBackProgress = Math.max(0f, Math.min(1f, progress));
++        Panel panel = mPanel;
++        if (panel == null) return;
++        if (mBackProgress == 0f || !isSheetChrome()) {
++            panel.setScaleX(1f);
++            panel.setScaleY(1f);
++            return;
+         }
++        int width = panel.getWidth() > 0 ? panel.getWidth() : Math.max(1, mPanelWidth);
++        int height = Math.max(1, panel.getHeight());
++        panel.setPivotX(width / 2f);
++        // It shrinks toward the toolbar it came from.
++        panel.setPivotY(sheetFromTop() ? 0f : height);
++        panel.setScaleX(1f - mBackProgress * Math.min(dp(BACK_SHRINK_X_DP), width / 4f) / width);
++        panel.setScaleY(1f - mBackProgress * Math.min(dp(BACK_SHRINK_Y_DP), height / 4f) / height);
+     }
+ 
+     // Pulled from the toolbar.
+@@ -2258,7 +2616,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             RecyclerView list = mList;
+             RecyclerView.ItemAnimator animator = list == null ? null : list.getItemAnimator();
+             if (animator != null && animator.isRunning()) {
+-                animator.isRunning(rebind::run);
++                animator.isRunning(() -> runOutsideLayout(rebind));
+             } else {
+                 rebind.run();
+             }
+@@ -2360,7 +2718,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             RecyclerView list = mList;
+             RecyclerView.ItemAnimator animator = list == null ? null : list.getItemAnimator();
+             if (animator != null && animator.isRunning()) {
+-                animator.isRunning(rebind::run);
++                animator.isRunning(() -> runOutsideLayout(rebind));
+             } else {
+                 rebind.run();
+             }
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 94c4dca1d7..4523466816 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -18,15 +18,23 @@ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+ import android.app.Activity;
++import android.app.Dialog;
+ import android.graphics.Bitmap;
++import android.graphics.drawable.GradientDrawable;
+ import android.view.Gravity;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.view.WindowManager;
+ import android.view.accessibility.AccessibilityNodeInfo;
+ import android.widget.FrameLayout;
+ import android.widget.LinearLayout;
+ import android.widget.TextView;
+ 
++import androidx.activity.BackEventCompat;
++import androidx.activity.ComponentActivity;
++import androidx.activity.OnBackPressedCallback;
++import androidx.activity.OnBackPressedDispatcher;
++import androidx.core.view.ViewCompat;
+ import androidx.recyclerview.widget.RecyclerView;
+ import androidx.test.ext.junit.rules.ActivityScenarioRule;
+ 
+@@ -36,6 +44,7 @@ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.robolectric.Shadows;
++import org.robolectric.annotation.Config;
+ import org.robolectric.shadows.ShadowLooper;
+ 
+ import org.chromium.base.Token;
+@@ -101,11 +110,14 @@ public class BareVerticalTabsDrawerUnitTest {
+         when(mCreators.getTabCreator(false)).thenReturn(mCreator);
+ 
+         BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++        // No blur in these tests unless one asks for it.
++        BareVerticalTabsDrawer.setGlassForTesting(false);
+         mDrawer = new BareVerticalTabsDrawer(mActivity, () -> mSelector, () -> mCreators);
+     }
+ 
+     @After
+     public void tearDown() {
++        BareVerticalTabsDrawer.setGlassForTesting(null);
+         org.chromium.chrome.browser.preferences.ChromeSharedPreferences.getInstance()
+                 .removeKey(
+                         org.chromium.chrome.browser.preferences.ChromePreferenceKeys
+@@ -881,6 +893,328 @@ public class BareVerticalTabsDrawerUnitTest {
+                         & Gravity.VERTICAL_GRAVITY_MASK);
+     }
+ 
++    private int px(float dp) {
++        return Math.round(dp * mActivity.getResources().getDisplayMetrics().density);
++    }
++
++    private OnBackPressedDispatcher backDispatcher() {
++        return ((ComponentActivity) mActivity).getOnBackPressedDispatcher();
++    }
++
++    private static BackEventCompat backEvent(float progress) {
++        return new BackEventCompat(10f, 900f, progress, BackEventCompat.EDGE_LEFT);
++    }
++
++    /** Opens the sheet at half, laid out {@code width} by {@code height}. Returns the panel. */
++    private LinearLayout openSheetLaidOut(int width, int height) {
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        LinearLayout panel = (LinearLayout) findTag("sheet_actions").getParent();
++        View root = (View) panel.getParent();
++        layoutOverlay(root, width, height);
++        mDrawer.finishAnimationForTesting();
++        // A size set while the overlay is first laid out is picked up on the next pass, as a
++        // window would; this test lays it out by hand, so it asks for that pass.
++        root.requestLayout();
++        layoutOverlay(root, width, height);
++        return panel;
++    }
++
++    private static boolean hasAction(View view, int actionId) {
++        AccessibilityNodeInfo info = view.createAccessibilityNodeInfo();
++        for (AccessibilityNodeInfo.AccessibilityAction action : info.getActionList()) {
++            if (action.getId() == actionId) return true;
++        }
++        return false;
++    }
++
++    @Test
++    public void testBackClosesTheSheetAndShrinksItWhileHeld() {
++        setAddressBarOnTop(false);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        assertTrue(backDispatcher().hasEnabledCallbacks());
++
++        backDispatcher().dispatchOnBackStarted(backEvent(0f));
++        backDispatcher().dispatchOnBackProgressed(backEvent(0.5f));
++        assertEquals(0.5f, mDrawer.backProgressForTesting(), 0.001f);
++        assertTrue(panel.getScaleX() < 1f);
++        assertTrue(panel.getScaleY() < 1f);
++        // Toward the bottom toolbar it rises from.
++        assertEquals(panel.getHeight(), panel.getPivotY(), 0.5f);
++        assertTrue(mDrawer.isOpen());
++
++        backDispatcher().onBackPressed();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++        assertEquals(1f, panel.getScaleX(), 0.001f);
++        assertEquals(1f, panel.getScaleY(), 0.001f);
++    }
++
++    @Test
++    public void testACancelledBackLeavesTheSheetWhereItWas() {
++        setAddressBarOnTop(true);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        backDispatcher().dispatchOnBackStarted(backEvent(0f));
++        backDispatcher().dispatchOnBackProgressed(backEvent(0.7f));
++        // Dropped from a top bar, it shrinks toward the top.
++        assertEquals(0f, panel.getPivotY(), 0.5f);
++        assertTrue(panel.getScaleX() < 1f);
++
++        backDispatcher().dispatchOnBackCancelled();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++        assertEquals(1f, panel.getScaleX(), 0.001f);
++        assertEquals(1f, panel.getScaleY(), 0.001f);
++    }
++
++    @Test
++    public void testWhileTheSheetIsOpenBackNeverReachesThePage() {
++        int[] pageBacks = {0};
++        // Registered first, like the browser's own handler, so anything added later goes first.
++        OnBackPressedCallback page =
++                new OnBackPressedCallback(true) {
++                    @Override
++                    public void handleOnBackPressed() {
++                        pageBacks[0]++;
++                    }
++                };
++        backDispatcher().addCallback(page);
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++
++        backDispatcher().onBackPressed();
++        assertEquals(0, pageBacks[0]);
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++
++        backDispatcher().onBackPressed();
++        assertEquals(1, pageBacks[0]);
++        page.remove();
++    }
++
++    @Test
++    public void testTheSideDrawerDoesNotShrinkWithBack() {
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        View panel = (View) findTag("sheet_actions").getParent();
++        backDispatcher().dispatchOnBackStarted(backEvent(0f));
++        backDispatcher().dispatchOnBackProgressed(backEvent(0.6f));
++        assertEquals(1f, panel.getScaleX(), 0f);
++        assertEquals(1f, panel.getScaleY(), 0f);
++        assertTrue(mDrawer.isOpen());
++        backDispatcher().onBackPressed();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testOnAPhoneTheSheetFillsTheWidth() {
++        setAddressBarOnTop(false);
++        LinearLayout panel = openSheetLaidOut(px(412), px(900));
++        assertEquals(px(412), panel.getWidth());
++        assertEquals(0, panel.getLeft());
++    }
++
++    @Test
++    public void testOnAWideWindowTheSheetIsCappedAndCentered() {
++        setAddressBarOnTop(false);
++        int width = px(900);
++        LinearLayout panel = openSheetLaidOut(width, px(1200));
++        assertEquals(px(640), panel.getWidth());
++        assertEquals((width - px(640)) / 2, panel.getLeft(), 1);
++        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        assertEquals(Gravity.CENTER_HORIZONTAL, params.gravity & Gravity.HORIZONTAL_GRAVITY_MASK);
++        assertEquals(Gravity.BOTTOM, params.gravity & Gravity.VERTICAL_GRAVITY_MASK);
++    }
++
++    @Test
++    @Config(qualifiers = "w860dp-h360dp-land")
++    public void testAPhoneOnItsSideGetsAFullCenteredSheetWithNoHalfStop() {
++        setAddressBarOnTop(true);
++        int width = px(860);
++        int height = px(300);
++        LinearLayout panel = openSheetLaidOut(width, height);
++        // Half of a short window has no room for a card, so the sheet opens full.
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++        assertEquals(height - sheetGap(), panel.getHeight());
++        assertEquals(px(640), panel.getWidth());
++        assertEquals((width - px(640)) / 2, panel.getLeft(), 1);
++        assertEquals(0, panel.getTop());
++        assertTrue(panel.getBottom() <= height);
++
++        // A drag let go near half stays full rather than stopping there.
++        mDrawer.beginToolbarPull();
++        mDrawer.updateToolbarPull(-(height - sheetGap()) * 0.45f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        // TalkBack is offered no collapse, as there is no half stop to collapse to.
++        View handleRow = findTag("sheet_handle_row");
++        assertEquals("Expanded", String.valueOf(ViewCompat.getStateDescription(handleRow)));
++        assertFalse(
++                hasAction(
++                        handleRow, AccessibilityNodeInfo.AccessibilityAction.ACTION_COLLAPSE.getId()));
++        assertTrue(
++                hasAction(
++                        handleRow, AccessibilityNodeInfo.AccessibilityAction.ACTION_DISMISS.getId()));
++    }
++
++    @Test
++    public void testTurnedOnItsSideAtHalfTheSheetGoesFull() {
++        setAddressBarOnTop(false);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++        android.content.res.Configuration config =
++                mActivity.getResources().getConfiguration();
++        config.screenHeightDp = 360;
++        mActivity.getResources().updateConfiguration(config, null);
++        layoutOverlay((View) panel.getParent(), px(860), px(300));
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++    }
++
++    @Test
++    public void testTypingInTheAddressBarClosesTheSheet() {
++        android.widget.EditText addressBar = new android.widget.EditText(mActivity);
++        addressBar.setFocusableInTouchMode(true);
++        content().addView(addressBar, new FrameLayout.LayoutParams(200, 50));
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        assertTrue(mDrawer.isOpen());
++        assertTrue(addressBar.requestFocus());
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testTheSideDrawerIsNotClosedByFocus() {
++        android.widget.EditText field = new android.widget.EditText(mActivity);
++        field.setFocusableInTouchMode(true);
++        content().addView(field, 0, new FrameLayout.LayoutParams(200, 50));
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(field.requestFocus());
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testTheHandleIsAFullTouchTargetThatTalkBackCanUse() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        View handleRow = findTag("sheet_handle_row");
++        assertTrue(handleRow.getMinimumHeight() >= px(48));
++        assertTrue(handleRow.getHeight() >= px(48));
++        assertTrue(handleRow.isFocusable());
++        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_YES, handleRow.getImportantForAccessibility());
++        assertEquals("Tabs sheet drag handle", String.valueOf(handleRow.getContentDescription()));
++        assertEquals("Half expanded", String.valueOf(ViewCompat.getStateDescription(handleRow)));
++        int expand = AccessibilityNodeInfo.AccessibilityAction.ACTION_EXPAND.getId();
++        int collapse = AccessibilityNodeInfo.AccessibilityAction.ACTION_COLLAPSE.getId();
++        int dismiss = AccessibilityNodeInfo.AccessibilityAction.ACTION_DISMISS.getId();
++        assertTrue(hasAction(handleRow, expand));
++        assertFalse(hasAction(handleRow, collapse));
++        assertTrue(hasAction(handleRow, dismiss));
++
++        assertTrue(handleRow.performAccessibilityAction(expand, null));
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++        assertEquals("Expanded", String.valueOf(ViewCompat.getStateDescription(handleRow)));
++        assertFalse(hasAction(handleRow, expand));
++        assertTrue(hasAction(handleRow, collapse));
++
++        assertTrue(handleRow.performAccessibilityAction(collapse, null));
++        mDrawer.finishAnimationForTesting();
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++
++        assertTrue(handleRow.performAccessibilityAction(dismiss, null));
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertFalse(hasAction(handleRow, dismiss));
++    }
++
++    @Test
++    public void testTalkBackSkipsTheSheetScrimButNotTheDrawers() {
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        View scrim = ((ViewGroup) root).getChildAt(0);
++        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, scrim.getImportantForAccessibility());
++        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, root.getImportantForAccessibility());
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_NO, scrim.getImportantForAccessibility());
++        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_NO, root.getImportantForAccessibility());
++        // The sheet under it is still read.
++        assertEquals(
++                View.IMPORTANT_FOR_ACCESSIBILITY_YES,
++                findTag("sheet_handle_row").getImportantForAccessibility());
++        // Still a tap target that closes the sheet.
++        scrim.performClick();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testInGlassTheSheetsWindowStopsAtTheToolbars() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        Dialog glass = mDrawer.glassWindowForTesting();
++        assertNotNull(glass);
++        WindowManager.LayoutParams attributes = glass.getWindow().getAttributes();
++        assertTrue(attributes.height != ViewGroup.LayoutParams.MATCH_PARENT);
++        assertEquals(Gravity.TOP, attributes.gravity & Gravity.VERTICAL_GRAVITY_MASK);
++        assertTrue(
++                (attributes.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0);
++        View panel = findTag(glass.getWindow().getDecorView(), "sheet_actions");
++        assertNotNull(panel);
++        panel = (View) panel.getParent();
++        // The overlay is the window: no margins of its own.
++        FrameLayout.LayoutParams rootParams =
++                (FrameLayout.LayoutParams) ((View) panel.getParent()).getLayoutParams();
++        assertEquals(0, rootParams.topMargin);
++        assertEquals(0, rootParams.bottomMargin);
++        // The sheet is see-through, for the blur behind it.
++        GradientDrawable background = (GradientDrawable) panel.getBackground();
++        assertTrue((background.getColor().getDefaultColor() >>> 24) < 0xFF);
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.destroy();
++    }
++
++    @Test
++    public void testInGlassTheSideDrawersWindowStillCoversTheScreen() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        Dialog glass = mDrawer.glassWindowForTesting();
++        assertNotNull(glass);
++        WindowManager.LayoutParams attributes = glass.getWindow().getAttributes();
++        assertEquals(ViewGroup.LayoutParams.MATCH_PARENT, attributes.height);
++        assertEquals(ViewGroup.LayoutParams.MATCH_PARENT, attributes.width);
++        assertEquals(0, attributes.y);
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.destroy();
++    }
++
+     private void layoutOverlay(View root, int width, int height) {
+         root.measure(
+                 View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+-- 
+2.34.1
+
