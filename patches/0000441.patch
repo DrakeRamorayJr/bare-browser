@@ -1,0 +1,401 @@
+From d861a01bf5fe9960ad47d1e016534aebd8d95d4e Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:06:43 +0000
+Subject: [PATCH] Bare: give the sheet new-tab button breathing room and match
+ the toolbar surface
+
+In bottom-bar Sheet mode, raise the bottom seam to 12dp, size the actions
+row buttons to 48dp with 16dp bottom padding (28dp total clearance above
+the bottom toolbar with non-overlapping touch targets), paint the seam and
+bottom toolbar to match the sheet's opaque surface while open, and restore
+the toolbar drawable on close. Top-bar Sheet mode and the side drawer are
+unchanged.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 138 ++++++++++++++++--
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 113 +++++++++++++-
+ 2 files changed, 236 insertions(+), 15 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 3e3d407581..9f73da2a1f 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -132,9 +132,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final long DURATION_MS = 380;
+     private static final long SHEET_DURATION_MS = 320;
+     private static final float SHEET_FULL_GAP_DP = 8f;
+-    // Clearance under a bottom-bar sheet so its action row does not sit on the toolbar.
+-    // A top-bar sheet has no toolbar there, so it keeps none.
+-    private static final float SHEET_BOTTOM_SEAM_DP = 8f;
++    // Clearance under a bottom-bar sheet so its action row, and the 48dp touch
++    // target of every button in that row, stays clear of the toolbar. A top-bar
++    // sheet has no toolbar there, so it keeps none.
++    private static final float SHEET_BOTTOM_SEAM_DP = 12f;
+     private static final float SHEET_FLING_DP_PER_S = 800f;
+     private static final @ColorInt int SCRIM_COLOR = 0xAA000000;
+     private static final float WIDTH_FRACTION = 0.85f;
+@@ -237,6 +238,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * address-bar slot so the morph can draw there; the sheet itself stays where it was.
+      */
+     private int mSheetBottomLift;
++    // Bottom toolbar fill saved while a rising sheet tints that bar to the sheet surface.
++    private @Nullable Drawable mHeldToolbarBackground;
++    private @ColorInt int mHeldToolbarColor;
++    private boolean mToolbarSurfaceHeld;
++    private @Nullable View mSeamFill;
+     private boolean mAddressCaptured;
+     private int mSavedLocationVis = View.VISIBLE;
+     private int mSavedUrlVis = View.VISIBLE;
+@@ -709,6 +715,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 new FrameLayout.LayoutParams(
+                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+ 
++        // Paints the seam with the sheet surface so the page does not show between the
++        // sheet and the toolbar. The panel draws above it and stays clear of the bar.
++        View seamFill = new View(mActivity);
++        seamFill.setVisibility(View.GONE);
++        root.addView(
++                seamFill,
++                new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, Gravity.BOTTOM));
++        mSeamFill = seamFill;
++
+         Panel panel = new Panel(mActivity);
+         panel.setOrientation(LinearLayout.VERTICAL);
+         panel.setBackgroundColor(color(0xFF1B1B1E, 0xFFF4F4F7));
+@@ -923,12 +938,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             ActionHaptics.tick(v);
+                             closeAllTabs();
+                         });
++        // 48dp is the touch target. It stays inside the row, above the seam.
+         LinearLayout.LayoutParams actionBtn =
+-                new LinearLayout.LayoutParams(dp(40), dp(40));
++                new LinearLayout.LayoutParams(dp(48), dp(48));
+         sheetActions.addView(sheetList, actionBtn);
+-        sheetActions.addView(sheetGrid, new LinearLayout.LayoutParams(dp(40), dp(40)));
+-        sheetActions.addView(sheetNew, new LinearLayout.LayoutParams(dp(40), dp(40)));
+-        sheetActions.addView(sheetCloseAll, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        sheetActions.addView(sheetGrid, new LinearLayout.LayoutParams(dp(48), dp(48)));
++        sheetActions.addView(sheetNew, new LinearLayout.LayoutParams(dp(48), dp(48)));
++        sheetActions.addView(sheetCloseAll, new LinearLayout.LayoutParams(dp(48), dp(48)));
+         ImageButton sheetSearch =
+                 sheetActionButton(
+                         R.drawable.ic_search_24dp,
+@@ -938,7 +954,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                             ActionHaptics.tick(v);
+                             expandSearch();
+                         });
+-        sheetActions.addView(sheetSearch, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        sheetActions.addView(sheetSearch, new LinearLayout.LayoutParams(dp(48), dp(48)));
+         buildActionRowSearch(sheetActions);
+         panel.addView(
+                 sheetActions,
+@@ -1091,7 +1107,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 if (fromTop) {
+                     mSheetActions.setPadding(dp(16), dp(10), dp(8), dp(8));
+                 } else {
+-                    mSheetActions.setPadding(dp(16), dp(8), dp(8), dp(10));
++                    // 16dp under the buttons, plus the seam, keeps a 48dp target off the toolbar.
++                    mSheetActions.setPadding(dp(16), dp(8), dp(8), dp(16));
+                 }
+                 applyActionsSurface();
+             }
+@@ -1557,6 +1574,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void applySheetBackground() {
+         Panel panel = mPanel;
+         if (panel == null) return;
++        // No shadow under a bottom-bar sheet: it would redraw the seam as a second surface.
++        panel.setElevation(isSheetChrome() && !sheetFromTop() ? 0f : (float) dp(16));
+         if (!isSheetChrome()) {
+             panel.setBackgroundColor(
+                     mGlass ? color(0xA61B1B1E, 0xB8F4F4F7) : color(0xFF1B1B1E, 0xFFF4F4F7));
+@@ -1586,6 +1605,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return mGlass ? color(0xA61C1A20, 0xB8F1EDF6) : color(0xFF1C1A20, 0xFFF1EDF6);
+     }
+ 
++    /**
++     * The RGB of {@link #sheetSurfaceColor()} with a full alpha. The seam and the toolbar
++     * use this. A glass tint is translucent, and the page shows through it there.
++     */
++    private @ColorInt int sheetJoinedSurfaceColor() {
++        return sheetSurfaceColor() | 0xFF000000;
++    }
++
+     /**
+      * Paints the action row with the panel fill. The old flat opaque color stayed put when
+      * glass was on, so the row read as a second surface.
+@@ -1595,6 +1622,94 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mSheetActions.setBackgroundColor(sheetSurfaceColor());
+     }
+ 
++    /**
++     * While a bottom-bar sheet is open, the five-button bar uses the sheet surface so the
++     * two read as one. The saved fill is put back as the sheet closes. Driven by the sheet's
++     * progress, so the change tracks the open and the close. Top-bar sheets and the side
++     * drawer leave the bar alone.
++     */
++    private void applyToolbarSurface() {
++        View bar = bottomButtonBar();
++        if (bar == null || !isSheetChrome() || sheetFromTop() || mProgress <= 0.001f) {
++            restoreToolbarSurface();
++            return;
++        }
++        if (!mToolbarSurfaceHeld) {
++            Drawable background = bar.getBackground();
++            if (background != null && background.getConstantState() != null) {
++                mHeldToolbarBackground = background.getConstantState().newDrawable().mutate();
++            } else {
++                mHeldToolbarBackground = background;
++            }
++            mHeldToolbarColor =
++                    background instanceof ColorDrawable color
++                            ? color.getColor()
++                            : sheetJoinedSurfaceColor();
++            mToolbarSurfaceHeld = true;
++        }
++        float opened = BareTabSheetSnap.HALF_RATIO;
++        float t = opened <= 0f ? 1f : Math.min(1f, mProgress / opened);
++        int blended = blendColor(mHeldToolbarColor, sheetJoinedSurfaceColor(), t);
++        Drawable current = bar.getBackground();
++        if (!(current instanceof ColorDrawable color) || color.getColor() != blended) {
++            bar.setBackgroundColor(blended);
++        }
++    }
++
++    private void restoreToolbarSurface() {
++        if (!mToolbarSurfaceHeld) return;
++        View bar = bottomButtonBar();
++        if (bar != null) bar.setBackground(mHeldToolbarBackground);
++        mHeldToolbarBackground = null;
++        mToolbarSurfaceHeld = false;
++    }
++
++    private @Nullable View bottomButtonBar() {
++        return mActivity.findViewById(
++                org.chromium.chrome.browser.ui.bottombar.R.id.bottom_bar_container);
++    }
++
++    static int bottomBarIdForTesting() {
++        return org.chromium.chrome.browser.ui.bottombar.R.id.bottom_bar_container;
++    }
++
++    @Nullable View seamFillForTesting() {
++        return mSeamFill;
++    }
++
++    /** Fills the gap under a bottom-bar sheet with the sheet surface. */
++    private void applySeamFill() {
++        View fill = mSeamFill;
++        if (fill == null) return;
++        boolean show = isSheetChrome() && !sheetFromTop() && mProgress > 0.001f;
++        int seam = show ? sheetBottomSeam() : 0;
++        if (seam <= 0) {
++            if (fill.getVisibility() != View.GONE) fill.setVisibility(View.GONE);
++            return;
++        }
++        int color = sheetJoinedSurfaceColor();
++        Drawable background = fill.getBackground();
++        if (!(background instanceof ColorDrawable paint) || paint.getColor() != color) {
++            fill.setBackgroundColor(color);
++        }
++        int width = ViewGroup.LayoutParams.MATCH_PARENT;
++        Panel panel = mPanel;
++        if (panel != null
++                && panel.getLayoutParams() instanceof FrameLayout.LayoutParams panelParams
++                && panelParams.width > 0) {
++            width = panelParams.width;
++        }
++        int gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
++        if (fill.getLayoutParams() instanceof FrameLayout.LayoutParams params
++                && (params.height != seam || params.width != width || params.gravity != gravity)) {
++            params.width = width;
++            params.height = seam;
++            params.gravity = gravity;
++            fill.setLayoutParams(params);
++        }
++        if (fill.getVisibility() != View.VISIBLE) fill.setVisibility(View.VISIBLE);
++    }
++
+     private void updateSheetButtons() {
+         if (mSheetList == null || mSheetGrid == null) return;
+         int active = color(0xFFEEEEEE, 0xFF1B1B1F);
+@@ -1925,6 +2040,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** 0 is closed and 1 is open. Drives the scrim, the panel and the shift of the page. */
+     private void applyProgress(float progress) {
+         mProgress = Math.max(0f, Math.min(1f, progress));
++        applyToolbarSurface();
++        applySeamFill();
+         layoutOriginPill();
+         View scrim = mScrim;
+         Panel panel = mPanel;
+@@ -3778,6 +3895,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mInWindowLayout = true;
+         try {
+             applyImeLiftFromInsets();
++            // A later toolbar pass can put the old fill back. Keep the sheet colour on it.
++            applyToolbarSurface();
++            applySeamFill();
+         } finally {
+             mInWindowLayout = false;
+         }
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index b691b9388d..f188da1e40 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -682,7 +682,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(Gravity.BOTTOM, halfParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
+         // The far gap stays at the top; the bottom seam is reserved under the action row.
+         assertEquals(
+-                Math.round(BareTabSheetSnap.HALF_RATIO * (2000 - sheetGap() - px(8))),
++                Math.round(BareTabSheetSnap.HALF_RATIO * (2000 - sheetGap() - px(12))),
+                 halfParams.height);
+         RecyclerView list = find(content(), RecyclerView.class);
+         assertNotNull(list);
+@@ -698,7 +698,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0f, panel.getTranslationY(), 0f);
+         FrameLayout.LayoutParams fullParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
+         assertEquals(Gravity.BOTTOM, fullParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
+-        assertEquals(2000 - sheetGap() - px(8), fullParams.height);
++        assertEquals(2000 - sheetGap() - px(12), fullParams.height);
+         assertTrue(listHolder.getBottom() <= actions.getTop());
+     }
+ 
+@@ -1833,6 +1833,106 @@ public class BareVerticalTabsDrawerUnitTest {
+         mDrawer.destroy();
+     }
+ 
++    @Test
++    public void testTheBottomToolbarMatchesTheSheetWhileItIsOpen() {
++        View bar = new View(mActivity);
++        bar.setId(BareVerticalTabsDrawer.bottomBarIdForTesting());
++        bar.setBackgroundColor(0xFF123456);
++        content().addView(bar, new FrameLayout.LayoutParams(px(400), px(56), Gravity.BOTTOM));
++
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            for (boolean night : new boolean[] {false, true}) {
++                setNightMode(night);
++                for (boolean glass : new boolean[] {false, true}) {
++                    if (mDrawer.isOpen()) {
++                        mDrawer.close();
++                        mDrawer.finishAnimationForTesting();
++                    }
++                    BareVerticalTabsDrawer.setGlassForTesting(glass);
++                    mDrawer.open();
++                    mDrawer.finishAnimationForTesting();
++                    // Opaque RGB. A glass tint would show the page through the bar.
++                    int expected = night ? 0xFF1C1A20 : 0xFFF1EDF6;
++                    assertEquals(
++                            "night=" + night + " glass=" + glass,
++                            expected,
++                            drawableColor(bar.getBackground()));
++                    View fill = mDrawer.seamFillForTesting();
++                    assertNotNull(fill);
++                    assertEquals(View.VISIBLE, fill.getVisibility());
++                    assertEquals(expected, drawableColor(fill.getBackground()));
++                    assertEquals(
++                            px(12), ((FrameLayout.LayoutParams) fill.getLayoutParams()).height);
++                    mDrawer.close();
++                    mDrawer.finishAnimationForTesting();
++                    assertEquals(
++                            "restored night=" + night + " glass=" + glass,
++                            0xFF123456,
++                            drawableColor(bar.getBackground()));
++                    assertEquals(View.GONE, fill.getVisibility());
++                }
++            }
++
++            setNightMode(false);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            setAddressBarOnTop(true);
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0xFF123456, drawableColor(bar.getBackground()));
++            assertEquals(View.GONE, mDrawer.seamFillForTesting().getVisibility());
++            mDrawer.close();
++            mDrawer.finishAnimationForTesting();
++
++            BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++            mDrawer.open();
++            mDrawer.finishAnimationForTesting();
++            assertEquals(0xFF123456, drawableColor(bar.getBackground()));
++            assertEquals(View.GONE, mDrawer.seamFillForTesting().getVisibility());
++        } finally {
++            setNightMode(false);
++            BareVerticalTabsDrawer.setGlassForTesting(false);
++            if (mDrawer.isOpen()) {
++                mDrawer.close();
++                mDrawer.finishAnimationForTesting();
++            }
++        }
++    }
++
++    @Test
++    public void testActionButtonsClearTheToolbarByAtLeastEightDp() {
++        setAddressBarOnTop(false);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        View root = (View) panel.getParent();
++        String[] tags =
++                new String[] {
++                    "sheet_list", "sheet_grid", "sheet_new", "sheet_close_all", "sheet_search"
++                };
++        for (String tag : tags) {
++            View button = findTag(tag);
++            assertNotNull(button);
++            assertTrue(tag + " touch height " + button.getHeight(), button.getHeight() >= px(48));
++            assertTrue(tag + " touch width " + button.getWidth(), button.getWidth() >= px(48));
++            int gap = root.getHeight() - bottomInAncestor(button, root);
++            assertTrue(tag + " gap " + gap, gap >= px(8));
++            // No delegate may reach into the toolbar past the button's own bottom.
++            assertTrue(button.getTouchDelegate() == null);
++        }
++    }
++
++    /** The view's bottom in {@code ancestor}'s coordinates. */
++    private static int bottomInAncestor(View view, View ancestor) {
++        int bottom = view.getHeight();
++        View current = view;
++        while (current != ancestor) {
++            bottom += current.getTop();
++            if (!(current.getParent() instanceof View parent)) break;
++            current = parent;
++        }
++        return bottom;
++    }
++
+     @Test
+     public void testTheActionRowUsesTheSheetSurface() {
+         setAddressBarOnTop(false);
+@@ -1963,7 +2063,7 @@ public class BareVerticalTabsDrawerUnitTest {
+     public void testOnlyABottomBarSheetLeavesAGapAboveTheToolbar() {
+         setAddressBarOnTop(false);
+         LinearLayout panel = openSheetLaidOut(px(400), px(800));
+-        assertEquals(px(8), panelBottomMargin(panel));
++        assertEquals(px(12), panelBottomMargin(panel));
+         assertBottomCornersMatchTop(panel);
+ 
+         mDrawer.finishSheetDragForTesting(-10_000f);
+@@ -1971,9 +2071,10 @@ public class BareVerticalTabsDrawerUnitTest {
+         View root = (View) panel.getParent();
+         layoutOverlay(root, px(400), px(800));
+         layoutOverlay(root, px(400), px(800));
+-        assertEquals(px(8), panelBottomMargin(panel));
++        assertEquals(px(12), panelBottomMargin(panel));
++        // The 8dp sliver stays at the top. The 12dp seam is the gap above the toolbar.
+         assertEquals(px(8), panel.getTop(), 1f);
+-        assertEquals(px(8), root.getHeight() - panel.getBottom(), 1f);
++        assertEquals(px(12), root.getHeight() - panel.getBottom(), 1f);
+ 
+         findTag("sheet_search").performClick();
+         ShadowLooper.idleMainLooper();
+@@ -1982,7 +2083,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         View field = findTag("sheet_search_field");
+         assertEquals(View.VISIBLE, field.getVisibility());
+         assertEquals(findTag("sheet_actions"), field.getParent());
+-        assertEquals(px(8), panelBottomMargin(panel));
++        assertEquals(px(12), panelBottomMargin(panel));
+ 
+         mDrawer.close();
+         mDrawer.finishAnimationForTesting();
+-- 
+2.34.1
+
