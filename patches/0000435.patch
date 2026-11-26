@@ -1,0 +1,903 @@
+From c4b7ca468c0972d61342e7305b867715e7d8bba7 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:52:11 +0000
+Subject: [PATCH] Turn the address bar into a tab search as the tab sheet
+ opens.
+
+In Sheet mode the address bar crossfades into a Search tabs field as the
+sheet is pulled open, in step with the sheet's progress, and back into the
+address bar, URL intact, as it closes. The field is drawn over the toolbar
+in the activity window; the omnibox is not touched.
+
+Typing filters the sheet's list or grid live by every word of the title or
+address; clearing lists every tab again. Focusing the field takes the sheet
+full and keeps it open, and the sheet and field stay above the keyboard,
+with or without glass. Back hides the keyboard, then clears the search,
+then closes the sheet. Reordering is off while a filter is shown. Top
+address bar mirrors this at the top. The side drawer is unchanged.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ .../values/channel_constants.xml              |   3 +
+ .../browser/bare/BareVerticalTabsDrawer.java  | 476 +++++++++++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 176 +++++++
+ 3 files changed, 648 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/android/java/res_chromium_base/values/channel_constants.xml b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+index 733aead7d9..9376ae3015 100644
+--- a/chrome/android/java/res_chromium_base/values/channel_constants.xml
++++ b/chrome/android/java/res_chromium_base/values/channel_constants.xml
+@@ -227,6 +227,9 @@ found in the LICENSE file.
+     <string name="bare_vtabs_sheet_half_expanded">Half expanded</string>
+     <string name="bare_vtabs_sheet_expanded_announcement">Tabs sheet expanded</string>
+     <string name="bare_vtabs_sheet_half_announcement">Tabs sheet half expanded</string>
++    <string name="bare_vtabs_search_tabs">Search tabs</string>
++    <string name="bare_vtabs_search_clear">Clear search</string>
++    <string name="bare_vtabs_search_none">No matching tabs</string>
+     <plurals name="bare_vtabs_sheet_count">
+         <item quantity="one">%d tab</item>
+         <item quantity="other">%d tabs</item>
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 8b5e92b0d3..8c2ba3b42e 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -20,9 +20,12 @@ import android.graphics.drawable.Drawable;
+ import android.graphics.drawable.GradientDrawable;
+ import android.graphics.drawable.RippleDrawable;
+ import android.os.Build;
++import android.text.Editable;
++import android.text.InputType;
+ import android.text.SpannableString;
+ import android.text.Spanned;
+ import android.text.TextUtils;
++import android.text.TextWatcher;
+ import android.text.style.ForegroundColorSpan;
+ import android.util.TypedValue;
+ import android.view.Gravity;
+@@ -38,6 +41,9 @@ import android.view.Window;
+ import android.view.WindowManager;
+ import android.view.WindowInsets;
+ import android.view.animation.PathInterpolator;
++import android.view.inputmethod.EditorInfo;
++import android.view.inputmethod.InputMethodManager;
++import android.widget.EditText;
+ import android.widget.FrameLayout;
+ import android.widget.ImageButton;
+ import android.widget.ImageView;
+@@ -88,10 +94,12 @@ import org.chromium.chrome.browser.tabmodel.TabModel;
+ import org.chromium.chrome.browser.tabmodel.TabModelObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
+ import org.chromium.components.embedder_support.util.UrlUtilities;
++import org.chromium.url.GURL;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Objects;
+ import java.util.function.Supplier;
+ 
+@@ -106,7 +114,9 @@ import java.util.function.Supplier;
+  * drops down from below the address bar, mirrored. A vertical drag on the address bar, away from
+  * it, also pulls the sheet out with the finger (see {@link BareTabSheetToolbarSwipe}). Back closes
+  * the sheet, shrinking it with the predictive back gesture. On a wide screen the sheet is capped
+- * in width and centered. It is a view over
++ * in width and centered. As the sheet opens, the address bar turns into a Search tabs field that
++ * filters the list by title and address; the real address bar is left untouched underneath, and
++ * comes back as it was when the sheet closes. It is a view over
+  * the browser's own tab model: selecting, closing, adding and closing all go through the same
+  * operations the tab overview uses. It keeps no tabs of its own.
+  */
+@@ -183,6 +193,25 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private final ViewTreeObserver.OnGlobalFocusChangeListener mFocusListener =
+             (oldFocus, newFocus) -> onFocusMoved(newFocus);
+     private @Nullable ViewTreeObserver mFocusObserver;
++    // While the sheet is open, follows the keyboard: it moves the search field and the sheet
++    // above it.
++    private final ViewTreeObserver.OnGlobalLayoutListener mLayoutListener = this::onWindowLayout;
++    // The address bar's stand-in while the sheet is open: a Search tabs field laid over the
++    // toolbar, faded in with the sheet. The real address bar underneath is never changed.
++    private @Nullable MorphBar mMorph;
++    private @Nullable LinearLayout mSearchPill;
++    private @Nullable EditText mSearchField;
++    private @Nullable View mSearchClear;
++    private @Nullable View mSearchIcon;
++    // Takes focus from the field, as the address bar's own focus thief does, so clearing the
++    // search does not hand focus to another text field.
++    private @Nullable View mSearchThief;
++    // What the list is filtered by, trimmed. Empty lists every tab.
++    private String mQuery = "";
++    // How far the keyboard lifts the bottom search field, and the sheet with it; and how much of
++    // a sheet dropped from the top it would otherwise cover.
++    private int mImeLift;
++    private int mImeCover;
+     // Lets tests stand in for a device that can blur behind windows.
+     private static @Nullable Boolean sGlassForTesting;
+     private @Nullable TabModelSelector mObservedSelector;
+@@ -366,6 +395,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         hostRoot(root, glassWanted());
+         applySheetInsets();
+         applySheetBackground();
++        positionMorph();
+         root.setVisibility(View.VISIBLE);
+         root.requestApplyInsets();
+         // The toolbars may not have been laid out on the first pass, so re-measure after.
+@@ -374,6 +404,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     applySheetInsets();
+                     applySheetBackground();
+                     applyChromeInsets();
++                    positionMorph();
+                     applyProgress(mProgress);
+                 });
+         if (mBackCallback != null) mBackCallback.setEnabled(true);
+@@ -395,6 +426,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (!mOpen) return;
+         mOpen = false;
+         watchFocus(false);
++        // The search goes with the sheet: the next open lists every tab again.
++        clearSearch();
+         if (mBackCallback != null) mBackCallback.setEnabled(false);
+         animateTo(
+                 0f,
+@@ -405,6 +438,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     if (!mOpen) {
+                         setBackProgress(0f);
+                         mSettledState = null;
++                        mImeLift = 0;
++                        mImeCover = 0;
+                         updateHandleAccessibility();
+                     }
+                     Dialog glass = mGlassWindow;
+@@ -430,19 +465,26 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (root != null && root.getParent() instanceof ViewGroup parent) {
+             parent.removeView(root);
+         }
++        MorphBar morph = mMorph;
++        if (morph != null && morph.getParent() instanceof ViewGroup parent) {
++            parent.removeView(morph);
++        }
+         applyProgress(0f);
+         mRoot = null;
++        mMorph = null;
+     }
+ 
+     private void watchFocus(boolean watch) {
+         ViewTreeObserver current = mFocusObserver;
+         if (current != null && current.isAlive()) {
+             current.removeOnGlobalFocusChangeListener(mFocusListener);
++            current.removeOnGlobalLayoutListener(mLayoutListener);
+         }
+         mFocusObserver = null;
+         if (!watch) return;
+         ViewTreeObserver observer = mActivity.getWindow().getDecorView().getViewTreeObserver();
+         observer.addOnGlobalFocusChangeListener(mFocusListener);
++        observer.addOnGlobalLayoutListener(mLayoutListener);
+         mFocusObserver = observer;
+     }
+ 
+@@ -451,8 +493,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             return;
+         }
+         FrameLayout root = mRoot;
++        View morph = mMorph;
++        // The sheet's own Search tabs field, over the address bar, is part of the sheet.
+         for (View view = focused; view != null; ) {
+-            if (view == root) return;
++            if (view == root || view == morph) return;
+             view = view.getParent() instanceof View parent ? parent : null;
+         }
+         close();
+@@ -792,6 +836,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 new FrameLayout.LayoutParams(
+                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+         mGlass = false;
++        MorphBar morph = buildSearchBar();
++        content.addView(
++                morph,
++                new FrameLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, dp(56), Gravity.BOTTOM));
++        mMorph = morph;
+ 
+         if (mActivity instanceof ComponentActivity componentActivity) {
+             mBackCallback =
+@@ -813,6 +863,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+                         @Override
+                         public void handleOnBackPressed() {
++                            // A search is cleared first; the next Back closes the sheet.
++                            if (searching()) {
++                                clearSearch();
++                                return;
++                            }
+                             close();
+                         }
+                     };
+@@ -1170,6 +1225,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             // sheetRangeHeight), so the scrim dims it too.
+             if (top <= 0) top = mTopInset;
+             if (bottom <= 0 && sheetFromTop()) bottom = mBottomInset;
++            // With the keyboard up, the sheet ends above it: on the address bar, which the
++            // browser lifts over the keyboard, or on the lifted search field, when rising; at
++            // the keyboard's top when dropping.
++            if (sheetFromTop()) {
++                bottom = Math.max(bottom, mImeCover);
++            } else {
++                bottom = Math.max(bottom, bottomAddressBarInset()) + mImeLift;
++            }
+         }
+         mOverlayTop = top;
+         mOverlayBottom = bottom;
+@@ -1229,6 +1292,28 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return new int[] {Math.max(0, top), Math.max(0, bottom)};
+     }
+ 
++    /**
++     * With the address bar at the bottom, how far its top is above the content's bottom. The
++     * browser lifts the bar over the keyboard, out of the bottom third that toolbarInsets looks
++     * at, and the sheet still ends on it.
++     */
++    private int bottomAddressBarInset() {
++        View content = mActivity.findViewById(android.R.id.content);
++        View bar = mActivity.findViewById(R.id.control_container);
++        if (content == null
++                || bar == null
++                || bar.getVisibility() != View.VISIBLE
++                || bar.getHeight() <= 0
++                || content.getHeight() <= 0) {
++            return 0;
++        }
++        int[] contentLoc = new int[2];
++        content.getLocationOnScreen(contentLoc);
++        int[] barLoc = new int[2];
++        bar.getLocationOnScreen(barLoc);
++        return Math.max(0, contentLoc[1] + content.getHeight() - barLoc[1]);
++    }
++
+     /** Status-bar inset only when the sheet reaches the top of the window. */
+     private int sheetTopClearance() {
+         return mOverlayTop > 0 ? 0 : mTopInset;
+@@ -1435,9 +1520,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         Window w = window != null ? window.getWindow() : null;
+         if (w == null) return;
+         if (isSheetChrome()) {
++            // Not focusable puts a window above the keyboard; the sheet's goes behind it, so a
++            // search's keyboard is never hidden. The drawer's window is left as it was.
++            w.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+             applySheetInsets();
+             return;
+         }
++        if ((w.getAttributes().flags & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) != 0) {
++            w.clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
++        }
+         WindowManager.LayoutParams attributes = w.getAttributes();
+         if (attributes.y == 0
+                 && attributes.height == ViewGroup.LayoutParams.MATCH_PARENT
+@@ -1528,6 +1619,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** 0 is closed and 1 is open. Drives the scrim, the panel and the shift of the page. */
+     private void applyProgress(float progress) {
+         mProgress = Math.max(0f, Math.min(1f, progress));
++        updateMorph();
+         View scrim = mScrim;
+         Panel panel = mPanel;
+         if (scrim != null) {
+@@ -1877,7 +1969,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void previewBack(float progress) {
+-        if (!isSheetChrome() || !mOpen) return;
++        // While searching, Back only clears the search, so the sheet does not shrink.
++        if (!isSheetChrome() || !mOpen || searching()) return;
+         if (mBackAnimator != null) mBackAnimator.cancel();
+         setBackProgress(progress);
+     }
+@@ -1953,6 +2046,366 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         finishSheetDrag(velocityY);
+     }
+ 
++    // Search tabs: the address bar's morph.
++
++    /**
++     * Builds the Search tabs field that stands in for the address bar while the sheet is open. It
++     * is laid over the toolbar, in the activity's own window (also in glass, whose window stops at
++     * the toolbars), so it can take the keyboard. The address bar underneath is not changed.
++     */
++    private MorphBar buildSearchBar() {
++        MorphBar morph = new MorphBar(mActivity);
++        morph.setTag("sheet_search_bar");
++        morph.setVisibility(View.GONE);
++        morph.setClickable(true);
++        // Only swallows touches over the toolbar; its field and button speak for themselves.
++        morph.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        morph.setBackgroundColor(color(0xFF1C1A20, 0xFFF1EDF6));
++
++        LinearLayout pill = new LinearLayout(mActivity);
++        pill.setTag("sheet_search_pill");
++        pill.setOrientation(LinearLayout.HORIZONTAL);
++        pill.setGravity(Gravity.CENTER_VERTICAL);
++        pill.setPaddingRelative(dp(14), 0, dp(4), 0);
++        GradientDrawable pillShape = new GradientDrawable();
++        pillShape.setCornerRadius(dp(24));
++        pillShape.setColor(color(0xFF2B2930, 0xFFE6E0EC));
++        pill.setBackground(pillShape);
++
++        ImageView icon = new ImageView(mActivity);
++        icon.setImageResource(R.drawable.ic_search_24dp);
++        icon.setColorFilter(color(0xFFCAC4D0, 0xFF49454F));
++        icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        pill.addView(icon, new LinearLayout.LayoutParams(dp(22), dp(22)));
++
++        EditText field = new EditText(mActivity);
++        field.setTag("sheet_search_field");
++        field.setBackground(null);
++        field.setHint(R.string.bare_vtabs_search_tabs);
++        field.setHintTextColor(color(0xFF938F99, 0xFF79747E));
++        field.setTextColor(color(0xFFE6E1E5, 0xFF1C1B1F));
++        field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
++        field.setSingleLine(true);
++        field.setPaddingRelative(dp(12), 0, dp(8), 0);
++        field.setInputType(
++                InputType.TYPE_CLASS_TEXT
++                        | InputType.TYPE_TEXT_VARIATION_FILTER
++                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
++        field.setImeOptions(
++                EditorInfo.IME_ACTION_SEARCH
++                        | EditorInfo.IME_FLAG_NO_EXTRACT_UI
++                        | EditorInfo.IME_FLAG_NO_FULLSCREEN);
++        field.addTextChangedListener(
++                new TextWatcher() {
++                    @Override
++                    public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
++
++                    @Override
++                    public void onTextChanged(CharSequence s, int start, int before, int count) {}
++
++                    @Override
++                    public void afterTextChanged(Editable s) {
++                        onSearchChanged(s.toString());
++                    }
++                });
++        field.setOnFocusChangeListener(
++                (v, hasFocus) -> {
++                    if (hasFocus) onSearchFocused();
++                });
++        field.setOnEditorActionListener(
++                (v, actionId, event) -> {
++                    if (actionId != EditorInfo.IME_ACTION_SEARCH) return false;
++                    // The filter is already live; Search just puts the keyboard away.
++                    dropSearchFocus();
++                    return true;
++                });
++        pill.addView(
++                field,
++                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
++
++        ImageButton clear = new ImageButton(mActivity);
++        clear.setTag("sheet_search_clear");
++        clear.setImageResource(R.drawable.ic_bare_close);
++        clear.setColorFilter(color(0xFFCAC4D0, 0xFF49454F));
++        clear.setBackground(null);
++        clear.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
++        clear.setPadding(dp(10), dp(10), dp(10), dp(10));
++        clear.setContentDescription(mActivity.getString(R.string.bare_vtabs_search_clear));
++        clear.setVisibility(View.GONE);
++        clear.setOnClickListener(
++                v -> {
++                    ActionHaptics.tick(v);
++                    field.setText("");
++                });
++        pill.addView(clear, new LinearLayout.LayoutParams(dp(40), dp(40)));
++
++        FrameLayout.LayoutParams pillParams =
++                new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
++        pillParams.gravity = Gravity.CENTER_VERTICAL;
++        pillParams.leftMargin = dp(8);
++        pillParams.rightMargin = dp(8);
++        morph.addView(pill, pillParams);
++
++        View thief = new View(mActivity);
++        thief.setFocusable(true);
++        thief.setFocusableInTouchMode(true);
++        thief.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        morph.addView(thief, new FrameLayout.LayoutParams(1, 1));
++
++        mSearchPill = pill;
++        mSearchField = field;
++        mSearchClear = clear;
++        mSearchIcon = icon;
++        mSearchThief = thief;
++        return morph;
++    }
++
++    /**
++     * Lays the search field over the toolbar the sheet opens from, and its pill over the address
++     * bar's, so the bar seems to turn into it. With the keyboard up, a bottom one is lifted above
++     * it.
++     */
++    private void positionMorph() {
++        MorphBar morph = mMorph;
++        View content = mActivity.findViewById(android.R.id.content);
++        if (morph == null || content == null) return;
++        if (!(morph.getLayoutParams() instanceof FrameLayout.LayoutParams params)) return;
++        View bar = mActivity.findViewById(R.id.control_container);
++        int width = ViewGroup.LayoutParams.MATCH_PARENT;
++        int height = dp(56);
++        int gravity = sheetFromTop() ? Gravity.TOP : Gravity.BOTTOM;
++        int left = 0;
++        int top = 0;
++        int pillStart = dp(8);
++        int pillEnd = dp(8);
++        if (bar != null && bar.getVisibility() == View.VISIBLE && bar.getHeight() > 0) {
++            int[] contentLoc = new int[2];
++            content.getLocationOnScreen(contentLoc);
++            int[] barLoc = new int[2];
++            bar.getLocationOnScreen(barLoc);
++            width = bar.getWidth();
++            height = bar.getHeight();
++            gravity = Gravity.TOP | Gravity.START;
++            left = barLoc[0] - contentLoc[0];
++            top = barLoc[1] - contentLoc[1];
++            View location = mActivity.findViewById(R.id.location_bar);
++            if (location != null && location.isShown() && location.getWidth() > 0) {
++                int[] locationLoc = new int[2];
++                location.getLocationOnScreen(locationLoc);
++                pillStart = Math.max(0, locationLoc[0] - barLoc[0]);
++                pillEnd = Math.max(0, barLoc[0] + width - locationLoc[0] - location.getWidth());
++            }
++        } else if (morph.getVisibility() == View.VISIBLE) {
++            // The toolbar is away for a moment, as while the keyboard comes up: stay put.
++            morph.setTranslationY(sheetFromTop() ? 0f : -mImeLift);
++            return;
++        }
++        if (params.width != width
++                || params.height != height
++                || params.gravity != gravity
++                || params.leftMargin != left
++                || params.topMargin != top) {
++            params.width = width;
++            params.height = height;
++            params.gravity = gravity;
++            params.leftMargin = left;
++            params.topMargin = top;
++            morph.setLayoutParams(params);
++        }
++        LinearLayout pill = mSearchPill;
++        if (pill != null && pill.getLayoutParams() instanceof FrameLayout.LayoutParams pillParams) {
++            if (pillParams.leftMargin != pillStart || pillParams.rightMargin != pillEnd) {
++                pillParams.leftMargin = pillStart;
++                pillParams.rightMargin = pillEnd;
++                pill.setLayoutParams(pillParams);
++            }
++        }
++        morph.setTranslationY(sheetFromTop() ? 0f : -mImeLift);
++    }
++
++    /**
++     * Fades the search field in over the address bar as the sheet opens, fully there by half, and
++     * out as it closes. The side drawer never shows it.
++     */
++    private void updateMorph() {
++        MorphBar morph = mMorph;
++        if (morph == null) return;
++        FrameLayout root = mRoot;
++        float shown =
++                isSheetChrome() && root != null && root.getVisibility() == View.VISIBLE
++                        ? Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO)
++                        : 0f;
++        if (shown <= 0f) {
++            if (morph.getVisibility() != View.GONE) morph.setVisibility(View.GONE);
++            return;
++        }
++        if (morph.getVisibility() != View.VISIBLE) {
++            positionMorph();
++            morph.setVisibility(View.VISIBLE);
++            // Above the sheet's overlay when that shares the activity's content.
++            morph.bringToFront();
++        }
++        morph.setAlpha(shown);
++        View icon = mSearchIcon;
++        if (icon != null) {
++            float scale = 0.6f + 0.4f * shown;
++            icon.setScaleX(scale);
++            icon.setScaleY(scale);
++        }
++    }
++
++    /** Whether a search is under way: there is text, or the field has the keyboard. */
++    private boolean searching() {
++        EditText field = mSearchField;
++        return field != null && (field.length() > 0 || field.hasFocus());
++    }
++
++    private void onSearchChanged(String text) {
++        View clear = mSearchClear;
++        if (clear != null) clear.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
++        String query = text.trim();
++        if (query.equals(mQuery)) return;
++        mQuery = query;
++        // A new filter replaces the list at once and shows the current tab if it is in it.
++        mSnapNext = true;
++        mScrollToSelected = true;
++        if (mOpen) refresh();
++    }
++
++    /** The keyboard must not cover the list, so the sheet goes full for a search. */
++    private void onSearchFocused() {
++        if (!mOpen || !isSheetChrome()) return;
++        settleSheet(BareTabSheetSnap.State.FULL, /* announce= */ true);
++    }
++
++    /** Puts the field in focus with the keyboard, for a tap beside it. */
++    private void focusSearchField() {
++        EditText field = mSearchField;
++        if (field == null || !mOpen) return;
++        if (field.requestFocus()) {
++            InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
++            if (imm != null) imm.showSoftInput(field, 0);
++        }
++    }
++
++    /** Puts the keyboard away and moves focus off the field, keeping its text. */
++    private void dropSearchFocus() {
++        EditText field = mSearchField;
++        if (field == null || !field.hasFocus()) return;
++        InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
++        if (imm != null) imm.hideSoftInputFromWindow(field.getWindowToken(), 0);
++        View thief = mSearchThief;
++        if (thief == null || !thief.requestFocus()) field.clearFocus();
++    }
++
++    /** Empties the field, which lists every tab again, and puts the keyboard away. */
++    private void clearSearch() {
++        EditText field = mSearchField;
++        if (field != null && field.length() > 0) field.setText("");
++        mQuery = "";
++        dropSearchFocus();
++    }
++
++    /** Follows the keyboard while the sheet is open, so it never covers the field or the list. */
++    private void onWindowLayout() {
++        if (!mOpen || !isSheetChrome()) return;
++        int lift = 0;
++        int cover = 0;
++        View decor = mActivity.getWindow().getDecorView();
++        WindowInsets raw = decor.getRootWindowInsets();
++        int ime =
++                raw == null
++                        ? 0
++                        : WindowInsetsCompat.toWindowInsetsCompat(raw)
++                                .getInsets(WindowInsetsCompat.Type.ime())
++                                .bottom;
++        View content = mActivity.findViewById(android.R.id.content);
++        MorphBar morph = mMorph;
++        if (ime > 0 && content != null && morph != null) {
++            int[] decorLoc = new int[2];
++            decor.getLocationOnScreen(decorLoc);
++            int imeTop = decorLoc[1] + decor.getHeight() - ime;
++            int[] contentLoc = new int[2];
++            content.getLocationOnScreen(contentLoc);
++            if (sheetFromTop()) {
++                cover = Math.max(0, contentLoc[1] + content.getHeight() - imeTop);
++            } else {
++                // Where the field sits when not lifted.
++                lift = Math.max(0, contentLoc[1] + morph.getBottom() - imeTop);
++            }
++        }
++        int top = mOverlayTop;
++        int bottom = mOverlayBottom;
++        boolean imeChanged = lift != mImeLift || cover != mImeCover;
++        mImeLift = lift;
++        mImeCover = cover;
++        // The toolbars may also have moved, as the bottom one does over the keyboard.
++        applySheetInsets();
++        positionMorph();
++        if (!imeChanged && top == mOverlayTop && bottom == mOverlayBottom) return;
++        FrameLayout root = mRoot;
++        if (root != null) {
++            root.post(
++                    () -> {
++                        if (mOpen) applyProgress(mProgress);
++                    });
++        }
++    }
++
++    /**
++     * Whether a tab titled {@code title} at {@code url} matches {@code query}: every word of the
++     * query appears in the title or the address, ignoring case.
++     */
++    static boolean matchesSearch(String query, @Nullable String title, @Nullable String url) {
++        String haystackTitle = title == null ? "" : title.toLowerCase(Locale.ROOT);
++        String haystackUrl = url == null ? "" : url.toLowerCase(Locale.ROOT);
++        for (String word : query.toLowerCase(Locale.ROOT).trim().split("\\s+")) {
++            if (word.isEmpty()) continue;
++            if (!haystackTitle.contains(word) && !haystackUrl.contains(word)) return false;
++        }
++        return true;
++    }
++
++    private static String urlOf(Tab tab) {
++        GURL url = tab.getUrl();
++        return url == null ? "" : url.getSpec();
++    }
++
++    String searchQueryForTesting() {
++        return mQuery;
++    }
++
++    int listedTabCountForTesting() {
++        TabAdapter adapter = mAdapter;
++        return adapter == null ? 0 : adapter.getItemCount();
++    }
++
++    /**
++     * The search field's frame over the toolbar. A vertical drag on it moves the sheet, as one on
++     * the handle does; a tap beside the field focuses it.
++     */
++    private final class MorphBar extends FrameLayout {
++        MorphBar(Context context) {
++            super(context);
++        }
++
++        @Override
++        public boolean onInterceptTouchEvent(MotionEvent ev) {
++            onSheetHandleTouch(this, ev);
++            return mSheetHandleDragging;
++        }
++
++        @Override
++        public boolean onTouchEvent(MotionEvent ev) {
++            boolean wasDragging = mSheetHandleDragging;
++            onSheetHandleTouch(this, ev);
++            if (ev.getActionMasked() == MotionEvent.ACTION_UP && !wasDragging) {
++                focusSearchField();
++            }
++            return true;
++        }
++    }
++
+     // Tabs.
+ 
+     private @Nullable TabModel currentModel() {
+@@ -1986,9 +2439,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         TabModel model = currentModel();
+         if (adapter == null || count == null || empty == null || model == null) return;
+         List<Tab> tabs = new ArrayList<>();
++        int total = 0;
+         for (int i = 0; i < model.getCount(); i++) {
+             Tab tab = model.getTabAt(i);
+-            if (tab != null && !tab.isClosing()) tabs.add(tab);
++            if (tab == null || tab.isClosing()) continue;
++            total++;
++            if (mQuery.isEmpty() || matchesSearch(mQuery, tab.getTitle(), urlOf(tab))) {
++                tabs.add(tab);
++            }
+         }
+         @Nullable Tab selected = null;
+         int index = model.index();
+@@ -2021,7 +2479,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 }
+             }
+         }
+-        int n = tabs.size();
++        int n = total;
+         count.setText(
+                 model.isIncognito()
+                         ? mActivity.getResources()
+@@ -2029,7 +2487,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         : mActivity.getResources()
+                                 .getQuantityString(R.plurals.bare_vtabs_count, n, n));
+         updateDomainAndSheetCount(model, selected, n);
+-        empty.setVisibility(n == 0 ? View.VISIBLE : View.GONE);
++        boolean noMatch = tabs.isEmpty() && n > 0 && !mQuery.isEmpty();
++        empty.setText(noMatch ? R.string.bare_vtabs_search_none : R.string.bare_vtabs_empty);
++        empty.setVisibility(tabs.isEmpty() ? View.VISIBLE : View.GONE);
+     }
+ 
+     private void selectTab(Tab tab) {
+@@ -2193,6 +2653,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private boolean startReorder(int adapterPosition) {
++        // A filtered list shows only some of the tabs, so a drop has no clear place among the rest.
++        if (!mQuery.isEmpty()) return false;
+         TabAdapter adapter = mAdapter;
+         TabModel model = currentModel();
+         if (adapter == null || model == null) return false;
+@@ -2445,7 +2907,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+         @Override
+         public boolean isLongPressDragEnabled() {
+-            return true;
++            return mQuery.isEmpty();
+         }
+ 
+         @Override
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 4523466816..ea48da2fd7 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1215,6 +1215,182 @@ public class BareVerticalTabsDrawerUnitTest {
+         mDrawer.destroy();
+     }
+ 
++    private android.widget.EditText searchField() {
++        return (android.widget.EditText) findTag("sheet_search_bar").findViewWithTag(
++                "sheet_search_field");
++    }
++
++    private View searchBar() {
++        return findTag("sheet_search_bar");
++    }
++
++    @Test
++    public void testSearchMatchesEveryWordInTheTitleOrAddressIgnoringCase() {
++        String url = "https://en.wikipedia.org/wiki/Tide";
++        assertTrue(BareVerticalTabsDrawer.matchesSearch("tide", "Tide - Wikipedia", url));
++        assertTrue(BareVerticalTabsDrawer.matchesSearch("WIKI", "Tide - Wikipedia", url));
++        assertTrue(BareVerticalTabsDrawer.matchesSearch("en.wikipedia", "Tide", url));
++        assertTrue(BareVerticalTabsDrawer.matchesSearch(" tide  en.wiki ", "Tide", url));
++        assertFalse(BareVerticalTabsDrawer.matchesSearch("moon", "Tide - Wikipedia", url));
++        assertFalse(BareVerticalTabsDrawer.matchesSearch("tide moon", "Tide - Wikipedia", url));
++        assertTrue(BareVerticalTabsDrawer.matchesSearch("   ", "Tide", url));
++        assertFalse(BareVerticalTabsDrawer.matchesSearch("tide", null, null));
++    }
++
++    @Test
++    public void testTheAddressBarTurnsIntoSearchAsTheSheetOpensAndBackAsItCloses() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        View bar = searchBar();
++        assertEquals(View.VISIBLE, bar.getVisibility());
++        // Fully there from half.
++        assertEquals(1f, bar.getAlpha(), 0.001f);
++        assertEquals(
++                Gravity.BOTTOM,
++                ((FrameLayout.LayoutParams) bar.getLayoutParams()).gravity & Gravity.VERTICAL_GRAVITY_MASK);
++
++        // Pushed most of the way back down, the bar is mostly the address bar again.
++        int range = px(800) - sheetGap();
++        mDrawer.beginToolbarPull();
++        mDrawer.updateToolbarPull(-0.4f * range);
++        assertEquals(0.1f, mDrawer.progressForTesting(), 0.01f);
++        assertEquals(0.2f, bar.getAlpha(), 0.02f);
++
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(View.GONE, bar.getVisibility());
++    }
++
++    @Test
++    public void testWithATopAddressBarTheSearchFieldIsAtTheTop() {
++        setAddressBarOnTop(true);
++        openSheetLaidOut(px(400), px(800));
++        View bar = searchBar();
++        assertEquals(View.VISIBLE, bar.getVisibility());
++        assertEquals(
++                Gravity.TOP,
++                ((FrameLayout.LayoutParams) bar.getLayoutParams()).gravity & Gravity.VERTICAL_GRAVITY_MASK);
++    }
++
++    @Test
++    public void testTheSideDrawerHasNoSearchField() {
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        View bar = searchBar();
++        assertTrue(bar == null || bar.getVisibility() == View.GONE);
++    }
++
++    @Test
++    public void testTypingFiltersTheListAndClearingListsEveryTabAgain() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        assertEquals(2, mDrawer.listedTabCountForTesting());
++
++        searchField().setText("SEC");
++        assertEquals("SEC", mDrawer.searchQueryForTesting());
++        assertEquals(1, mDrawer.listedTabCountForTesting());
++        View clear = findTag("sheet_search_clear");
++        assertEquals(View.VISIBLE, clear.getVisibility());
++
++        searchField().setText("nothing like it");
++        assertEquals(0, mDrawer.listedTabCountForTesting());
++        assertNotNull(button("No matching tabs"));
++
++        clear.performClick();
++        assertEquals("", mDrawer.searchQueryForTesting());
++        assertEquals(2, mDrawer.listedTabCountForTesting());
++        assertEquals(View.GONE, clear.getVisibility());
++    }
++
++    @Test
++    public void testTheSearchFieldDoesNotCloseTheSheetAndTakesItFull() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        assertTrue(searchField().requestFocus());
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++    }
++
++    @Test
++    public void testBackClearsTheSearchFirstAndThenClosesTheSheet() {
++        setAddressBarOnTop(false);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        android.widget.EditText field = searchField();
++        assertTrue(field.requestFocus());
++        field.setText("sec");
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++
++        // While searching the predictive gesture does not shrink the sheet.
++        backDispatcher().dispatchOnBackStarted(backEvent(0f));
++        backDispatcher().dispatchOnBackProgressed(backEvent(0.6f));
++        assertEquals(1f, panel.getScaleX(), 0.001f);
++        backDispatcher().onBackPressed();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals("", field.getText().toString());
++        assertFalse(field.hasFocus());
++        assertEquals(2, mDrawer.listedTabCountForTesting());
++
++        backDispatcher().onBackPressed();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++    }
++
++    @Test
++    public void testClosingTheSheetForgetsTheSearch() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        searchField().setText("sec");
++        assertEquals(1, mDrawer.listedTabCountForTesting());
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertEquals("", searchField().getText().toString());
++        assertEquals(2, mDrawer.listedTabCountForTesting());
++    }
++
++    @Test
++    public void testAFilteredListIsNotReordered() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        when(mModel.indexOf(mFirst)).thenReturn(0);
++        when(mModel.indexOf(mSecond)).thenReturn(1);
++        // Both titles have an s, so both are listed, but only as search results.
++        searchField().setText("s");
++        assertEquals(2, mDrawer.listedTabCountForTesting());
++        mDrawer.moveForTesting(0, 1);
++        verify(mModel, never()).moveTab(anyInt(), anyInt());
++    }
++
++    @Test
++    public void testInGlassOnlyTheSheetsWindowSitsBehindTheKeyboard() {
++        BareVerticalTabsDrawer.setGlassForTesting(true);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        int flags = mDrawer.glassWindowForTesting().getWindow().getAttributes().flags;
++        assertTrue((flags & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) != 0);
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++
++        BareTabsStyle.setStyle(BareTabsStyle.DRAWER);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        flags = mDrawer.glassWindowForTesting().getWindow().getAttributes().flags;
++        assertFalse((flags & WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM) != 0);
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.destroy();
++    }
++
+     private void layoutOverlay(View root, int width, int height) {
+         root.measure(
+                 View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+-- 
+2.34.1
+
