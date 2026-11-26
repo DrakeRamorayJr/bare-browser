@@ -1,0 +1,1651 @@
+From c397c768de6e213305a89c260049e0dbb88b966a Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:31:07 +0000
+Subject: [PATCH] Make the address bar the tab sheet's top, and search tabs
+ from the row.
+
+In Sheet mode the address bar now shrinks into a 32dp origin pill that rides
+the sheet's top edge as it rises, in one motion driven by the sheet's
+progress, and grows back into the bar as it closes. The bar cross-fades out
+as the pill fades in, so the two never show at once. A pull from the bar
+keeps the bar alive to touch until the finger lifts, so the sheet always
+settles. Tapping the pill closes the sheet and focuses the omnibox. Sideways
+tab swipes on the bar are off while the sheet is open.
+
+The overlay Search tabs field is gone. A magnifier at the end of the "N tabs"
+row grows, in place, into a rounded search field across that row; the sheet
+goes full and the list filters live. Back hides the keyboard, then clears
+the search, then closes the sheet; with no keyboard up, the first Back
+clears. Back also works while the field has made the glass window focusable.
+
+With a top address bar the pill shrinks in place in the bar's row and the
+sheet drops below it. The side drawer is unchanged.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ .../bare/BareTabSheetToolbarSwipe.java        |  23 +-
+ .../browser/bare/BareVerticalTabsDrawer.java  | 865 +++++++++++++-----
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 202 +++-
+ 3 files changed, 826 insertions(+), 264 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+index 15dfbfacde..2a87c79b16 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+@@ -16,7 +16,8 @@ import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.Sw
+  *
+  * <p>It wraps the toolbar's own swipe handler instead of listening to touches itself. The
+  * toolbar's gesture listener already settles a drag's direction once, when the finger has moved
+- * far enough: a sideways drag goes on to switch tabs as before and never reaches the sheet, and a
++ * far enough: a sideways drag goes on to switch tabs as before and never reaches the sheet,
++ * except while the sheet is open, when a sideways drag is ignored. A
+  * drag that started vertical stays with the sheet even if it later drifts sideways. Taps and long
+  * presses never become a swipe, so they reach the address bar and its buttons untouched.
+  *
+@@ -50,6 +51,7 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+     private final @Nullable SwipeHandler mDelegate;
+     private final Sheet mSheet;
+     private boolean mPulling;
++    private boolean mSwallow;
+     private boolean mDownward;
+     private float mFlingVelocityY;
+ 
+@@ -64,8 +66,16 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+         return mSheet.opensDownward() ? ScrollDirection.DOWN : ScrollDirection.UP;
+     }
+ 
++    private static boolean isTabSwitch(@ScrollDirection int direction) {
++        return direction == ScrollDirection.LEFT || direction == ScrollDirection.RIGHT;
++    }
++
+     @Override
+     public boolean isSwipeEnabled(@ScrollDirection int direction, MotionEvent triggerEvent) {
++        // The sheet owns the bar while it is open. A sideways drag must not change tabs.
++        if (isTabSwitch(direction) && BareVerticalTabsDrawer.suppressesAddressBarTabSwipe()) {
++            return false;
++        }
+         if (direction != ScrollDirection.UNKNOWN && direction == pullDirection()) return true;
+         return mDelegate != null && mDelegate.isSwipeEnabled(direction, triggerEvent);
+     }
+@@ -73,7 +83,12 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+     @Override
+     public void onSwipeStarted(@ScrollDirection int direction, MotionEvent triggerEvent) {
+         mPulling = false;
++        mSwallow = false;
+         mFlingVelocityY = 0f;
++        if (isTabSwitch(direction) && BareVerticalTabsDrawer.suppressesAddressBarTabSwipe()) {
++            mSwallow = true;
++            return;
++        }
+         if (direction != ScrollDirection.UNKNOWN && direction == pullDirection()) {
+             mPulling = true;
+             mDownward = direction == ScrollDirection.DOWN;
+@@ -86,6 +101,7 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+     @Override
+     public void onSwipeUpdated(
+             MotionEvent current, float tx, float ty, float distanceX, float distanceY) {
++        if (mSwallow) return;
+         if (mPulling) {
+             mSheet.updateToolbarPull(mDownward ? ty : -ty);
+             return;
+@@ -101,6 +117,7 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+             float ty,
+             float velocityX,
+             float velocityY) {
++        if (mSwallow) return;
+         if (mPulling) {
+             mFlingVelocityY = velocityY;
+             return;
+@@ -112,6 +129,10 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+ 
+     @Override
+     public void onSwipeFinished() {
++        if (mSwallow) {
++            mSwallow = false;
++            return;
++        }
+         if (mPulling) {
+             mPulling = false;
+             float velocity = mFlingVelocityY;
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 8c2ba3b42e..c5b3e7de0f 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -51,6 +51,8 @@ import android.widget.LinearLayout;
+ import android.widget.PopupMenu;
+ import android.graphics.Matrix;
+ import android.graphics.Outline;
++import android.transition.AutoTransition;
++import android.transition.TransitionManager;
+ import android.util.Size;
+ import android.widget.TextView;
+ 
+@@ -94,6 +96,7 @@ import org.chromium.chrome.browser.tabmodel.TabModel;
+ import org.chromium.chrome.browser.tabmodel.TabModelObserver;
+ import org.chromium.chrome.browser.tabmodel.TabModelSelector;
+ import org.chromium.components.embedder_support.util.UrlUtilities;
++import org.chromium.components.omnibox.OmniboxFocusReason;
+ import org.chromium.url.GURL;
+ 
+ import java.util.ArrayList;
+@@ -114,8 +117,9 @@ import java.util.function.Supplier;
+  * drops down from below the address bar, mirrored. A vertical drag on the address bar, away from
+  * it, also pulls the sheet out with the finger (see {@link BareTabSheetToolbarSwipe}). Back closes
+  * the sheet, shrinking it with the predictive back gesture. On a wide screen the sheet is capped
+- * in width and centered. As the sheet opens, the address bar turns into a Search tabs field that
+- * filters the list by title and address; the real address bar is left untouched underneath, and
++ * in width and centered. As the sheet opens, the address bar shrinks into a small origin pill
++ * that rides the sheet's top edge and is the drag handle. Search lives on the bottom action row,
++ * not in the address bar. The address bar's own text is hidden while the pill is showing and
+  * comes back as it was when the sheet closes. It is a view over
+  * the browser's own tab model: selecting, closing, adding and closing all go through the same
+  * operations the tab overview uses. It keeps no tabs of its own.
+@@ -141,6 +145,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final float BACK_SHRINK_Y_DP = 24f;
+     private static final long BACK_CANCEL_MS = 150;
+     private static final float HANDLE_TOUCH_DP = 48f;
++    private static final float PILL_HEIGHT_DP = 32f;
++    private static final float PILL_MIN_WIDTH_DP = 96f;
++    private static final float PILL_MAX_WIDTH_DP = 280f;
++    /** The real bar is gone by this fraction of the shrink, so its text never sits under the pill. */
++    private static final float TOOLBAR_FADE_SHRINK = 0.35f;
++
++    /** Address-bar tab swipes are off while a sheet is on screen. The side drawer leaves them. */
++    private static boolean sSuppressAddressBarTabSwipe;
+     // Below this window height, such as a phone on its side, half a sheet leaves no room for a
+     // single card, so the sheet has no half stop (Material's skip-collapsed).
+     private static final int SHORT_WINDOW_DP = 440;
+@@ -176,6 +188,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private @Nullable TextView mSheetCount;
+     private @Nullable ImageButton mSheetList;
+     private @Nullable ImageButton mSheetGrid;
++    private @Nullable ImageButton mSheetNew;
++    private @Nullable ImageButton mSheetCloseAll;
++    private @Nullable ImageButton mSheetSearch;
+     private @Nullable TabAdapter mAdapter;
+     private @Nullable OnBackPressedCallback mBackCallback;
+     private @Nullable ValueAnimator mAnimator;
+@@ -193,21 +208,34 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private final ViewTreeObserver.OnGlobalFocusChangeListener mFocusListener =
+             (oldFocus, newFocus) -> onFocusMoved(newFocus);
+     private @Nullable ViewTreeObserver mFocusObserver;
+-    // While the sheet is open, follows the keyboard: it moves the search field and the sheet
+-    // above it.
++    // While the sheet is open, follows the keyboard so it does not cover the sheet or the field.
+     private final ViewTreeObserver.OnGlobalLayoutListener mLayoutListener = this::onWindowLayout;
+-    // The address bar's stand-in while the sheet is open: a Search tabs field laid over the
+-    // toolbar, faded in with the sheet. The real address bar underneath is never changed.
+-    private @Nullable MorphBar mMorph;
+-    private @Nullable LinearLayout mSearchPill;
++    // The address bar, shrunk to a 32dp origin pill. It rides the sheet's top edge and is the
++    // drag handle. Gone when the sheet is closed, so the real address bar is itself again.
++    private @Nullable LinearLayout mOriginPill;
++    private @Nullable ImageView mPillLock;
++    private @Nullable ImageView mPillIcon;
++    private @Nullable TextView mPillOrigin;
+     private @Nullable EditText mSearchField;
+     private @Nullable View mSearchClear;
+-    private @Nullable View mSearchIcon;
+     // Takes focus from the field, as the address bar's own focus thief does, so clearing the
+     // search does not hand focus to another text field.
+     private @Nullable View mSearchThief;
+     // What the list is filtered by, trimmed. Empty lists every tab.
+     private String mQuery = "";
++    // The action row is showing the search field instead of the count and the tools.
++    /**
++     * With a top bar, the browser draws that bar from its compositor too, so hiding its view does
++     * not clear the row. This plain cover, in the sheet's colour, fills the row under the pill.
++     */
++    private @Nullable View mTopSlotCover;
++
++    /** True while the address bar is carrying a pull, so it must stay visible to touch. */
++    private boolean mToolbarPulling;
++
++    private boolean mSearchExpanded;
++    // How many times a pill tap has asked the omnibox to take focus.
++    private int mOmniboxFocusRequests;
+     // How far the keyboard lifts the bottom search field, and the sheet with it; and how much of
+     // a sheet dropped from the top it would otherwise cover.
+     private int mImeLift;
+@@ -344,6 +372,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         sGlassForTesting = glass;
+     }
+ 
++    /** Whether a sideways drag on the address bar must not switch tabs. */
++    static boolean suppressesAddressBarTabSwipe() {
++        return sSuppressAddressBarTabSwipe;
++    }
++
++    int omniboxFocusRequestsForTesting() {
++        return mOmniboxFocusRequests;
++    }
++
+     @Nullable Dialog glassWindowForTesting() {
+         return mGlassWindow;
+     }
+@@ -395,7 +432,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         hostRoot(root, glassWanted());
+         applySheetInsets();
+         applySheetBackground();
+-        positionMorph();
+         root.setVisibility(View.VISIBLE);
+         root.requestApplyInsets();
+         // The toolbars may not have been laid out on the first pass, so re-measure after.
+@@ -404,7 +440,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     applySheetInsets();
+                     applySheetBackground();
+                     applyChromeInsets();
+-                    positionMorph();
+                     applyProgress(mProgress);
+                 });
+         if (mBackCallback != null) mBackCallback.setEnabled(true);
+@@ -465,13 +500,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (root != null && root.getParent() instanceof ViewGroup parent) {
+             parent.removeView(root);
+         }
+-        MorphBar morph = mMorph;
+-        if (morph != null && morph.getParent() instanceof ViewGroup parent) {
+-            parent.removeView(morph);
++        View cover = mTopSlotCover;
++        if (cover != null && cover.getParent() instanceof ViewGroup coverParent) {
++            coverParent.removeView(cover);
++        }
++        // With a top bar the pill is hosted by the activity content; take it out too.
++        LinearLayout pill = mOriginPill;
++        if (pill != null && pill.getParent() instanceof ViewGroup pillParent) {
++            pillParent.removeView(pill);
+         }
++        sSuppressAddressBarTabSwipe = false;
++        fadeToolbarChrome(0f);
+         applyProgress(0f);
+         mRoot = null;
+-        mMorph = null;
++        mOriginPill = null;
+     }
+ 
+     private void watchFocus(boolean watch) {
+@@ -493,10 +535,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             return;
+         }
+         FrameLayout root = mRoot;
+-        View morph = mMorph;
+-        // The sheet's own Search tabs field, over the address bar, is part of the sheet.
++        View field = mSearchField;
++        // The in-row search field is part of the sheet, even if a glass window holds it.
+         for (View view = focused; view != null; ) {
+-            if (view == root || view == morph) return;
++            if (view == root || view == field) return;
+             view = view.getParent() instanceof View parent ? parent : null;
+         }
+         close();
+@@ -543,6 +585,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         super.onSizeChanged(w, h, oldw, oldh);
+                         applySheetInsets();
+                         sizePanel(w);
++                        layoutOriginPill();
+                         // Turned on its side at half, the sheet goes full: the window is now
+                         // too short for a half stop. Done after this layout pass.
+                         if (mOpen
+@@ -561,6 +604,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 };
+         root.setVisibility(View.GONE);
+         root.setClickable(true);
++        // The top-bar pill sits just above the overlay, in the address bar's own slot.
++        root.setClipChildren(false);
+ 
+         View scrim = new View(mActivity);
+         scrim.setBackgroundColor(SCRIM_COLOR);
+@@ -619,6 +664,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 handleRow,
+                 new LinearLayout.LayoutParams(
+                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        buildOriginPill(handleRow);
+ 
+         // Header: the wordmark and a close button. Fixed.
+         LinearLayout header = new LinearLayout(mActivity);
+@@ -790,6 +836,17 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         sheetActions.addView(sheetGrid, new LinearLayout.LayoutParams(dp(40), dp(40)));
+         sheetActions.addView(sheetNew, new LinearLayout.LayoutParams(dp(40), dp(40)));
+         sheetActions.addView(sheetCloseAll, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        ImageButton sheetSearch =
++                sheetActionButton(
++                        R.drawable.ic_search_24dp,
++                        R.string.bare_vtabs_search_tabs,
++                        "sheet_search",
++                        v -> {
++                            ActionHaptics.tick(v);
++                            expandSearch();
++                        });
++        sheetActions.addView(sheetSearch, new LinearLayout.LayoutParams(dp(40), dp(40)));
++        buildActionRowSearch(sheetActions);
+         panel.addView(
+                 sheetActions,
+                 new LinearLayout.LayoutParams(
+@@ -836,12 +893,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 new FrameLayout.LayoutParams(
+                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+         mGlass = false;
+-        MorphBar morph = buildSearchBar();
+-        content.addView(
+-                morph,
+-                new FrameLayout.LayoutParams(
+-                        ViewGroup.LayoutParams.MATCH_PARENT, dp(56), Gravity.BOTTOM));
+-        mMorph = morph;
+ 
+         if (mActivity instanceof ComponentActivity componentActivity) {
+             mBackCallback =
+@@ -863,7 +914,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+                         @Override
+                         public void handleOnBackPressed() {
+-                            // A search is cleared first; the next Back closes the sheet.
++                            // 1) hide the keyboard, 2) clear and collapse the field, 3) close.
++                            // The system takes the first Back to hide a soft keyboard. A field
++                            // that still has focus with no keyboard (hidden, or a hardware
++                            // keyboard) goes straight to clearing, so it is never a dead press.
++                            if (searchFieldFocused() && searchImeVisible()) {
++                                dropSearchFocus();
++                                return;
++                            }
+                             if (searching()) {
+                                 clearSearch();
+                                 return;
+@@ -888,6 +946,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mSheetCount = sheetCount;
+         mSheetList = sheetList;
+         mSheetGrid = sheetGrid;
++        mSheetNew = sheetNew;
++        mSheetCloseAll = sheetCloseAll;
++        mSheetSearch = sheetSearch;
+         mAdapter = adapter;
+         applyChrome();
+         sizePanel(root.getWidth() > 0 ? root.getWidth() : mActivity.getResources().getDisplayMetrics().widthPixels);
+@@ -1172,7 +1233,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void applyChrome() {
+         boolean sheet = isSheetChrome();
+         if (mHandleRow != null) mHandleRow.setVisibility(sheet ? View.VISIBLE : View.GONE);
+-        if (mDomain != null) mDomain.setVisibility(sheet ? View.VISIBLE : View.GONE);
++        // The origin pill is the handle. The old grip and the domain line stay out of the way.
++        View grip = mHandleRow != null ? mHandleRow.findViewWithTag("sheet_handle") : null;
++        if (grip != null) grip.setVisibility(View.GONE);
++        if (mDomain != null) mDomain.setVisibility(View.GONE);
+         if (mSheetActions != null) mSheetActions.setVisibility(sheet ? View.VISIBLE : View.GONE);
+         if (mHeader != null) mHeader.setVisibility(sheet ? View.GONE : View.VISIBLE);
+         if (mCount != null) mCount.setVisibility(sheet ? View.GONE : View.VISIBLE);
+@@ -1224,6 +1288,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             // The small gap a full sheet leaves at its far end is inside the overlay (see
+             // sheetRangeHeight), so the scrim dims it too.
+             if (top <= 0) top = mTopInset;
++            // A top bar that has shrunk into the pill keeps its slot: the pill sits there.
++            if (sheetFromTop()) top = Math.max(top, topAddressBarSlotBottom());
+             if (bottom <= 0 && sheetFromTop()) bottom = mBottomInset;
+             // With the keyboard up, the sheet ends above it: on the address bar, which the
+             // browser lifts over the keyboard, or on the lifted search field, when rising; at
+@@ -1231,7 +1297,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             if (sheetFromTop()) {
+                 bottom = Math.max(bottom, mImeCover);
+             } else {
+-                bottom = Math.max(bottom, bottomAddressBarInset()) + mImeLift;
++                // As the address bar fades into the pill, the sheet occupies that row
++                // and sits on the five-button bar. The button bar itself stays put.
++                float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++                float fade =
++                        shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
++                int address = addressBarSlotInset();
++                int buttons = bottomButtonsInset();
++                int slot = Math.round(address + (buttons - address) * fade);
++                bottom = Math.max(buttons, slot) + mImeLift;
+             }
+         }
+         mOverlayTop = top;
+@@ -1298,15 +1372,58 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * at, and the sheet still ends on it.
+      */
+     private int bottomAddressBarInset() {
++        return slotInsetFromTop(R.id.control_container, /*goneCounts=*/false);
++    }
++
++    /**
++     * How far the top of the address-bar row is above the content's bottom, even when that
++     * row has been hidden as it becomes the pill, so the sheet can take its slot.
++     */
++    private int addressBarSlotInset() {
++        return slotInsetFromTop(R.id.control_container, /*goneCounts=*/true);
++    }
++
++    /**
++     * With the address bar on top, how far the bottom of its row is below the content's top,
++     * even after it has been hidden as it became the pill. 0 when the bar is not on top.
++     */
++    private int topAddressBarSlotBottom() {
+         View content = mActivity.findViewById(android.R.id.content);
+         View bar = mActivity.findViewById(R.id.control_container);
+-        if (content == null
+-                || bar == null
+-                || bar.getVisibility() != View.VISIBLE
+-                || bar.getHeight() <= 0
+-                || content.getHeight() <= 0) {
++        if (content == null || bar == null || bar.getHeight() <= 0 || content.getHeight() <= 0) {
++            return 0;
++        }
++        if (bar.getVisibility() == View.GONE || isInside(bar, mRoot)) return 0;
++        int[] contentLoc = new int[2];
++        int[] barLoc = new int[2];
++        content.getLocationOnScreen(contentLoc);
++        bar.getLocationOnScreen(barLoc);
++        int bottom = barLoc[1] + bar.getHeight() - contentLoc[1];
++        return bottom > 0 && bottom < content.getHeight() / 3 ? bottom : 0;
++    }
++
++    /** How far the five-button bar (not the address bar) is above the content's bottom. */
++    private int bottomButtonsInset() {
++        int buttons = slotInsetFromTop(
++                org.chromium.chrome.browser.ui.bottombar.R.id.bottom_bar_container,
++                /*goneCounts=*/false);
++        if (buttons > 0) return buttons;
++        return mBottomInset;
++    }
++
++    /**
++     * Distance from the top of {@code id} to the bottom of the activity content. When
++     * {@code goneCounts} is set, an invisible (but still laid out) view is measured too,
++     * so a faded address bar still contributes its slot until the sheet covers it.
++     */
++    private int slotInsetFromTop(int id, boolean goneCounts) {
++        View content = mActivity.findViewById(android.R.id.content);
++        View bar = mActivity.findViewById(id);
++        if (content == null || bar == null || bar.getHeight() <= 0 || content.getHeight() <= 0) {
+             return 0;
+         }
++        if (bar.getVisibility() == View.GONE) return 0;
++        if (!goneCounts && bar.getVisibility() != View.VISIBLE) return 0;
+         int[] contentLoc = new int[2];
+         content.getLocationOnScreen(contentLoc);
+         int[] barLoc = new int[2];
+@@ -1368,22 +1485,21 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void updateDomainAndSheetCount(TabModel model, @Nullable Tab selected, int n) {
++        String label = "";
++        if (selected != null
++                && selected.getUrl() != null
++                && !UrlUtilities.isNtpUrl(selected.getUrl())
++                && !TextUtils.isEmpty(selected.getUrl().getSpec())) {
++            String host = selected.getUrl().getHost();
++            label = TextUtils.isEmpty(host) ? selected.getUrl().getSpec() : host;
++        }
+         TextView domain = mDomain;
+         if (domain != null) {
+-            String label = "";
+-            if (selected != null
+-                    && selected.getUrl() != null
+-                    && !UrlUtilities.isNtpUrl(selected.getUrl())
+-                    && !TextUtils.isEmpty(selected.getUrl().getSpec())) {
+-                String host = selected.getUrl().getHost();
+-                label = TextUtils.isEmpty(host) ? selected.getUrl().getSpec() : host;
+-            }
+             domain.setText(label);
+-            domain.setVisibility(
+-                    isSheetChrome()
+-                            ? (label.isEmpty() ? View.INVISIBLE : View.VISIBLE)
+-                            : View.GONE);
++            domain.setVisibility(View.GONE);
+         }
++        if (mPillOrigin != null) mPillOrigin.setText(label);
++        bindPillIcons(selected);
+         TextView sheetCount = mSheetCount;
+         if (sheetCount != null) {
+             boolean incognito = model.isIncognito();
+@@ -1476,7 +1592,22 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         Dialog window = mGlassWindow;
+         if (window == null) {
+-            window = new Dialog(mActivity, android.R.style.Theme_Translucent_NoTitleBar);
++            // While the search field has made this window focusable, Back reaches the dialog,
++            // not the activity (as a key, or as the dialog's own back callback when predictive
++            // back is on). Both end in onBackPressed: run the sheet's three-step Back there
++            // instead of letting the dialog cancel itself.
++            window =
++                    new Dialog(mActivity, android.R.style.Theme_Translucent_NoTitleBar) {
++                        @Override
++                        public void onBackPressed() {
++                            OnBackPressedCallback back = mBackCallback;
++                            if (back != null) {
++                                back.handleOnBackPressed();
++                            } else {
++                                close();
++                            }
++                        }
++                    };
+             window.setContentView(
+                     root,
+                     new ViewGroup.LayoutParams(
+@@ -1619,7 +1750,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** 0 is closed and 1 is open. Drives the scrim, the panel and the shift of the page. */
+     private void applyProgress(float progress) {
+         mProgress = Math.max(0f, Math.min(1f, progress));
+-        updateMorph();
++        layoutOriginPill();
+         View scrim = mScrim;
+         Panel panel = mPanel;
+         if (scrim != null) {
+@@ -2023,6 +2154,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     @Override
+     public void beginToolbarPull() {
++        mToolbarPulling = true;
+         if (mAnimator != null) mAnimator.cancel();
+         if (!mOpen) {
+             // A close cut short by this drag never let go of the tab model; let go now, so
+@@ -2042,51 +2174,376 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     @Override
+     public void endToolbarPull(float velocityY) {
++        mToolbarPulling = false;
+         if (!mOpen) return;
++        layoutOriginPill();
+         finishSheetDrag(velocityY);
+     }
+ 
+-    // Search tabs: the address bar's morph.
+-
+-    /**
+-     * Builds the Search tabs field that stands in for the address bar while the sheet is open. It
+-     * is laid over the toolbar, in the activity's own window (also in glass, whose window stops at
+-     * the toolbars), so it can take the keyboard. The address bar underneath is not changed.
+-     */
+-    private MorphBar buildSearchBar() {
+-        MorphBar morph = new MorphBar(mActivity);
+-        morph.setTag("sheet_search_bar");
+-        morph.setVisibility(View.GONE);
+-        morph.setClickable(true);
+-        // Only swallows touches over the toolbar; its field and button speak for themselves.
+-        morph.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+-        morph.setBackgroundColor(color(0xFF1C1A20, 0xFFF1EDF6));
++    // Origin pill and in-row search.
+ 
++    /** The 32dp origin pill that the address bar shrinks into. It starts on the handle row. */
++    private void buildOriginPill(LinearLayout handleRow) {
+         LinearLayout pill = new LinearLayout(mActivity);
+-        pill.setTag("sheet_search_pill");
++        pill.setTag("sheet_origin_pill");
+         pill.setOrientation(LinearLayout.HORIZONTAL);
+         pill.setGravity(Gravity.CENTER_VERTICAL);
+-        pill.setPaddingRelative(dp(14), 0, dp(4), 0);
+-        GradientDrawable pillShape = new GradientDrawable();
+-        pillShape.setCornerRadius(dp(24));
+-        pillShape.setColor(color(0xFF2B2930, 0xFFE6E0EC));
+-        pill.setBackground(pillShape);
++        pill.setPaddingRelative(dp(10), 0, dp(12), 0);
++        pill.setVisibility(View.GONE);
++        pill.setClickable(true);
++        pill.setFocusable(false);
++        pill.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        GradientDrawable shape = new GradientDrawable();
++        shape.setColor(color(0xFF2B2930, 0xFFE8EAED));
++        shape.setCornerRadius(dp(PILL_HEIGHT_DP) / 2f);
++        pill.setBackground(shape);
++        pill.setClipToOutline(true);
++        pill.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
++
++        ImageView lock = new ImageView(mActivity);
++        lock.setTag("sheet_pill_lock");
++        lock.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
++        lock.setColorFilter(color(0xFFCAC4D0, 0xFF49454F));
++        lock.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        lock.setVisibility(View.GONE);
++        int lockId =
++                mActivity.getResources()
++                        .getIdentifier(
++                                "omnibox_https_valid_page_info",
++                                "drawable",
++                                mActivity.getPackageName());
++        if (lockId != 0) lock.setImageResource(lockId);
++        pill.addView(lock, new LinearLayout.LayoutParams(dp(16), dp(16)));
+ 
+         ImageView icon = new ImageView(mActivity);
+-        icon.setImageResource(R.drawable.ic_search_24dp);
+-        icon.setColorFilter(color(0xFFCAC4D0, 0xFF49454F));
++        icon.setTag("sheet_pill_icon");
++        icon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+         icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+-        pill.addView(icon, new LinearLayout.LayoutParams(dp(22), dp(22)));
++        icon.setVisibility(View.GONE);
++        LinearLayout.LayoutParams iconParams = new LinearLayout.LayoutParams(dp(16), dp(16));
++        iconParams.setMarginStart(dp(4));
++        pill.addView(icon, iconParams);
++
++        TextView origin = new TextView(mActivity);
++        origin.setTag("sheet_pill_origin");
++        origin.setTextColor(color(0xFFE6E1E5, 0xFF1C1B1F));
++        origin.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
++        origin.setSingleLine(true);
++        origin.setEllipsize(TextUtils.TruncateAt.END);
++        origin.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        LinearLayout.LayoutParams textParams =
++                new LinearLayout.LayoutParams(
++                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        textParams.setMarginStart(dp(6));
++        pill.addView(origin, textParams);
++
++        pill.setOnClickListener(v -> closeAndFocusOmnibox());
++        pill.setOnTouchListener(this::onOriginPillTouch);
++
++        mOriginPill = pill;
++        mPillLock = lock;
++        mPillIcon = icon;
++        mPillOrigin = origin;
++        LinearLayout.LayoutParams params =
++                new LinearLayout.LayoutParams(dp(PILL_MIN_WIDTH_DP), dp(PILL_HEIGHT_DP));
++        params.gravity = Gravity.CENTER_HORIZONTAL;
++        handleRow.addView(pill, 0, params);
++    }
++
++    /** Lock and favicon for the current tab. The host itself is set with the domain label. */
++    private void bindPillIcons(@Nullable Tab selected) {
++        ImageView icon = mPillIcon;
++        ImageView lock = mPillLock;
++        GURL url = selected == null ? null : selected.getUrl();
++        boolean ntp = url != null && UrlUtilities.isNtpUrl(url);
++        if (icon != null) {
++            Bitmap favicon = selected == null || ntp ? null : TabFavicon.getBitmap(selected);
++            if (favicon != null) {
++                icon.setImageBitmap(favicon);
++                icon.setVisibility(View.VISIBLE);
++            } else {
++                icon.setImageDrawable(null);
++                icon.setVisibility(View.GONE);
++            }
++        }
++        if (lock != null) {
++            String scheme = url == null ? "" : url.getScheme();
++            boolean secure = "https".equalsIgnoreCase(scheme) && lock.getDrawable() != null;
++            lock.setVisibility(secure ? View.VISIBLE : View.GONE);
++        }
++    }
++
++    /**
++     * Bottom sheets keep the pill in the handle row, so it rides the sheet's top edge. A top
++     * address bar shrinks in place: the pill stays at the top of the overlay and the sheet stays
++     * below it.
++     */
++    private void placePillParent() {
++        LinearLayout pill = mOriginPill;
++        if (pill == null) return;
++        // A top bar shrinks in place. Its slot is outside the sheet (and outside the glass
++        // window), so the pill is hosted by the activity content, over the hidden bar.
++        View wantView =
++                isSheetChrome() && sheetFromTop()
++                        ? mActivity.findViewById(android.R.id.content)
++                        : mHandleRow;
++        if (!(wantView instanceof ViewGroup want) || pill.getParent() == want) return;
++        if (pill.getParent() instanceof ViewGroup parent) parent.removeView(pill);
++        if (want instanceof FrameLayout) {
++            pill.setElevation(dp(20));
++            want.addView(
++                    pill,
++                    new FrameLayout.LayoutParams(
++                            dp(PILL_MIN_WIDTH_DP),
++                            dp(PILL_HEIGHT_DP),
++                            Gravity.TOP | Gravity.CENTER_HORIZONTAL));
++        } else {
++            pill.setElevation(0f);
++            LinearLayout.LayoutParams params =
++                    new LinearLayout.LayoutParams(dp(PILL_MIN_WIDTH_DP), dp(PILL_HEIGHT_DP));
++            params.gravity = Gravity.CENTER_HORIZONTAL;
++            want.addView(pill, 0, params);
++        }
++    }
++
++    /** Content width of the settled pill: host, plus lock and favicon, clamped to 96–280dp. */
++    private int pillWidth() {
++        TextView origin = mPillOrigin;
++        int text = dp(48);
++        if (origin != null) {
++            CharSequence shown = origin.getText();
++            text = Math.round(origin.getPaint().measureText(shown == null ? "" : shown.toString()));
++        }
++        int icons = 0;
++        if (mPillLock != null && mPillLock.getVisibility() == View.VISIBLE) icons += dp(20);
++        if (mPillIcon != null && mPillIcon.getVisibility() == View.VISIBLE) icons += dp(20);
++        int width = text + icons + dp(28);
++        int min = dp(PILL_MIN_WIDTH_DP);
++        int max = dp(PILL_MAX_WIDTH_DP);
++        if (width < min) width = min;
++        if (width > max) width = max;
++        return width;
++    }
++
++    /**
++     * Sizes the pill from the address bar toward 32dp as the sheet opens, and parks it. At progress
++     * 0 the real bar is untouched and the pill is gone. Side buttons fade with the shrink.
++     */
++    private void layoutOriginPill() {
++        sSuppressAddressBarTabSwipe = isSheetChrome() && (mOpen || mProgress > 0.001f);
++        LinearLayout pill = mOriginPill;
++        FrameLayout root = mRoot;
++        if (pill == null) return;
++        placePillParent();
++        boolean show =
++                isSheetChrome()
++                        && mProgress > 0.001f
++                        && root != null
++                        && root.getVisibility() == View.VISIBLE;
++        if (!show || !sheetFromTop()) hideTopSlotCover();
++        if (!show) {
++            if (pill.getVisibility() != View.GONE) pill.setVisibility(View.GONE);
++            fadeToolbarChrome(0f);
++            applySheetInsets();
++            return;
++        }
++        float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
++        int startH = dp(56);
++        int startW = root.getWidth() > 0 ? root.getWidth() : dp(PILL_MAX_WIDTH_DP);
++        View location = mActivity.findViewById(R.id.location_bar);
++        if (location != null && !isInside(location, root)) {
++            if (location.getHeight() > 0) startH = location.getHeight();
++            if (location.getWidth() > 0) startW = location.getWidth();
++        }
++        int endH = dp(PILL_HEIGHT_DP);
++        int endW = pillWidth();
++        int height = Math.max(1, Math.round(startH + (endH - startH) * shrink));
++        int width = Math.max(1, Math.round(startW + (endW - startW) * shrink));
++        if (pill.getBackground() instanceof GradientDrawable background) {
++            background.setCornerRadius(height / 2f);
++        }
++        pill.setVisibility(View.VISIBLE);
++        if (sheetFromTop()) {
++            FrameLayout.LayoutParams params =
++                    pill.getLayoutParams() instanceof FrameLayout.LayoutParams existing
++                            ? existing
++                            : new FrameLayout.LayoutParams(width, height);
++            // The pill shrinks in place, centred on the top bar's row. The sheet hangs below it.
++            int centre = topAddressBarCentre();
++            int topMargin = Math.max(0, centre - height / 2);
++            if (params.width != width
++                    || params.height != height
++                    || params.topMargin != topMargin
++                    || params.gravity != (Gravity.TOP | Gravity.CENTER_HORIZONTAL)) {
++                params.width = width;
++                params.height = height;
++                params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
++                params.topMargin = topMargin;
++                params.leftMargin = 0;
++                params.rightMargin = 0;
++                pill.setLayoutParams(params);
++            }
++            layoutTopSlotCover(pill, Math.min(1f, shrink / TOOLBAR_FADE_SHRINK));
++        } else if (pill.getLayoutParams() instanceof LinearLayout.LayoutParams params) {
++            if (params.width != width || params.height != height || params.topMargin != 0) {
++                params.width = width;
++                params.height = height;
++                params.gravity = Gravity.CENTER_HORIZONTAL;
++                params.topMargin = 0;
++                pill.setLayoutParams(params);
++            }
++        }
++        fadeToolbarChrome(shrink);
++        // Cross-fade: the pill comes in exactly as the bar goes, so the two never show at once.
++        float pillAlpha = Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
++        if (pill.getAlpha() != pillAlpha) pill.setAlpha(pillAlpha);
++        applySheetInsets();
++    }
+ 
++    /** Fills the top bar's row, just under the pill, fading in as the bar fades out. */
++    private void layoutTopSlotCover(View pill, float alpha) {
++        if (!(pill.getParent() instanceof ViewGroup host)) return;
++        int slotBottom = topAddressBarSlotBottom();
++        int slotTop = mTopInset;
++        View location = mActivity.findViewById(R.id.control_container);
++        View content = mActivity.findViewById(android.R.id.content);
++        if (location != null && content != null && location.getHeight() > 0) {
++            int[] c = new int[2];
++            int[] l = new int[2];
++            content.getLocationOnScreen(c);
++            location.getLocationOnScreen(l);
++            slotTop = Math.max(0, l[1] - c[1]);
++        }
++        if (slotBottom <= slotTop) {
++            hideTopSlotCover();
++            return;
++        }
++        View cover = mTopSlotCover;
++        if (cover == null) {
++            cover = new View(mActivity);
++            cover.setTag("sheet_top_slot_cover");
++            cover.setClickable(true);
++            cover.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++            mTopSlotCover = cover;
++        }
++        cover.setBackgroundColor(color(0xFF1B1B1E, 0xFFF4F4F7));
++        if (cover.getParent() != host) {
++            if (cover.getParent() instanceof ViewGroup old) old.removeView(cover);
++            host.addView(cover, host.indexOfChild(pill));
++        }
++        cover.setElevation(pill.getElevation());
++        FrameLayout.LayoutParams params =
++                cover.getLayoutParams() instanceof FrameLayout.LayoutParams existing
++                        ? existing
++                        : new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1);
++        int height = slotBottom - slotTop;
++        if (params.height != height || params.topMargin != slotTop) {
++            params.width = ViewGroup.LayoutParams.MATCH_PARENT;
++            params.height = height;
++            params.gravity = Gravity.TOP;
++            params.topMargin = slotTop;
++            cover.setLayoutParams(params);
++        }
++        cover.setAlpha(alpha);
++        if (cover.getVisibility() != View.VISIBLE) cover.setVisibility(View.VISIBLE);
++    }
++
++    private void hideTopSlotCover() {
++        View cover = mTopSlotCover;
++        if (cover != null && cover.getVisibility() != View.GONE) cover.setVisibility(View.GONE);
++    }
++
++    /** Middle of the top address bar's row, from the content's top. */
++    private int topAddressBarCentre() {
++        View content = mActivity.findViewById(android.R.id.content);
++        View location = mActivity.findViewById(R.id.location_bar);
++        if (content != null && location != null && location.getHeight() > 0
++                && !isInside(location, mRoot)) {
++            int[] contentLoc = new int[2];
++            int[] loc = new int[2];
++            content.getLocationOnScreen(contentLoc);
++            location.getLocationOnScreen(loc);
++            return loc[1] - contentLoc[1] + location.getHeight() / 2;
++        }
++        int slot = topAddressBarSlotBottom();
++        return slot > 0 ? Math.max(mTopInset, slot - dp(28)) : mTopInset + dp(28);
++    }
++
++    /** Fades the real address bar so its URL and side buttons are not left under the pill. */
++    private void fadeToolbarChrome(float shrink) {
++        float alpha = shrink <= 0f ? 1f : Math.max(0f, 1f - shrink / TOOLBAR_FADE_SHRINK);
++        setToolbarAlpha(R.id.control_container, alpha);
++        setToolbarAlpha(R.id.toolbar_container, alpha);
++        setToolbarAlpha(R.id.toolbar, alpha);
++        setToolbarAlpha(R.id.location_bar, alpha);
++        setToolbarAlpha(R.id.url_bar, alpha);
++        setToolbarAlpha(R.id.home_button, alpha);
++        setToolbarAlpha(R.id.back_button, alpha);
++        setToolbarAlpha(R.id.toolbar_buttons, alpha);
++        // The compositor and later toolbar layout passes can restore a child's alpha.
++        // Once the bar has faded, hide the container so the URL cannot show through.
++        // Never hide the bar while it is still carrying the pull: a hidden view stops getting the
++        // rest of the gesture, and the sheet would be left part-way with no release.
++        int vis = alpha <= 0.001f && !mToolbarPulling ? View.INVISIBLE : View.VISIBLE;
++        for (int id : new int[] {R.id.control_container, R.id.toolbar_container}) {
++            View view = mActivity.findViewById(id);
++            if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) continue;
++            if (view.getVisibility() != vis) view.setVisibility(vis);
++        }
++    }
++
++    private void setToolbarAlpha(int id, float alpha) {
++        View view = mActivity.findViewById(id);
++        if (view == null || view.getAlpha() == alpha) return;
++        if (isInside(view, mRoot) || isInside(view, mOriginPill)) return;
++        view.setAlpha(alpha);
++    }
++
++    private static boolean isInside(View view, @Nullable View ancestor) {
++        if (ancestor == null) return false;
++        for (View current = view; current != null; ) {
++            if (current == ancestor) return true;
++            current = current.getParent() instanceof View parent ? parent : null;
++        }
++        return false;
++    }
++
++    /** A drag moves the sheet. A tap, with no drag, closes it and focuses the omnibox. */
++    private boolean onOriginPillTouch(View view, MotionEvent ev) {
++        boolean wasDragging = mSheetHandleDragging;
++        onSheetHandleTouch(view, ev);
++        if (ev.getActionMasked() == MotionEvent.ACTION_UP && !wasDragging) {
++            view.performClick();
++        }
++        return true;
++    }
++
++    private void closeAndFocusOmnibox() {
++        mOmniboxFocusRequests++;
++        close();
++        if (!(mActivity instanceof ChromeActivity chromeActivity)) return;
++        if (chromeActivity.getToolbarManager() == null) return;
++        chromeActivity
++                .getToolbarManager()
++                .focusAndSelectAllUrlBarText(OmniboxFocusReason.OMNIBOX_TAP);
++    }
++
++    /** The magnifier's field, in the action row, hidden until the magnifier is tapped. */
++    private void buildActionRowSearch(LinearLayout row) {
+         EditText field = new EditText(mActivity);
+         field.setTag("sheet_search_field");
+-        field.setBackground(null);
++        field.setVisibility(View.GONE);
++        // A filled, fully rounded field, the same family as the origin pill.
++        GradientDrawable fieldShape = new GradientDrawable();
++        fieldShape.setColor(color(0xFF2B2930, 0xFFE3E1EC));
++        fieldShape.setCornerRadius(dp(20));
++        field.setBackground(fieldShape);
+         field.setHint(R.string.bare_vtabs_search_tabs);
+         field.setHintTextColor(color(0xFF938F99, 0xFF79747E));
+         field.setTextColor(color(0xFFE6E1E5, 0xFF1C1B1F));
+         field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+         field.setSingleLine(true);
+-        field.setPaddingRelative(dp(12), 0, dp(8), 0);
++        field.setPaddingRelative(dp(16), 0, dp(12), 0);
+         field.setInputType(
+                 InputType.TYPE_CLASS_TEXT
+                         | InputType.TYPE_TEXT_VARIATION_FILTER
+@@ -2115,13 +2572,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         field.setOnEditorActionListener(
+                 (v, actionId, event) -> {
+                     if (actionId != EditorInfo.IME_ACTION_SEARCH) return false;
+-                    // The filter is already live; Search just puts the keyboard away.
+                     dropSearchFocus();
+                     return true;
+                 });
+-        pill.addView(
+-                field,
+-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
++        LinearLayout.LayoutParams fieldParams = new LinearLayout.LayoutParams(0, dp(40), 1f);
++        fieldParams.gravity = Gravity.CENTER_VERTICAL;
++        row.addView(field, fieldParams);
+ 
+         ImageButton clear = new ImageButton(mActivity);
+         clear.setTag("sheet_search_clear");
+@@ -2135,160 +2591,97 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         clear.setOnClickListener(
+                 v -> {
+                     ActionHaptics.tick(v);
+-                    field.setText("");
++                    clearSearch();
+                 });
+-        pill.addView(clear, new LinearLayout.LayoutParams(dp(40), dp(40)));
+-
+-        FrameLayout.LayoutParams pillParams =
+-                new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+-        pillParams.gravity = Gravity.CENTER_VERTICAL;
+-        pillParams.leftMargin = dp(8);
+-        pillParams.rightMargin = dp(8);
+-        morph.addView(pill, pillParams);
++        row.addView(clear, new LinearLayout.LayoutParams(dp(40), dp(40)));
+ 
+         View thief = new View(mActivity);
+         thief.setFocusable(true);
+         thief.setFocusableInTouchMode(true);
++        thief.setAlpha(0f);
+         thief.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+-        morph.addView(thief, new FrameLayout.LayoutParams(1, 1));
++        row.addView(thief, new LinearLayout.LayoutParams(1, 1));
+ 
+-        mSearchPill = pill;
+         mSearchField = field;
+         mSearchClear = clear;
+-        mSearchIcon = icon;
+         mSearchThief = thief;
+-        return morph;
+     }
+ 
+-    /**
+-     * Lays the search field over the toolbar the sheet opens from, and its pill over the address
+-     * bar's, so the bar seems to turn into it. With the keyboard up, a bottom one is lifted above
+-     * it.
+-     */
+-    private void positionMorph() {
+-        MorphBar morph = mMorph;
+-        View content = mActivity.findViewById(android.R.id.content);
+-        if (morph == null || content == null) return;
+-        if (!(morph.getLayoutParams() instanceof FrameLayout.LayoutParams params)) return;
+-        View bar = mActivity.findViewById(R.id.control_container);
+-        int width = ViewGroup.LayoutParams.MATCH_PARENT;
+-        int height = dp(56);
+-        int gravity = sheetFromTop() ? Gravity.TOP : Gravity.BOTTOM;
+-        int left = 0;
+-        int top = 0;
+-        int pillStart = dp(8);
+-        int pillEnd = dp(8);
+-        if (bar != null && bar.getVisibility() == View.VISIBLE && bar.getHeight() > 0) {
+-            int[] contentLoc = new int[2];
+-            content.getLocationOnScreen(contentLoc);
+-            int[] barLoc = new int[2];
+-            bar.getLocationOnScreen(barLoc);
+-            width = bar.getWidth();
+-            height = bar.getHeight();
+-            gravity = Gravity.TOP | Gravity.START;
+-            left = barLoc[0] - contentLoc[0];
+-            top = barLoc[1] - contentLoc[1];
+-            View location = mActivity.findViewById(R.id.location_bar);
+-            if (location != null && location.isShown() && location.getWidth() > 0) {
+-                int[] locationLoc = new int[2];
+-                location.getLocationOnScreen(locationLoc);
+-                pillStart = Math.max(0, locationLoc[0] - barLoc[0]);
+-                pillEnd = Math.max(0, barLoc[0] + width - locationLoc[0] - location.getWidth());
+-            }
+-        } else if (morph.getVisibility() == View.VISIBLE) {
+-            // The toolbar is away for a moment, as while the keyboard comes up: stay put.
+-            morph.setTranslationY(sheetFromTop() ? 0f : -mImeLift);
+-            return;
+-        }
+-        if (params.width != width
+-                || params.height != height
+-                || params.gravity != gravity
+-                || params.leftMargin != left
+-                || params.topMargin != top) {
+-            params.width = width;
+-            params.height = height;
+-            params.gravity = gravity;
+-            params.leftMargin = left;
+-            params.topMargin = top;
+-            morph.setLayoutParams(params);
+-        }
+-        LinearLayout pill = mSearchPill;
+-        if (pill != null && pill.getLayoutParams() instanceof FrameLayout.LayoutParams pillParams) {
+-            if (pillParams.leftMargin != pillStart || pillParams.rightMargin != pillEnd) {
+-                pillParams.leftMargin = pillStart;
+-                pillParams.rightMargin = pillEnd;
+-                pill.setLayoutParams(pillParams);
+-            }
+-        }
+-        morph.setTranslationY(sheetFromTop() ? 0f : -mImeLift);
++    /** The magnifier grows into the field in place: the other tools fade as the field widens. */
++    private void beginSearchRowTransition() {
++        EditText field = mSearchField;
++        if (field == null || !(field.getParent() instanceof ViewGroup row)) return;
++        if (!row.isLaidOut()) return;
++        TransitionManager.beginDelayedTransition(row, new AutoTransition().setDuration(180));
+     }
+ 
+-    /**
+-     * Fades the search field in over the address bar as the sheet opens, fully there by half, and
+-     * out as it closes. The side drawer never shows it.
+-     */
+-    private void updateMorph() {
+-        MorphBar morph = mMorph;
+-        if (morph == null) return;
+-        FrameLayout root = mRoot;
+-        float shown =
+-                isSheetChrome() && root != null && root.getVisibility() == View.VISIBLE
+-                        ? Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO)
+-                        : 0f;
+-        if (shown <= 0f) {
+-            if (morph.getVisibility() != View.GONE) morph.setVisibility(View.GONE);
+-            return;
+-        }
+-        if (morph.getVisibility() != View.VISIBLE) {
+-            positionMorph();
+-            morph.setVisibility(View.VISIBLE);
+-            // Above the sheet's overlay when that shares the activity's content.
+-            morph.bringToFront();
+-        }
+-        morph.setAlpha(shown);
+-        View icon = mSearchIcon;
+-        if (icon != null) {
+-            float scale = 0.6f + 0.4f * shown;
+-            icon.setScaleX(scale);
+-            icon.setScaleY(scale);
++    /** Shows the field across the action row and hides the count and the other tools. */
++    private void applySearchRow() {
++        boolean expanded = mSearchExpanded && isSheetChrome();
++        int tools = expanded ? View.GONE : View.VISIBLE;
++        if (mSheetCount != null) mSheetCount.setVisibility(tools);
++        if (mSheetList != null) mSheetList.setVisibility(tools);
++        if (mSheetGrid != null) mSheetGrid.setVisibility(tools);
++        if (mSheetNew != null) mSheetNew.setVisibility(tools);
++        if (mSheetCloseAll != null) mSheetCloseAll.setVisibility(tools);
++        if (mSheetSearch != null) mSheetSearch.setVisibility(tools);
++        if (mSearchField != null) mSearchField.setVisibility(expanded ? View.VISIBLE : View.GONE);
++        if (mSearchClear != null) {
++            boolean typed = expanded && mSearchField != null && mSearchField.length() > 0;
++            mSearchClear.setVisibility(typed ? View.VISIBLE : View.GONE);
+         }
+     }
+ 
+-    /** Whether a search is under way: there is text, or the field has the keyboard. */
+-    private boolean searching() {
+-        EditText field = mSearchField;
+-        return field != null && (field.length() > 0 || field.hasFocus());
++    /** Magnifier: the row becomes the search field, the keyboard comes up, and the sheet goes full. */
++    private void expandSearch() {
++        if (!mOpen || !isSheetChrome() || mSearchField == null || mSearchExpanded) return;
++        mSearchExpanded = true;
++        beginSearchRowTransition();
++        applySearchRow();
++        setSheetWindowFocusForSearch(true);
++        if (!mSearchField.requestFocus()) onSearchFocused();
++        InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
++        if (imm != null) imm.showSoftInput(mSearchField, InputMethodManager.SHOW_IMPLICIT);
+     }
+ 
+     private void onSearchChanged(String text) {
+-        View clear = mSearchClear;
+-        if (clear != null) clear.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
+         String query = text.trim();
+-        if (query.equals(mQuery)) return;
++        boolean same = query.equals(mQuery);
+         mQuery = query;
+-        // A new filter replaces the list at once and shows the current tab if it is in it.
++        applySearchRow();
++        if (same || !mOpen) return;
+         mSnapNext = true;
+         mScrollToSelected = true;
+-        if (mOpen) refresh();
++        refresh();
+     }
+ 
+     /** The keyboard must not cover the list, so the sheet goes full for a search. */
+     private void onSearchFocused() {
+         if (!mOpen || !isSheetChrome()) return;
++        if (!mSearchExpanded) {
++            mSearchExpanded = true;
++            applySearchRow();
++            setSheetWindowFocusForSearch(true);
++        }
+         settleSheet(BareTabSheetSnap.State.FULL, /* announce= */ true);
+     }
+ 
+-    /** Puts the field in focus with the keyboard, for a tap beside it. */
+-    private void focusSearchField() {
++    private static @Nullable Boolean sImeVisibleForTesting;
++
++    /** Robolectric has no soft keyboard; tests say whether one is up. Null for the real check. */
++    static void setImeVisibleForTesting(@Nullable Boolean visible) {
++        sImeVisibleForTesting = visible;
++    }
++
++    private boolean searchImeVisible() {
++        if (sImeVisibleForTesting != null) return sImeVisibleForTesting;
+         EditText field = mSearchField;
+-        if (field == null || !mOpen) return;
+-        if (field.requestFocus()) {
+-            InputMethodManager imm = mActivity.getSystemService(InputMethodManager.class);
+-            if (imm != null) imm.showSoftInput(field, 0);
+-        }
++        if (field == null) return false;
++        WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(field);
++        return insets != null && insets.isVisible(WindowInsetsCompat.Type.ime());
+     }
+ 
+-    /** Puts the keyboard away and moves focus off the field, keeping its text. */
++    /** Puts the keyboard away and moves focus off the field, keeping its text and the row. */
+     private void dropSearchFocus() {
+         EditText field = mSearchField;
+         if (field == null || !field.hasFocus()) return;
+@@ -2298,12 +2691,48 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (thief == null || !thief.requestFocus()) field.clearFocus();
+     }
+ 
+-    /** Empties the field, which lists every tab again, and puts the keyboard away. */
++    /** Empties the field, collapses it back to the magnifier, and lists every tab again. */
+     private void clearSearch() {
++        if (mSearchExpanded) beginSearchRowTransition();
++        mSearchExpanded = false;
+         EditText field = mSearchField;
+         if (field != null && field.length() > 0) field.setText("");
+         mQuery = "";
++        applySearchRow();
+         dropSearchFocus();
++        setSheetWindowFocusForSearch(false);
++        if (mOpen) {
++            mSnapNext = true;
++            refresh();
++        }
++    }
++
++    /**
++     * The sheet's glass window is not focusable, which keeps taps outside it working, but a
++     * not-focusable window cannot take the keyboard. While the in-row field is up, that one
++     * window accepts text. {@code FLAG_ALT_FOCUSABLE_IM} stays set so the keyboard is not covered.
++     */
++    private void setSheetWindowFocusForSearch(boolean allow) {
++        Dialog dialog = mGlassWindow;
++        Window w = dialog != null ? dialog.getWindow() : null;
++        if (w == null || !mGlass || !isSheetChrome()) return;
++        if (allow) {
++            w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
++            return;
++        }
++        if ((w.getAttributes().flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) == 0) {
++            w.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
++        }
++    }
++
++    /** Whether a search is up: the row is expanded, the field has the keyboard, or there is text. */
++    private boolean searching() {
++        return mSearchExpanded || searchFieldFocused() || !mQuery.isEmpty();
++    }
++
++    private boolean searchFieldFocused() {
++        EditText field = mSearchField;
++        return field != null && field.hasFocus();
+     }
+ 
+     /** Follows the keyboard while the sheet is open, so it never covers the field or the list. */
+@@ -2320,8 +2749,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                                 .getInsets(WindowInsetsCompat.Type.ime())
+                                 .bottom;
+         View content = mActivity.findViewById(android.R.id.content);
+-        MorphBar morph = mMorph;
+-        if (ime > 0 && content != null && morph != null) {
++        if (ime > 0 && content != null) {
+             int[] decorLoc = new int[2];
+             decor.getLocationOnScreen(decorLoc);
+             int imeTop = decorLoc[1] + decor.getHeight() - ime;
+@@ -2330,8 +2758,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             if (sheetFromTop()) {
+                 cover = Math.max(0, contentLoc[1] + content.getHeight() - imeTop);
+             } else {
+-                // Where the field sits when not lifted.
+-                lift = Math.max(0, contentLoc[1] + morph.getBottom() - imeTop);
++                View anchor =
++                        mSearchExpanded && mSearchField != null && mSearchField.isShown()
++                                ? mSearchField
++                                : mSheetActions;
++                if (anchor != null && anchor.getHeight() > 0) {
++                    int[] anchorLoc = new int[2];
++                    anchor.getLocationOnScreen(anchorLoc);
++                    lift = Math.max(0, anchorLoc[1] + anchor.getHeight() - imeTop);
++                }
+             }
+         }
+         int top = mOverlayTop;
+@@ -2339,9 +2774,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         boolean imeChanged = lift != mImeLift || cover != mImeCover;
+         mImeLift = lift;
+         mImeCover = cover;
+-        // The toolbars may also have moved, as the bottom one does over the keyboard.
+         applySheetInsets();
+-        positionMorph();
++        layoutOriginPill();
+         if (!imeChanged && top == mOverlayTop && bottom == mOverlayBottom) return;
+         FrameLayout root = mRoot;
+         if (root != null) {
+@@ -2352,6 +2786,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+     }
+ 
++
+     /**
+      * Whether a tab titled {@code title} at {@code url} matches {@code query}: every word of the
+      * query appears in the title or the address, ignoring case.
+@@ -2380,32 +2815,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return adapter == null ? 0 : adapter.getItemCount();
+     }
+ 
+-    /**
+-     * The search field's frame over the toolbar. A vertical drag on it moves the sheet, as one on
+-     * the handle does; a tap beside the field focuses it.
+-     */
+-    private final class MorphBar extends FrameLayout {
+-        MorphBar(Context context) {
+-            super(context);
+-        }
+-
+-        @Override
+-        public boolean onInterceptTouchEvent(MotionEvent ev) {
+-            onSheetHandleTouch(this, ev);
+-            return mSheetHandleDragging;
+-        }
+-
+-        @Override
+-        public boolean onTouchEvent(MotionEvent ev) {
+-            boolean wasDragging = mSheetHandleDragging;
+-            onSheetHandleTouch(this, ev);
+-            if (ev.getActionMasked() == MotionEvent.ACTION_UP && !wasDragging) {
+-                focusSearchField();
+-            }
+-            return true;
+-        }
+-    }
+-
+     // Tabs.
+ 
+     private @Nullable TabModel currentModel() {
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index ea48da2fd7..fb3f81411f 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -6,6 +6,7 @@ package org.chromium.chrome.browser.bare;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -520,8 +521,11 @@ public class BareVerticalTabsDrawerUnitTest {
+         RecyclerView list = openSheetAndGetList();
+         assertTrue(mDrawer.isOpen());
+         assertTrue(findTag("sheet_handle_row").isShown());
+-        assertTrue(findTag("sheet_handle").isShown());
++        // The grip is gone; the origin pill is the handle.
++        assertFalse(findTag("sheet_handle").isShown());
++        assertTrue(findTag("sheet_origin_pill").isShown());
+         assertTrue(findTag("sheet_actions").isShown());
++        assertTrue(findTag("sheet_search").isShown());
+         assertFalse(button("New tab").isShown());
+         assertFalse(button("Close all").isShown());
+         assertNotNull(list);
+@@ -589,8 +593,10 @@ public class BareVerticalTabsDrawerUnitTest {
+         openSheetAndGetList();
+         TextView domain = (TextView) findTag("sheet_domain");
+         assertNotNull(domain);
+-        assertEquals(View.VISIBLE, domain.getVisibility());
+-        assertEquals(mSecond.getUrl().getHost(), domain.getText().toString());
++        assertEquals(View.GONE, domain.getVisibility());
++        TextView origin = (TextView) findTag("sheet_pill_origin");
++        assertNotNull(origin);
++        assertEquals(mSecond.getUrl().getHost(), origin.getText().toString());
+         TextView count = (TextView) findTag("sheet_count");
+         assertNotNull(count);
+         assertTrue(count.getText().toString().contains("2"));
+@@ -829,6 +835,21 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
+     }
+ 
++    @Test
++    public void testThePillFadesInAsTheAddressBarFadesOutDuringAPull() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int range = beginPullAndLayOut();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.updateToolbarPull(range * 0.05f);
++        float early = findTag("sheet_origin_pill").getAlpha();
++        assertTrue("pill alpha " + early, early > 0f && early < 0.99f);
++        mDrawer.updateToolbarPull(range * 2f);
++        assertEquals(1f, findTag("sheet_origin_pill").getAlpha(), 0.001f);
++        mDrawer.endToolbarPull(0f);
++        assertTrue(mDrawer.isOpen());
++    }
++
+     @Test
+     public void testLettingGoOfAToolbarPullSnapsToTheNearestStop() {
+         setAddressBarOnTop(false);
+@@ -1216,12 +1237,11 @@ public class BareVerticalTabsDrawerUnitTest {
+     }
+ 
+     private android.widget.EditText searchField() {
+-        return (android.widget.EditText) findTag("sheet_search_bar").findViewWithTag(
+-                "sheet_search_field");
++        return (android.widget.EditText) findTag("sheet_search_field");
+     }
+ 
+-    private View searchBar() {
+-        return findTag("sheet_search_bar");
++    private View originPill() {
++        return findTag("sheet_origin_pill");
+     }
+ 
+     @Test
+@@ -1238,55 +1258,101 @@ public class BareVerticalTabsDrawerUnitTest {
+     }
+ 
+     @Test
+-    public void testTheAddressBarTurnsIntoSearchAsTheSheetOpensAndBackAsItCloses() {
+-        setAddressBarOnTop(false);
+-        openSheetLaidOut(px(400), px(800));
+-        View bar = searchBar();
+-        assertEquals(View.VISIBLE, bar.getVisibility());
+-        // Fully there from half.
+-        assertEquals(1f, bar.getAlpha(), 0.001f);
+-        assertEquals(
+-                Gravity.BOTTOM,
+-                ((FrameLayout.LayoutParams) bar.getLayoutParams()).gravity & Gravity.VERTICAL_GRAVITY_MASK);
++    public void testTheAddressBarShrinksToAPillOnTheSheetTopAndReturnsOnClose() {
++        View toolbar = new View(mActivity);
++        toolbar.setId(org.chromium.chrome.R.id.toolbar);
++        toolbar.setAlpha(1f);
++        content().addView(toolbar, 0, new FrameLayout.LayoutParams(px(400), px(56)));
+ 
+-        // Pushed most of the way back down, the bar is mostly the address bar again.
+-        int range = px(800) - sheetGap();
++        setAddressBarOnTop(false);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        View pill = originPill();
++        assertEquals(View.VISIBLE, pill.getVisibility());
++        assertEquals("sheet_handle_row", ((View) pill.getParent()).getTag());
++        assertEquals(0, panel.indexOfChild((View) pill.getParent()));
++        ViewGroup.LayoutParams params = pill.getLayoutParams();
++        assertEquals(px(32), params.height);
++        assertTrue(params.width >= px(96));
++        assertTrue(params.width <= px(280));
++        GradientDrawable background = (GradientDrawable) pill.getBackground();
++        assertEquals(px(32) / 2f, background.getCornerRadius(), 0.6f);
++        // The real bar is hidden so its URL is not left under the pill.
++        assertEquals(0f, toolbar.getAlpha(), 0.001f);
++        assertTrue(mDrawer.suppressesAddressBarTabSwipe());
++
++        // Part way back down, the pill is still shrinking toward the bar.
++        View root = (View) panel.getParent();
++        int range = root.getHeight() - sheetGap();
+         mDrawer.beginToolbarPull();
+         mDrawer.updateToolbarPull(-0.4f * range);
+         assertEquals(0.1f, mDrawer.progressForTesting(), 0.01f);
+-        assertEquals(0.2f, bar.getAlpha(), 0.02f);
++        assertTrue(pill.getLayoutParams().height > px(32));
++        assertTrue(pill.getLayoutParams().height < px(56));
++
++        mDrawer.updateToolbarPull(-range);
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++        assertEquals(View.GONE, pill.getVisibility());
+ 
+         mDrawer.endToolbarPull(0f);
+         mDrawer.finishAnimationForTesting();
+         assertFalse(mDrawer.isOpen());
+-        assertEquals(View.GONE, bar.getVisibility());
++        assertEquals(View.GONE, pill.getVisibility());
++        assertEquals(1f, toolbar.getAlpha(), 0.001f);
++        assertFalse(mDrawer.suppressesAddressBarTabSwipe());
+     }
+ 
+     @Test
+-    public void testWithATopAddressBarTheSearchFieldIsAtTheTop() {
++    public void testWithATopAddressBarThePillShrinksInPlaceAtTheTop() {
+         setAddressBarOnTop(true);
+-        openSheetLaidOut(px(400), px(800));
+-        View bar = searchBar();
+-        assertEquals(View.VISIBLE, bar.getVisibility());
+-        assertEquals(
+-                Gravity.TOP,
+-                ((FrameLayout.LayoutParams) bar.getLayoutParams()).gravity & Gravity.VERTICAL_GRAVITY_MASK);
++        LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        View pill = originPill();
++        View root = (View) panel.getParent();
++        // The bar's slot is outside the sheet (and its glass window), so the activity content
++        // hosts the pill, over the hidden bar.
++        assertEquals(mActivity.findViewById(android.R.id.content), pill.getParent());
++        assertNotEquals(root, pill.getParent());
++        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) pill.getLayoutParams();
++        assertEquals(px(32), params.height);
++        assertTrue(params.topMargin >= 0);
++        assertTrue(params.width >= px(96) && params.width <= px(280));
++        // Full does not carry the pill down with the sheet.
++        int top = params.topMargin;
++        mDrawer.finishSheetDragForTesting(10_000f);
++        mDrawer.finishAnimationForTesting();
++        layoutOverlay(root, px(400), px(800));
++        params = (FrameLayout.LayoutParams) pill.getLayoutParams();
++        assertEquals(top, params.topMargin);
++        assertEquals(px(32), params.height);
++        assertTrue(params.topMargin < px(800) / 4);
+     }
+ 
+     @Test
+-    public void testTheSideDrawerHasNoSearchField() {
++    public void testTheSideDrawerHasNoPillAndNoInRowSearch() {
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+         assertTrue(mDrawer.isOpen());
+-        View bar = searchBar();
+-        assertTrue(bar == null || bar.getVisibility() == View.GONE);
++        View pill = originPill();
++        assertTrue(pill == null || !pill.isShown());
++        View search = findTag("sheet_search");
++        assertTrue(search == null || !search.isShown());
++        assertFalse(mDrawer.suppressesAddressBarTabSwipe());
+     }
+ 
+     @Test
+-    public void testTypingFiltersTheListAndClearingListsEveryTabAgain() {
++    public void testTheMagnifierExpandsInPlaceAndClearRestoresEveryTab() {
+         setAddressBarOnTop(false);
+         openSheetLaidOut(px(400), px(800));
+         assertEquals(2, mDrawer.listedTabCountForTesting());
++        View magnifier = findTag("sheet_search");
++        assertEquals(findTag("sheet_actions"), magnifier.getParent());
++
++        magnifier.performClick();
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.VISIBLE, searchField().getVisibility());
++        assertEquals(View.GONE, findTag("sheet_list").getVisibility());
++        assertEquals(View.GONE, findTag("sheet_count").getVisibility());
++        assertEquals(View.GONE, magnifier.getVisibility());
+ 
+         searchField().setText("SEC");
+         assertEquals("SEC", mDrawer.searchQueryForTesting());
+@@ -1302,25 +1368,34 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals("", mDrawer.searchQueryForTesting());
+         assertEquals(2, mDrawer.listedTabCountForTesting());
+         assertEquals(View.GONE, clear.getVisibility());
++        assertEquals(View.GONE, searchField().getVisibility());
++        assertEquals(View.VISIBLE, magnifier.getVisibility());
++        assertEquals(View.VISIBLE, findTag("sheet_list").getVisibility());
+     }
+ 
+     @Test
+     public void testTheSearchFieldDoesNotCloseTheSheetAndTakesItFull() {
+         setAddressBarOnTop(false);
+         openSheetLaidOut(px(400), px(800));
+-        assertTrue(searchField().requestFocus());
++        findTag("sheet_search").performClick();
+         ShadowLooper.idleMainLooper();
+         mDrawer.finishAnimationForTesting();
+         assertTrue(mDrawer.isOpen());
+         assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++        assertTrue(searchField().hasFocus());
++        // Focusing it again still does not close the sheet.
++        assertTrue(searchField().requestFocus());
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
+     }
+ 
+     @Test
+     public void testBackClearsTheSearchFirstAndThenClosesTheSheet() {
+         setAddressBarOnTop(false);
+         LinearLayout panel = openSheetLaidOut(px(400), px(800));
++        findTag("sheet_search").performClick();
+         android.widget.EditText field = searchField();
+-        assertTrue(field.requestFocus());
+         field.setText("sec");
+         ShadowLooper.idleMainLooper();
+         mDrawer.finishAnimationForTesting();
+@@ -1329,22 +1404,64 @@ public class BareVerticalTabsDrawerUnitTest {
+         backDispatcher().dispatchOnBackStarted(backEvent(0f));
+         backDispatcher().dispatchOnBackProgressed(backEvent(0.6f));
+         assertEquals(1f, panel.getScaleX(), 0.001f);
++        backDispatcher().dispatchOnBackCancelled();
++
++        // 1) Hide the keyboard. The query and the field stay.
++        BareVerticalTabsDrawer.setImeVisibleForTesting(true);
+         backDispatcher().onBackPressed();
++        BareVerticalTabsDrawer.setImeVisibleForTesting(null);
+         mDrawer.finishAnimationForTesting();
+         assertTrue(mDrawer.isOpen());
+-        assertEquals("", field.getText().toString());
++        assertEquals("sec", field.getText().toString());
+         assertFalse(field.hasFocus());
++        assertEquals(View.VISIBLE, field.getVisibility());
++        assertEquals(1, mDrawer.listedTabCountForTesting());
++
++        // 2) Clear and collapse. The sheet stays open.
++        backDispatcher().onBackPressed();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals("", field.getText().toString());
++        assertEquals(View.GONE, field.getVisibility());
++        assertEquals(View.VISIBLE, findTag("sheet_search").getVisibility());
+         assertEquals(2, mDrawer.listedTabCountForTesting());
+ 
++        // 3) Close.
+         backDispatcher().onBackPressed();
+         mDrawer.finishAnimationForTesting();
+         assertFalse(mDrawer.isOpen());
+     }
+ 
++    @Test
++    public void testWithNoKeyboardUpTheFirstBackClearsTheSearch() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        findTag("sheet_search").performClick();
++        android.widget.EditText field = searchField();
++        field.setText("sec");
++        ShadowLooper.idleMainLooper();
++        mDrawer.finishAnimationForTesting();
++        BareVerticalTabsDrawer.setImeVisibleForTesting(false);
++        try {
++            // The field still has focus but no keyboard: Back is never a dead press.
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertTrue(mDrawer.isOpen());
++            assertEquals("", field.getText().toString());
++            assertEquals(View.GONE, field.getVisibility());
++            backDispatcher().onBackPressed();
++            mDrawer.finishAnimationForTesting();
++            assertFalse(mDrawer.isOpen());
++        } finally {
++            BareVerticalTabsDrawer.setImeVisibleForTesting(null);
++        }
++    }
++
+     @Test
+     public void testClosingTheSheetForgetsTheSearch() {
+         setAddressBarOnTop(false);
+         openSheetLaidOut(px(400), px(800));
++        findTag("sheet_search").performClick();
+         searchField().setText("sec");
+         assertEquals(1, mDrawer.listedTabCountForTesting());
+         mDrawer.close();
+@@ -1353,6 +1470,8 @@ public class BareVerticalTabsDrawerUnitTest {
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+         assertEquals("", searchField().getText().toString());
++        assertEquals(View.GONE, searchField().getVisibility());
++        assertEquals(View.VISIBLE, findTag("sheet_search").getVisibility());
+         assertEquals(2, mDrawer.listedTabCountForTesting());
+     }
+ 
+@@ -1362,6 +1481,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         openSheetLaidOut(px(400), px(800));
+         when(mModel.indexOf(mFirst)).thenReturn(0);
+         when(mModel.indexOf(mSecond)).thenReturn(1);
++        findTag("sheet_search").performClick();
+         // Both titles have an s, so both are listed, but only as search results.
+         searchField().setText("s");
+         assertEquals(2, mDrawer.listedTabCountForTesting());
+@@ -1369,6 +1489,18 @@ public class BareVerticalTabsDrawerUnitTest {
+         verify(mModel, never()).moveTab(anyInt(), anyInt());
+     }
+ 
++    @Test
++    public void testAPillTapClosesTheSheetAndAsksForTheOmnibox() {
++        setAddressBarOnTop(false);
++        openSheetLaidOut(px(400), px(800));
++        assertEquals(0, mDrawer.omniboxFocusRequestsForTesting());
++        originPill().performClick();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(1, mDrawer.omniboxFocusRequestsForTesting());
++        assertEquals(View.GONE, originPill().getVisibility());
++    }
++
+     @Test
+     public void testInGlassOnlyTheSheetsWindowSitsBehindTheKeyboard() {
+         BareVerticalTabsDrawer.setGlassForTesting(true);
+-- 
+2.34.1
+
