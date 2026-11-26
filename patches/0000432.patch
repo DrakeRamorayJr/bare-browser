@@ -1,0 +1,643 @@
+From 6216d7b4b4ca12d910fbcf8c407fb4e7c7591034 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:22:34 +0000
+Subject: [PATCH] Mirror the tab sheet under a top address bar, and tint the
+ status bar.
+
+With the address bar on top, the tab sheet now drops down from below
+it instead of filling the gap between the two bars. It is the same
+sheet mirrored: the tab count and actions sit under the address bar,
+the list follows, and the handle and the current tab's domain are at
+the free bottom edge, which has the round corners. Dragging the handle
+down opens it to half or full; dragging it up, or an upward over-pull
+at the end of the list, settles it at half or closes it. The snap
+rules are the same as for the bottom sheet.
+
+With the address bar at the bottom, the status bar is now dimmed with
+the scrim while the sheet is open, through the same status bar scrim
+hook the browser's own scrim uses, and restored when it closes. The
+small gap a full sheet leaves at its far end is now inside the overlay,
+so the scrim covers it too; the half and full heights are unchanged.
+With the address bar on top, the status bar keeps the address bar's
+color, since the address bar is not dimmed.
+
+A fling on the handle now reads its speed from screen positions. In
+the handle's own coordinates, which move with the finger, a fling read
+as almost no speed, so only the position decided where it settled.
+
+The side drawer is unchanged.
+
+Tested on the Android emulator (Pixel 10 Pro profile).
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 201 +++++++++++++++---
+ .../tabbed_mode/TabbedRootUiCoordinator.java  |   4 +
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 135 +++++++++++-
+ 3 files changed, 309 insertions(+), 31 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 92905a36be..8012505b9a 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -98,7 +98,9 @@ import java.util.function.Supplier;
+  * <p>The Vertical tabs button opens it. Which chrome it uses is {@link BareTabsStyle}: the side
+  * drawer is the default; the sheet is opt-in. Both share this class's list, its reorder and its
+  * swipe-to-close. In sheet mode the sheet opens to a half-height stop, and the handle (or an
+- * over-pull at the top of the list) moves it between hidden, half and full. It is a view over
++ * over-pull at the list's end next to the handle) moves it between hidden, half and full. With
++ * the address bar at the bottom the sheet rises from above the toolbar; with it on top the sheet
++ * drops down from below the address bar, mirrored. It is a view over
+  * the browser's own tab model: selecting, closing, adding and closing all go through the same
+  * operations the tab overview uses. It keeps no tabs of its own.
+  */
+@@ -108,6 +110,7 @@ public final class BareVerticalTabsDrawer {
+     private static final long SHEET_DURATION_MS = 320;
+     private static final float SHEET_FULL_GAP_DP = 8f;
+     private static final float SHEET_FLING_DP_PER_S = 800f;
++    private static final @ColorInt int SCRIM_COLOR = 0xAA000000;
+     private static final float WIDTH_FRACTION = 0.85f;
+     private static final float MAX_WIDTH_DP = 400f;
+     private static final float PAGE_SHIFT_DP = 30f;
+@@ -155,6 +158,10 @@ public final class BareVerticalTabsDrawer {
+     private float mSheetDragStartProgress;
+     private float mSheetDragStartY;
+     private @Nullable VelocityTracker mSheetTracker;
++    // Tints the status bar with the sheet's scrim. Chrome's status bar is drawn by the browser, not
++    // by this overlay, so the scrim alone would leave it bright.
++    private @Nullable Callback<Integer> mStatusBarScrimObserver;
++    private @ColorInt int mStatusBarScrimColor = Color.TRANSPARENT;
+     private boolean mRefreshPosted;
+     // A model refresh arrived while a card was being dragged. Applied when the drag ends.
+     private boolean mRefreshPending;
+@@ -238,6 +245,14 @@ public final class BareVerticalTabsDrawer {
+         mContentSupplier = contentSupplier;
+     }
+ 
++    /**
++     * Lets the sheet tint the status bar while it dims the page below it. Receives the scrim color
++     * to lay over the status bar, and {@link Color#TRANSPARENT} once nothing is dimmed.
++     */
++    public void setStatusBarScrimObserver(@Nullable Callback<Integer> observer) {
++        mStatusBarScrimObserver = observer;
++    }
++
+     /** Opens the drawer, or closes it if it is already open. */
+     public void toggle() {
+         if (mOpen) {
+@@ -402,7 +417,7 @@ public final class BareVerticalTabsDrawer {
+         root.setClickable(true);
+ 
+         View scrim = new View(mActivity);
+-        scrim.setBackgroundColor(0xAA000000);
++        scrim.setBackgroundColor(SCRIM_COLOR);
+         scrim.setAlpha(0f);
+         scrim.setOnClickListener(v -> close());
+         root.addView(
+@@ -642,8 +657,13 @@ public final class BareVerticalTabsDrawer {
+                     }
+ 
+                     @Override
+-                    public void dragSheetBy(float dyDown) {
+-                        BareVerticalTabsDrawer.this.dragSheetBy(dyDown);
++                    public boolean fromTop() {
++                        return sheetFromTop();
++                    }
++
++                    @Override
++                    public void dragSheetBy(float towardClosed) {
++                        BareVerticalTabsDrawer.this.dragSheetBy(towardClosed);
+                     }
+ 
+                     @Override
+@@ -716,13 +736,29 @@ public final class BareVerticalTabsDrawer {
+         LinearLayout header = mHeader;
+         LinearLayout footer = mFooter;
+         if (isSheetChrome()) {
++            boolean fromTop = sheetFromTop();
+             View handleRow = mHandleRow;
+             if (handleRow != null) {
+-                int top = sheetTopClearance() + dp(10);
+-                handleRow.setPadding(dp(16), top, dp(16), dp(2));
++                if (fromTop) {
++                    handleRow.setPadding(dp(16), dp(2), dp(16), dp(10));
++                } else {
++                    int top = sheetTopClearance() + dp(10);
++                    handleRow.setPadding(dp(16), top, dp(16), dp(2));
++                }
++            }
++            if (mDomain != null) {
++                if (fromTop) {
++                    mDomain.setPadding(dp(16), dp(8), dp(16), dp(6));
++                } else {
++                    mDomain.setPadding(dp(16), dp(6), dp(16), dp(8));
++                }
+             }
+             if (mSheetActions != null) {
+-                mSheetActions.setPadding(dp(16), dp(8), dp(8), dp(10));
++                if (fromTop) {
++                    mSheetActions.setPadding(dp(16), dp(10), dp(8), dp(8));
++                } else {
++                    mSheetActions.setPadding(dp(16), dp(8), dp(8), dp(10));
++                }
+                 mSheetActions.setBackgroundColor(color(0xFF1C1A20, 0xFFF1EDF6));
+             }
+             if (mList != null) {
+@@ -882,6 +918,60 @@ public final class BareVerticalTabsDrawer {
+         return BareTabsStyle.isSheet();
+     }
+ 
++    /** Whether the sheet drops down from below a top address bar instead of rising from below. */
++    private boolean sheetFromTop() {
++        return isSheetChrome() && AddressBarPreference.isToolbarConfiguredToShowOnTop();
++    }
++
++    /**
++     * Puts the sheet chrome on the right ends of the panel. Rising from the bottom, the handle is at
++     * the top and the actions sit on the toolbar. Dropping from the top, the actions sit under the
++     * address bar and the handle is at the bottom, so the sheet is the same one mirrored. The
++     * drawer hides both, so it keeps the rising order.
++     */
++    private void orderSheetChrome() {
++        Panel panel = mPanel;
++        View handleRow = mHandleRow;
++        View actions = mSheetActions;
++        if (panel == null || handleRow == null || actions == null) return;
++        boolean fromTop = sheetFromTop();
++        int last = panel.getChildCount() - 1;
++        boolean ordered =
++                fromTop
++                        ? panel.indexOfChild(actions) == 0 && panel.indexOfChild(handleRow) == last
++                        : panel.indexOfChild(handleRow) == 0 && panel.indexOfChild(actions) == last;
++        if (!ordered) {
++            panel.removeView(handleRow);
++            panel.removeView(actions);
++            if (fromTop) {
++                panel.addView(actions, 0);
++                panel.addView(handleRow);
++            } else {
++                panel.addView(handleRow, 0);
++                panel.addView(actions);
++            }
++        }
++        if (handleRow instanceof LinearLayout row) {
++            View handle = row.findViewWithTag("sheet_handle");
++            View domain = mDomain;
++            if (handle == null || domain == null) return;
++            boolean handleFirst = row.indexOfChild(handle) < row.indexOfChild(domain);
++            if (handleFirst == fromTop) {
++                row.removeView(handle);
++                row.addView(handle, fromTop ? row.getChildCount() : 0);
++            }
++            if (handle.getLayoutParams() instanceof LinearLayout.LayoutParams params) {
++                int top = fromTop ? 0 : dp(2);
++                int bottom = fromTop ? dp(2) : 0;
++                if (params.topMargin != top || params.bottomMargin != bottom) {
++                    params.topMargin = top;
++                    params.bottomMargin = bottom;
++                    handle.setLayoutParams(params);
++                }
++            }
++        }
++    }
++
+     /**
+      * Shows the drawer chrome or the sheet chrome, and sizes the panel for that mode. The list
+      * itself is not rebuilt.
+@@ -895,6 +985,7 @@ public final class BareVerticalTabsDrawer {
+         if (mCount != null) mCount.setVisibility(sheet ? View.GONE : View.VISIBLE);
+         if (mDivider != null) mDivider.setVisibility(sheet ? View.GONE : View.VISIBLE);
+         if (mFooter != null) mFooter.setVisibility(sheet ? View.GONE : View.VISIBLE);
++        orderSheetChrome();
+         Panel panel = mPanel;
+         if (panel != null) {
+             if (sheet) {
+@@ -927,9 +1018,11 @@ public final class BareVerticalTabsDrawer {
+             int[] inset = toolbarInsets();
+             top = inset[0];
+             bottom = inset[1];
+-            // A small gap below the status bar (or the top toolbar) so a sliver of the page
+-            // stays visible when the sheet is full, as in the mockup.
+-            top += top > 0 ? dp(SHEET_FULL_GAP_DP) : mTopInset + dp(SHEET_FULL_GAP_DP);
++            // The overlay ends at the status bar, or at the top address bar, which stays clear.
++            // The small gap a full sheet leaves at its far end is inside the overlay (see
++            // sheetRangeHeight), so the scrim dims it too.
++            if (top <= 0) top = mTopInset;
++            if (bottom <= 0 && sheetFromTop()) bottom = mBottomInset;
+         }
+         if (params.topMargin == top && params.bottomMargin == bottom) return;
+         params.topMargin = top;
+@@ -940,7 +1033,7 @@ public final class BareVerticalTabsDrawer {
+     /**
+      * How much of the activity's content the top and bottom toolbars occupy, so the sheet can sit
+      * in the gap. When the address bar is on top, this also leaves that bar clear (the five-button
+-     * bar stays at the bottom). Full visual mirroring of the sheet is a later step.
++     * bar stays at the bottom), and the sheet drops down from it.
+      */
+     private int[] toolbarInsets() {
+         View content = mActivity.findViewById(android.R.id.content);
+@@ -1004,8 +1097,11 @@ public final class BareVerticalTabsDrawer {
+         int radius = dp(20);
+         GradientDrawable background = new GradientDrawable();
+         background.setColor(color(0xFF1C1A20, 0xFFF1EDF6));
++        // The corners on the free edge are round: the top when rising, the bottom when dropping.
+         background.setCornerRadii(
+-                new float[] {radius, radius, radius, radius, 0f, 0f, 0f, 0f});
++                sheetFromTop()
++                        ? new float[] {0f, 0f, 0f, 0f, radius, radius, radius, radius}
++                        : new float[] {radius, radius, radius, radius, 0f, 0f, 0f, 0f});
+         panel.setBackground(background);
+         panel.setClipToOutline(true);
+         panel.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+@@ -1234,9 +1330,20 @@ public final class BareVerticalTabsDrawer {
+                 float half = BareTabSheetSnap.HALF_RATIO;
+                 float dim = half <= 0f ? mProgress : Math.min(1f, mProgress / half);
+                 scrim.setAlpha(dim);
++                // Rising from the bottom, the status bar is above the dimmed page, so it is
++                // dimmed with it. Dropping from the top, it is above the address bar, which
++                // stays bright, so it keeps the address bar's color.
++                setStatusBarScrim(
++                        sheetFromTop()
++                                ? Color.TRANSPARENT
++                                : Color.argb(
++                                        Math.round(Color.alpha(SCRIM_COLOR) * dim), 0, 0, 0));
+             } else {
+                 scrim.setAlpha(mProgress * (mGlass ? GLASS_SCRIM : 1f));
++                setStatusBarScrim(Color.TRANSPARENT);
+             }
++        } else {
++            setStatusBarScrim(Color.TRANSPARENT);
+         }
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
+         if (isSheetChrome()) {
+@@ -1262,6 +1369,13 @@ public final class BareVerticalTabsDrawer {
+         if (page != null) page.setTranslationX(mSide * mProgress * dp(PAGE_SHIFT_DP));
+     }
+ 
++    private void setStatusBarScrim(@ColorInt int color) {
++        if (color == mStatusBarScrimColor) return;
++        mStatusBarScrimColor = color;
++        Callback<Integer> observer = mStatusBarScrimObserver;
++        if (observer != null) observer.onResult(color);
++    }
++
+     private void dragTo(float dx) {
+         if (mAnimator != null) mAnimator.cancel();
+         int width = mPanelWidth > 0 ? mPanelWidth : 1;
+@@ -1292,37 +1406,42 @@ public final class BareVerticalTabsDrawer {
+ 
+     /**
+      * How far the sheet can travel from hidden to full. This is the height of the
+-     * overlay, not the panel's current height, so a drag from half still covers
+-     * the remaining distance to the top.
++     * overlay less a small gap at the far end, not the panel's current height, so a
++     * drag from half still covers the remaining distance. The gap keeps a sliver of
++     * the page visible when the sheet is full, as in the mockup.
+      */
+     private int sheetRangeHeight() {
+         FrameLayout root = mRoot;
+-        if (root != null && root.getHeight() > 0) return root.getHeight();
++        if (root != null && root.getHeight() > 0) {
++            return Math.max(1, root.getHeight() - dp(SHEET_FULL_GAP_DP));
++        }
+         return 1;
+     }
+ 
+     /**
+      * Makes the sheet only as tall as its current progress and sits it on the
+-     * bottom, so the actions stay on the toolbar and the list ends above them.
++     * toolbar it opens from: the bottom, or the top when the address bar is there.
++     * The actions stay on that toolbar and the list ends short of them.
+      * The old translation plus a counter-move of the actions left the last cards
+      * under the row at half height.
+      */
+     private void layoutSheetPanel(Panel panel) {
+         int height = Math.max(1, Math.round(mProgress * sheetRangeHeight()));
++        int gravity = sheetFromTop() ? Gravity.TOP : Gravity.BOTTOM;
+         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) panel.getLayoutParams();
+         if (params.width != ViewGroup.LayoutParams.MATCH_PARENT
+                 || params.height != height
+-                || params.gravity != Gravity.BOTTOM
++                || params.gravity != gravity
+                 || params.bottomMargin != 0) {
+             params.width = ViewGroup.LayoutParams.MATCH_PARENT;
+             params.height = height;
+-            params.gravity = Gravity.BOTTOM;
++            params.gravity = gravity;
+             params.bottomMargin = 0;
+             panel.setLayoutParams(params);
+         }
+     }
+ 
+-    /** Lets the handle (and a downward over-pull at the top of the list) move the sheet. */
++    /** Lets the handle (and an over-pull at the list's end next to it) move the sheet. */
+     private void bindSheetHandle() {
+         View handleRow = mHandleRow;
+         if (handleRow == null) return;
+@@ -1342,10 +1461,10 @@ public final class BareVerticalTabsDrawer {
+                 mSheetDragStartProgress = mProgress;
+                 if (mSheetTracker != null) mSheetTracker.recycle();
+                 mSheetTracker = VelocityTracker.obtain();
+-                mSheetTracker.addMovement(ev);
++                trackOnScreen(mSheetTracker, ev);
+                 return true;
+             case MotionEvent.ACTION_MOVE:
+-                if (mSheetTracker != null) mSheetTracker.addMovement(ev);
++                if (mSheetTracker != null) trackOnScreen(mSheetTracker, ev);
+                 float dy = ev.getRawY() - mSheetDragStartY;
+                 if (!mSheetHandleDragging && Math.abs(dy) > slop) {
+                     mSheetHandleDragging = true;
+@@ -1358,12 +1477,14 @@ public final class BareVerticalTabsDrawer {
+                     dy = 0f;
+                 }
+                 if (mSheetHandleDragging) {
+-                    applyProgress(mSheetDragStartProgress - dy / sheetRangeHeight());
++                    // Away from the toolbar opens: up when rising, down when dropping.
++                    float opening = sheetFromTop() ? dy : -dy;
++                    applyProgress(mSheetDragStartProgress + opening / sheetRangeHeight());
+                 }
+                 return true;
+             case MotionEvent.ACTION_UP:
+             case MotionEvent.ACTION_CANCEL:
+-                if (mSheetTracker != null) mSheetTracker.addMovement(ev);
++                if (mSheetTracker != null) trackOnScreen(mSheetTracker, ev);
+                 if (mSheetHandleDragging) {
+                     float velocity = 0f;
+                     if (mSheetTracker != null) {
+@@ -1383,14 +1504,29 @@ public final class BareVerticalTabsDrawer {
+         }
+     }
+ 
+-    private void dragSheetBy(float dyDown) {
++    /**
++     * The handle moves with the finger, so in its own coordinates the finger barely moves and a
++     * fling reads as no speed at all. The tracker is fed screen positions instead.
++     */
++    private static void trackOnScreen(VelocityTracker tracker, MotionEvent ev) {
++        MotionEvent onScreen = MotionEvent.obtain(ev);
++        onScreen.setLocation(ev.getRawX(), ev.getRawY());
++        tracker.addMovement(onScreen);
++        onScreen.recycle();
++    }
++
++    /** Moves the sheet {@code towardClosed} pixels toward its toolbar. */
++    private void dragSheetBy(float towardClosed) {
+         if (mAnimator != null) mAnimator.cancel();
+-        applyProgress(mProgress - dyDown / sheetRangeHeight());
++        applyProgress(mProgress - towardClosed / sheetRangeHeight());
+     }
+ 
++    /** {@code velocityY} is on the screen: positive is downward. */
+     private void finishSheetDrag(float velocityY) {
++        // The snap rules take positive as toward closed, which is upward for a dropped sheet.
++        float towardClosed = sheetFromTop() ? -velocityY : velocityY;
+         BareTabSheetSnap.State next =
+-                BareTabSheetSnap.snap(mProgress, velocityY, dp(SHEET_FLING_DP_PER_S));
++                BareTabSheetSnap.snap(mProgress, towardClosed, dp(SHEET_FLING_DP_PER_S));
+         if (next == BareTabSheetSnap.State.HIDDEN) {
+             close();
+         } else {
+@@ -2592,7 +2728,11 @@ public final class BareVerticalTabsDrawer {
+ 
+             boolean reorderActive();
+ 
+-            void dragSheetBy(float dyDown);
++            /** Whether the sheet hangs from a top address bar, so it closes upward. */
++            boolean fromTop();
++
++            /** Moves the sheet toward its toolbar by {@code towardClosed} pixels. */
++            void dragSheetBy(float towardClosed);
+ 
+             void finishSheetDrag(float velocityY);
+         }
+@@ -2721,11 +2861,14 @@ public final class BareVerticalTabsDrawer {
+                 int type,
+                 int[] consumed) {
+             if (type != ViewCompat.TYPE_TOUCH) return;
+-            if (dyUnconsumed >= 0) return;
+             if (mSheetHost == null || !mSheetHost.sheetActive() || mSheetHost.reorderActive()) {
+                 return;
+             }
+-            mSheetHost.dragSheetBy(-dyUnconsumed);
++            // Pulling past the list's end next to the handle moves the sheet toward closed:
++            // down past the top when it rises, up past the bottom when it drops.
++            int towardClosed = mSheetHost.fromTop() ? dyUnconsumed : -dyUnconsumed;
++            if (towardClosed <= 0) return;
++            mSheetHost.dragSheetBy(towardClosed);
+             consumed[1] += dyUnconsumed;
+             mSheetNestedDrag = true;
+         }
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
+index ed0b4489e0..fe10ee0f81 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
+@@ -1216,6 +1216,10 @@ public class TabbedRootUiCoordinator extends RootUiCoordinator {
+                                                     () -> mTabModelSelectorSupplier.get(),
+                                                     () -> mTabCreatorManagerSupplier.get(),
+                                                     () -> mTabContentManagerSupplier.get());
++                                    // The sheet's scrim tints the status bar the way
++                                    // Chrome's own scrim does.
++                                    mBareVerticalTabsDrawer.setStatusBarScrimObserver(
++                                            this::onScrimColorChanged);
+                                 }
+                                 mBareVerticalTabsDrawer.toggle();
+                             },
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 5cf9be24cf..26e361bd29 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -30,6 +30,7 @@ import android.widget.TextView;
+ import androidx.recyclerview.widget.RecyclerView;
+ import androidx.test.ext.junit.rules.ActivityScenarioRule;
+ 
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -103,6 +104,28 @@ public class BareVerticalTabsDrawerUnitTest {
+         mDrawer = new BareVerticalTabsDrawer(mActivity, () -> mSelector, () -> mCreators);
+     }
+ 
++    @After
++    public void tearDown() {
++        org.chromium.chrome.browser.preferences.ChromeSharedPreferences.getInstance()
++                .removeKey(
++                        org.chromium.chrome.browser.preferences.ChromePreferenceKeys
++                                .TOOLBAR_TOP_ANCHORED);
++    }
++
++    /** Puts the address bar on top (1, from settings) or at the bottom (3, from settings). */
++    private void setAddressBarOnTop(boolean onTop) {
++        org.chromium.chrome.browser.preferences.ChromeSharedPreferences.getInstance()
++                .writeInt(
++                        org.chromium.chrome.browser.preferences.ChromePreferenceKeys
++                                .TOOLBAR_TOP_ANCHORED,
++                        onTop ? 1 : 3);
++    }
++
++    /** The small gap a full sheet leaves at its far end, in pixels. */
++    private int sheetGap() {
++        return Math.round(8f * mActivity.getResources().getDisplayMetrics().density);
++    }
++
+     private ViewGroup content() {
+         return mActivity.findViewById(android.R.id.content);
+     }
+@@ -580,6 +603,7 @@ public class BareVerticalTabsDrawerUnitTest {
+ 
+     @Test
+     public void testAFlingUpFromTheSheetHalfGoesToFull() {
++        setAddressBarOnTop(false);
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+@@ -591,6 +615,7 @@ public class BareVerticalTabsDrawerUnitTest {
+ 
+     @Test
+     public void testAFlingDownFromTheSheetHalfClosesIt() {
++        setAddressBarOnTop(false);
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+@@ -602,6 +627,7 @@ public class BareVerticalTabsDrawerUnitTest {
+ 
+     @Test
+     public void testAFlingDownFromTheSheetFullSettlesAtHalf() {
++        setAddressBarOnTop(false);
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+@@ -615,6 +641,7 @@ public class BareVerticalTabsDrawerUnitTest {
+ 
+     @Test
+     public void testTheSheetActionsStayPutAndTheListEndsAboveThem() {
++        setAddressBarOnTop(false);
+         BareTabsStyle.setStyle(BareTabsStyle.SHEET);
+         mDrawer.open();
+         mDrawer.finishAnimationForTesting();
+@@ -631,7 +658,7 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0f, panel.getTranslationY(), 0f);
+         FrameLayout.LayoutParams halfParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
+         assertEquals(Gravity.BOTTOM, halfParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
+-        assertEquals(Math.round(BareTabSheetSnap.HALF_RATIO * 2000), halfParams.height);
++        assertEquals(Math.round(BareTabSheetSnap.HALF_RATIO * (2000 - sheetGap())), halfParams.height);
+         RecyclerView list = find(content(), RecyclerView.class);
+         assertNotNull(list);
+         assertEquals(0, list.getPaddingBottom());
+@@ -646,10 +673,114 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0f, panel.getTranslationY(), 0f);
+         FrameLayout.LayoutParams fullParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
+         assertEquals(Gravity.BOTTOM, fullParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
+-        assertEquals(2000, fullParams.height);
++        assertEquals(2000 - sheetGap(), fullParams.height);
+         assertTrue(listHolder.getBottom() <= actions.getTop());
+     }
+ 
++    @Test
++    public void testWithTheAddressBarOnTopTheSheetDropsFromTheTopMirrored() {
++        setAddressBarOnTop(true);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        View actions = findTag("sheet_actions");
++        View handleRow = findTag("sheet_handle_row");
++        assertNotNull(actions);
++        assertNotNull(handleRow);
++        LinearLayout panel = (LinearLayout) actions.getParent();
++        View root = (View) panel.getParent();
++        layoutOverlay(root, 1080, 2000);
++        mDrawer.finishAnimationForTesting();
++        layoutOverlay(root, 1080, 2000);
++
++        FrameLayout.LayoutParams halfParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        assertEquals(Gravity.TOP, halfParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
++        assertEquals(Math.round(BareTabSheetSnap.HALF_RATIO * (2000 - sheetGap())), halfParams.height);
++        assertEquals(0, panel.getTop());
++        // Actions under the address bar, then the list, then the handle at the free edge.
++        RecyclerView list = find(content(), RecyclerView.class);
++        assertNotNull(list);
++        View listHolder = (View) list.getParent();
++        assertEquals(0, panel.indexOfChild(actions));
++        assertEquals(panel.getChildCount() - 1, panel.indexOfChild(handleRow));
++        assertTrue(actions.getBottom() <= listHolder.getTop());
++        assertTrue(listHolder.getBottom() <= handleRow.getTop());
++        LinearLayout row = (LinearLayout) handleRow;
++        assertTrue(
++                row.indexOfChild(findTag("sheet_domain"))
++                        < row.indexOfChild(findTag("sheet_handle")));
++
++        mDrawer.finishSheetDragForTesting(10_000f);
++        mDrawer.finishAnimationForTesting();
++        layoutOverlay(root, 1080, 2000);
++        FrameLayout.LayoutParams fullParams = (FrameLayout.LayoutParams) panel.getLayoutParams();
++        assertEquals(Gravity.TOP, fullParams.gravity & Gravity.VERTICAL_GRAVITY_MASK);
++        assertEquals(2000 - sheetGap(), fullParams.height);
++        assertTrue(listHolder.getBottom() <= handleRow.getTop());
++    }
++
++    @Test
++    public void testWithTheAddressBarOnTopAFlingDownOpensAndAFlingUpCloses() {
++        setAddressBarOnTop(true);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++
++        mDrawer.finishSheetDragForTesting(10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.01f);
++
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++
++        mDrawer.finishSheetDragForTesting(-10_000f);
++        mDrawer.finishAnimationForTesting();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(0f, mDrawer.progressForTesting(), 0.01f);
++    }
++
++    @Test
++    public void testTheBottomSheetDimsTheStatusBarAndRestoresItOnClose() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        java.util.List<Integer> colors = new java.util.ArrayList<>();
++        mDrawer.setStatusBarScrimObserver(colors::add);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertFalse(colors.isEmpty());
++        // Fully dimmed from half onward, with the page's scrim color.
++        assertEquals(0xAA000000, (int) colors.get(colors.size() - 1));
++
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        assertEquals(android.graphics.Color.TRANSPARENT, (int) colors.get(colors.size() - 1));
++    }
++
++    @Test
++    public void testTheTopSheetAndTheDrawerLeaveTheStatusBarAlone() {
++        java.util.List<Integer> colors = new java.util.ArrayList<>();
++        mDrawer.setStatusBarScrimObserver(colors::add);
++
++        // The drawer has its own full-window scrim.
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++
++        // The top sheet hangs below the address bar, which stays bright, as does the status bar.
++        setAddressBarOnTop(true);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++
++        for (int color : colors) assertEquals(android.graphics.Color.TRANSPARENT, color);
++    }
++
+     private void layoutOverlay(View root, int width, int height) {
+         root.measure(
+                 View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+-- 
+2.34.1
+
