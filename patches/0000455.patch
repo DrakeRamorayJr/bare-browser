@@ -1,0 +1,670 @@
+From 9e9088c0312ae09f991c9a5067905ae8700378fc Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:46:30 +0000
+Subject: [PATCH] Bare: pull the bottom tab sheet up from the button bar
+
+An upward drag on the five-button bottom bar now opens the bottom-bar
+tab sheet 1:1, like the address-bar pull. Once the move is upward, past
+touch slop and steeper than it is sideways, the bar intercepts the
+gesture, cancels the pressed button so a tap target such as + does not
+fire, and drives the sheet through the same pull calls the address bar
+uses. The release velocity from a VelocityTracker feeds the spring
+settle.
+
+Taps still press the buttons with no added delay, and horizontal drags
+keep their meaning. The pull only runs when the tabs style is Sheet and
+the address bar is at the bottom, so the side drawer and the top-bar
+sheet are unchanged.
+---
+ .../bare/BareTabSheetToolbarSwipe.java        |  11 ++
+ .../BottomBarContainerCoordinator.java        |   6 +
+ .../tabbed_mode/TabbedRootUiCoordinator.java  |  30 +++
+ .../browser/toolbar/ToolbarManager.java       |  18 ++
+ .../BareTabSheetToolbarSwipeUnitTest.java     | 175 ++++++++++++++++++
+ chrome/browser/ui/android/bottombar/BUILD.gn  |   1 +
+ .../ui/bottombar/BareBottomBarSheetPull.java  |  31 ++++
+ .../ui/bottombar/BottomBarCoordinator.java    |   5 +
+ .../browser/ui/bottombar/BottomBarView.java   | 142 +++++++++++++-
+ 9 files changed, 409 insertions(+), 10 deletions(-)
+ create mode 100755 chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BareBottomBarSheetPull.java
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+index 2a87c79b16..50077c99a5 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipe.java
+@@ -60,6 +60,17 @@ public final class BareTabSheetToolbarSwipe implements SwipeHandler {
+         mSheet = sheet;
+     }
+ 
++    /**
++     * Whether the five-button bar should pull the sheet.
++     *
++     * <p>Only a bottom address bar in sheet mode. The side drawer and a top address bar keep the
++     * bar's existing gestures.
++     */
++    public static boolean wantsButtonBarPull(
++            boolean sheetStyle, boolean opensDownward, boolean sheetWants) {
++        return sheetStyle && !opensDownward && sheetWants;
++    }
++
+     /** The direction that pulls the sheet out, or UNKNOWN when the sheet does not want drags. */
+     private @ScrollDirection int pullDirection() {
+         if (!mSheet.wantsToolbarPull()) return ScrollDirection.UNKNOWN;
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bottombar/BottomBarContainerCoordinator.java b/chrome/android/java/src/org/chromium/chrome/browser/bottombar/BottomBarContainerCoordinator.java
+index 1972c27a06..64612e2938 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bottombar/BottomBarContainerCoordinator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bottombar/BottomBarContainerCoordinator.java
+@@ -34,6 +34,7 @@ import org.chromium.chrome.browser.toolbar.bottom.BottomControlsContentDelegate;
+ import org.chromium.chrome.browser.toolbar.bottom.BottomControlsCoordinator.BottomControlsVisibilityController;
+ import org.chromium.chrome.browser.ui.actions.ActionRegistry;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuCoordinator;
++import org.chromium.chrome.browser.ui.bottombar.BareBottomBarSheetPull;
+ import org.chromium.chrome.browser.ui.bottombar.BareTabSwitchDelegate;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBar;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBarConfigUtils;
+@@ -230,6 +231,11 @@ public class BottomBarContainerCoordinator
+         mBottomBarCoordinator.setTabSwitchDelegate(delegate);
+     }
+ 
++    /** Lets an upward drag on the bar pull the bottom tab sheet. Null leaves that drag alone. */
++    public void setSheetPull(@Nullable BareBottomBarSheetPull pull) {
++        mBottomBarCoordinator.setSheetPull(pull);
++    }
++
+     /** Returns the bottom bar. */
+     public BottomBar getBottomBar() {
+         return mBottomBarCoordinator;
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
+index b4a149d350..950b06bd65 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/tabbed_mode/TabbedRootUiCoordinator.java
+@@ -252,6 +252,7 @@ import org.chromium.chrome.browser.ui.actions.ActionUtils;
+ import org.chromium.chrome.browser.ui.app_rating.AppRatingPromoController;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuBlocker;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuDelegate;
++import org.chromium.chrome.browser.ui.bottombar.BareBottomBarSheetPull;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBarConfigUtils;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBarHostManager;
+ import org.chromium.chrome.browser.ui.browser_window.ChromeAndroidTask;
+@@ -1219,6 +1220,35 @@ public class TabbedRootUiCoordinator extends RootUiCoordinator {
+                                             .onMenuOrKeyboardAction(
+                                                     R.id.task_manager, false, null, null));
+         }
++
++        // An upward drag on the five-button bar pulls the bottom sheet the same way the address
++        // bar does. The side drawer and a top bar leave the buttons alone. The bar itself is
++        // built later; the manager keeps this until then.
++        mToolbarManager.setBareBottomBarSheetPull(
++                new BareBottomBarSheetPull() {
++                    @Override
++                    public boolean wantsPull() {
++                        if (!BareTabsStyle.isSheet()) return false;
++                        BareVerticalTabsDrawer drawer = getBareVerticalTabsDrawer();
++                        return BareTabSheetToolbarSwipe.wantsButtonBarPull(
++                                true, drawer.opensDownward(), drawer.wantsToolbarPull());
++                    }
++
++                    @Override
++                    public void beginPull() {
++                        getBareVerticalTabsDrawer().beginToolbarPull();
++                    }
++
++                    @Override
++                    public void updatePull(float openingPx) {
++                        getBareVerticalTabsDrawer().updateToolbarPull(openingPx);
++                    }
++
++                    @Override
++                    public void endPull(float velocityY) {
++                        getBareVerticalTabsDrawer().endToolbarPull(velocityY);
++                    }
++                });
+     }
+ 
+     /** The vertical tabs drawer, or sheet, made the first time it is asked for. */
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java b/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java
+index 0f8663b479..e83d86f7bf 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/toolbar/ToolbarManager.java
+@@ -240,6 +240,7 @@ import org.chromium.chrome.browser.ui.actions.tabswitcher.TabSwitcherActionProvi
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuCoordinator;
+ import org.chromium.chrome.browser.ui.appmenu.AppMenuDelegate;
+ import org.chromium.chrome.browser.ui.appmenu.MenuButtonDelegate;
++import org.chromium.chrome.browser.ui.bottombar.BareBottomBarSheetPull;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBarConfigUtils;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBarEducationDialogCoordinator;
+ import org.chromium.chrome.browser.ui.bottombar.BottomBarHostManager;
+@@ -558,6 +559,8 @@ public class ToolbarManager
+     private @Nullable ToolbarPositionController mToolbarPositionController;
+     private @Nullable UndoBarThrottle mUndoBarThrottle;
+     private final @Nullable BottomBarHostManager mBottomBarHostManager;
++    private @Nullable BottomBarContainerCoordinator mBottomBarContainerCoordinator;
++    private @Nullable BareBottomBarSheetPull mBareBottomBarSheetPull;
+     private @Nullable BottomBarEducationDialogCoordinator mBottomBarEducationDialogCoordinator;
+     private final @Nullable OneshotSupplier<HubManager> mHubManagerSupplier;
+ 
+@@ -2790,6 +2793,10 @@ public class ToolbarManager
+         // the swipe happens, since it does not exist yet while the bar is being built.
+         bottomBarContainerCoordinator.setTabSwitchDelegate(
+                 next -> BareTabSwitcher.switchTab(mTabModelSelectorSupplier.get(), next));
++        mBottomBarContainerCoordinator = bottomBarContainerCoordinator;
++        if (mBareBottomBarSheetPull != null) {
++            mBottomBarContainerCoordinator.setSheetPull(mBareBottomBarSheetPull);
++        }
+ 
+         if (mBottomBarHostManager != null) {
+             mBottomBarHostManager.registerBottomBar(
+@@ -4322,6 +4329,17 @@ public class ToolbarManager
+         if (coordinator != null) coordinator.setBareSheetTravel(gone);
+     }
+ 
++    /**
++     * Bare sheet. An upward drag on the five-button bar pulls the sheet. Stored until the bar
++     * exists, because the bar is built later than the caller.
++     */
++    public void setBareBottomBarSheetPull(@Nullable BareBottomBarSheetPull pull) {
++        mBareBottomBarSheetPull = pull;
++        if (mBottomBarContainerCoordinator != null) {
++            mBottomBarContainerCoordinator.setSheetPull(pull);
++        }
++    }
++
+     @VisibleForTesting
+     void onToolbarHorizontalMarginsChanged(int leftMargin, int rightMargin) {
+         // When Vertical Tabs is in auto-hidden mode, keep the margins intact on the layout
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java
+index 6356dcb684..5a3e8e5a1a 100644
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareTabSheetToolbarSwipeUnitTest.java
+@@ -9,8 +9,12 @@ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ 
+ import android.app.Activity;
++import android.graphics.Rect;
+ import android.os.SystemClock;
++import android.view.LayoutInflater;
+ import android.view.MotionEvent;
++import android.view.View;
++import android.view.ViewConfiguration;
+ 
+ import androidx.test.ext.junit.rules.ActivityScenarioRule;
+ 
+@@ -21,6 +25,9 @@ import org.junit.runner.RunWith;
+ import org.robolectric.shadows.ShadowLooper;
+ 
+ import org.chromium.base.test.BaseRobolectricTestRunner;
++import org.chromium.chrome.browser.ui.bottombar.BareBottomBarSheetPull;
++import org.chromium.chrome.browser.ui.bottombar.BottomBarView;
++import org.chromium.chrome.browser.ui.bottombar.R;
+ import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener;
+ import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.ScrollDirection;
+ import org.chromium.components.browser_ui.widget.gesture.SwipeGestureListener.SwipeHandler;
+@@ -259,4 +266,172 @@ public class BareTabSheetToolbarSwipeUnitTest {
+         assertTrue(mDelegate.mStarted.isEmpty());
+         assertFalse(mSheet.mEnded > 0);
+     }
++
++    @Test
++    public void testTheButtonBarPullsOnlyTheBottomSheet() {
++        // Side drawer.
++        assertFalse(BareTabSheetToolbarSwipe.wantsButtonBarPull(false, false, true));
++        // Top address bar: the sheet opens downward, so the button bar is left alone.
++        assertFalse(BareTabSheetToolbarSwipe.wantsButtonBarPull(true, true, true));
++        // Bottom sheet that does not want a drag right now (a card is already moving).
++        assertFalse(BareTabSheetToolbarSwipe.wantsButtonBarPull(true, false, false));
++        assertTrue(BareTabSheetToolbarSwipe.wantsButtonBarPull(true, false, true));
++    }
++
++    /** Records the sheet calls the button bar makes, and whether it wants them. */
++    private static final class RecordingPull implements BareBottomBarSheetPull {
++        boolean mWants = true;
++        int mBegun;
++        int mEnded;
++        float mLastOpening = Float.NaN;
++        float mVelocity = Float.NaN;
++
++        @Override
++        public boolean wantsPull() {
++            return mWants;
++        }
++
++        @Override
++        public void beginPull() {
++            mBegun++;
++        }
++
++        @Override
++        public void updatePull(float openingPx) {
++            mLastOpening = openingPx;
++        }
++
++        @Override
++        public void endPull(float velocityY) {
++            mEnded++;
++            mVelocity = velocityY;
++        }
++    }
++
++    private BottomBarView inflateBar() {
++        BottomBarView view =
++                (BottomBarView)
++                        LayoutInflater.from(mActivity)
++                                .inflate(R.layout.bottom_bar_layout, null, false);
++        view.measure(
++                View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(160, View.MeasureSpec.EXACTLY));
++        view.layout(0, 0, 1080, 160);
++        return view;
++    }
++
++    private static float[] centerOf(android.view.ViewGroup parent, View child) {
++        Rect rect = new Rect(0, 0, child.getWidth(), child.getHeight());
++        parent.offsetDescendantRectToMyCoords(child, rect);
++        return new float[] {rect.centerX(), rect.centerY()};
++    }
++
++    private void barTouch(
++            BottomBarView view, long downTime, long time, int action, float x, float y) {
++        MotionEvent event = MotionEvent.obtain(downTime, time, action, x, y, 0);
++        view.dispatchTouchEvent(event);
++        event.recycle();
++    }
++
++    @Test
++    public void testATapOnNewTabStillClicks() {
++        BottomBarView bar = inflateBar();
++        // Attached, a tap posts its click onto the window's looper. Unattached, that
++        // runnable sits on a queue the test looper does not run.
++        mActivity.setContentView(bar);
++        bar.measure(
++                View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(160, View.MeasureSpec.EXACTLY));
++        bar.layout(0, 0, 1080, 160);
++        View plus = bar.findViewById(R.id.new_tab_button);
++        int[] clicks = new int[1];
++        plus.setOnClickListener(view -> clicks[0]++);
++        float[] at = centerOf(bar, plus);
++        long t = SystemClock.uptimeMillis();
++        barTouch(bar, t, t, MotionEvent.ACTION_DOWN, at[0], at[1]);
++        barTouch(bar, t, t + 30, MotionEvent.ACTION_UP, at[0], at[1]);
++        ShadowLooper.idleMainLooper();
++        assertEquals(1, clicks[0]);
++    }
++
++    @Test
++    public void testAnUpwardDragFromNewTabOpensTheSheetAndDoesNotClick() {
++        BottomBarView bar = inflateBar();
++        RecordingPull pull = new RecordingPull();
++        bar.setSheetPull(pull);
++        View plus = bar.findViewById(R.id.new_tab_button);
++        int[] clicks = new int[1];
++        int[] cancels = new int[1];
++        plus.setOnClickListener(view -> clicks[0]++);
++        plus.setOnTouchListener(
++                (view, event) -> {
++                    if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) cancels[0]++;
++                    return false;
++                });
++        float[] at = centerOf(bar, plus);
++        int slop = ViewConfiguration.get(mActivity).getScaledTouchSlop();
++        long t = SystemClock.uptimeMillis();
++        float y = at[1];
++        barTouch(bar, t, t, MotionEvent.ACTION_DOWN, at[0], y);
++        // Past slop, straight up: the lock. The sheet has not moved yet.
++        barTouch(bar, t, t + 16, MotionEvent.ACTION_MOVE, at[0], y - slop - 4);
++        barTouch(bar, t, t + 24, MotionEvent.ACTION_UP, at[0], y - slop - 4 - 160);
++        assertEquals(0, clicks[0]);
++        assertEquals(1, cancels[0]);
++        assertEquals(1, pull.mBegun);
++        assertEquals(1, pull.mEnded);
++        assertEquals(160f, pull.mLastOpening, 1f);
++        // Flung upward: negative on the screen, which is what the sheet spring consumes.
++        assertTrue(pull.mVelocity < 0f);
++    }
++
++    @Test
++    public void testAHorizontalDragDoesNotOpenTheSheet() {
++        BottomBarView bar = inflateBar();
++        RecordingPull pull = new RecordingPull();
++        bar.setSheetPull(pull);
++        View plus = bar.findViewById(R.id.new_tab_button);
++        int[] clicks = new int[1];
++        plus.setOnClickListener(view -> clicks[0]++);
++        float[] at = centerOf(bar, plus);
++        int slop = ViewConfiguration.get(mActivity).getScaledTouchSlop();
++        long t = SystemClock.uptimeMillis();
++        barTouch(bar, t, t, MotionEvent.ACTION_DOWN, at[0], at[1]);
++        barTouch(bar, t, t + 16, MotionEvent.ACTION_MOVE, at[0] + slop + 30, at[1]);
++        barTouch(bar, t, t + 32, MotionEvent.ACTION_UP, 1000f, at[1]);
++        assertEquals(0, pull.mBegun);
++        assertEquals(0, pull.mEnded);
++        assertEquals(0, clicks[0]);
++        assertEquals(View.GONE, bar.findViewById(R.id.bottom_bar_swipe_slider).getVisibility());
++    }
++
++    @Test
++    public void testSideDrawerModeIgnoresAnUpwardDrag() {
++        BottomBarView bar = inflateBar();
++        RecordingPull pull = new RecordingPull();
++        pull.mWants = false;
++        bar.setSheetPull(pull);
++        View plus = bar.findViewById(R.id.new_tab_button);
++        // A real button is clickable, which is what makes it the touch target.
++        plus.setOnClickListener(view -> {});
++        int[] cancels = new int[1];
++        int[] ups = new int[1];
++        plus.setOnTouchListener(
++                (view, event) -> {
++                    int action = event.getActionMasked();
++                    if (action == MotionEvent.ACTION_CANCEL) cancels[0]++;
++                    if (action == MotionEvent.ACTION_UP) ups[0]++;
++                    return false;
++                });
++        float[] at = centerOf(bar, plus);
++        int slop = ViewConfiguration.get(mActivity).getScaledTouchSlop();
++        long t = SystemClock.uptimeMillis();
++        barTouch(bar, t, t, MotionEvent.ACTION_DOWN, at[0], at[1]);
++        barTouch(bar, t, t + 16, MotionEvent.ACTION_MOVE, at[0], at[1] - slop - 40);
++        barTouch(bar, t, t + 32, MotionEvent.ACTION_UP, at[0], at[1] - slop - 40);
++        assertEquals(0, pull.mBegun);
++        assertEquals(0, pull.mEnded);
++        assertEquals(0, cancels[0]);
++        assertEquals(1, ups[0]);
++    }
+ }
+diff --git a/chrome/browser/ui/android/bottombar/BUILD.gn b/chrome/browser/ui/android/bottombar/BUILD.gn
+index b08b0e8b18..7de96b24dd 100644
+--- a/chrome/browser/ui/android/bottombar/BUILD.gn
++++ b/chrome/browser/ui/android/bottombar/BUILD.gn
+@@ -76,6 +76,7 @@ android_library("java") {
+     "java/src/org/chromium/chrome/browser/ui/bottombar/BareToolbarSecondaryActions.java",
+     "java/src/org/chromium/chrome/browser/ui/bottombar/BareToolbarSlot.java",
+     "java/src/org/chromium/chrome/browser/ui/bottombar/BareToolbarSwipeAction.java",
++    "java/src/org/chromium/chrome/browser/ui/bottombar/BareBottomBarSheetPull.java",
+     "java/src/org/chromium/chrome/browser/ui/bottombar/BareTabSwitchDelegate.java",
+     "java/src/org/chromium/chrome/browser/ui/bottombar/BareToolbarSwipeAdjuster.java",
+     "java/src/org/chromium/chrome/browser/ui/bottombar/BareToolbarSwipePrefs.java",
+diff --git a/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BareBottomBarSheetPull.java b/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BareBottomBarSheetPull.java
+new file mode 100755
+index 0000000000..e28dd1f8b0
+--- /dev/null
++++ b/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BareBottomBarSheetPull.java
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.chrome.browser.ui.bottombar;
++
++import org.chromium.build.annotations.NullMarked;
++
++/**
++ * Pulls the tab sheet from an upward drag on the five-button bar.
++ *
++ * <p>The bar cannot see the sheet. Whatever builds the bar hands it an implementation that
++ * forwards to the same begin, update, and end the address bar uses.
++ */
++@NullMarked
++public interface BareBottomBarSheetPull {
++    /** Whether an upward drag should open the sheet. False for the side drawer and a top bar. */
++    boolean wantsPull();
++
++    /** The drag has passed touch slop. Show the sheet where it is, without animating. */
++    void beginPull();
++
++    /** The finger is {@code openingPx} pixels above where the drag locked. */
++    void updatePull(float openingPx);
++
++    /**
++     * The finger has lifted. {@code velocityY} is pixels per second on the screen, positive
++     * downward, or 0 when the touch was cancelled.
++     */
++    void endPull(float velocityY);
++}
+diff --git a/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarCoordinator.java b/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarCoordinator.java
+index cca461f2ca..78e7cf353b 100644
+--- a/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarCoordinator.java
++++ b/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarCoordinator.java
+@@ -178,6 +178,11 @@ public class BottomBarCoordinator
+         mView.setTabSwitchDelegate(delegate);
+     }
+ 
++    /** Lets an upward drag on the bar pull the bottom tab sheet. Null leaves that drag alone. */
++    public void setSheetPull(@Nullable BareBottomBarSheetPull pull) {
++        mView.setSheetPull(pull);
++    }
++
+     /**
+      * Describes each position on the bar: what it holds, what that thing needs, and how it is
+      * shown.
+diff --git a/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarView.java b/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarView.java
+index 7ce9391b7f..16fa90f82b 100644
+--- a/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarView.java
++++ b/chrome/browser/ui/android/bottombar/java/src/org/chromium/chrome/browser/ui/bottombar/BottomBarView.java
+@@ -15,6 +15,7 @@ import android.graphics.drawable.LayerDrawable;
+ import android.graphics.drawable.RippleDrawable;
+ import android.util.AttributeSet;
+ import android.view.MotionEvent;
++import android.view.VelocityTracker;
+ import android.view.ViewConfiguration;
+ import android.view.View;
+ import android.view.ViewGroup;
+@@ -71,9 +72,17 @@ public class BottomBarView extends LinearLayout {
+     /** Set once the bar is built. Null means a sideways drag cannot switch tabs. */
+     private @Nullable BareTabSwitchDelegate mTabSwitchDelegate;
+ 
++    /** Set once the bar is built. Null means an upward drag does not open the sheet. */
++    private @Nullable BareBottomBarSheetPull mSheetPull;
++
+     private float mDownX;
+     private float mDownY;
+     private boolean mSwipeActive;
++    private boolean mSheetPulling;
++    private float mPullLockY;
++    private @Nullable VelocityTracker mPullTracker;
++    private long mPullTrackedTime = Long.MIN_VALUE;
++    private int mPullTrackedAction = -1;
+     private boolean mLongPressConsumed;
+     private @BareToolbarSwipeAction int mSwipeAction = BareToolbarSwipeAction.OFF;
+     private float mSwipeStartValue;
+@@ -332,14 +341,20 @@ public class BottomBarView extends LinearLayout {
+         mSwipeAdjuster = adjuster;
+     }
+ 
++    /** Lets an upward drag pull the bottom tab sheet. Null leaves that drag alone. */
++    public void setSheetPull(@Nullable BareBottomBarSheetPull pull) {
++        mSheetPull = pull;
++    }
++
+     /**
+-     * Watches for a sideways drag without taking the touch away from the buttons.
++     * Watches for a sideways drag, or an upward drag that opens the sheet, without taking the
++     * touch away from the buttons.
+      *
+      * <p>Nothing is claimed on the way down. A button needs the press to know it has been pressed,
+      * and it needs to keep it for as long as the finger is still, or there would be no tap and
+-     * later no long press. Only once the finger has travelled far enough sideways to mean it does
+-     * the bar take over, and Android then tells the button its touch was cancelled, which is what
+-     * stops it firing when the finger lifts.
++     * later no long press. Only once the finger has travelled far enough to mean it does the bar
++     * take over, and Android then tells the button its touch was cancelled, which is what stops it
++     * firing when the finger lifts.
+      */
+     @Override
+     public boolean onInterceptTouchEvent(MotionEvent event) {
+@@ -348,10 +363,20 @@ public class BottomBarView extends LinearLayout {
+                 onGestureDown(event);
+                 return false;
+             case MotionEvent.ACTION_MOVE:
+-                if (mSwipeActive) return true;
++                trackPull(event);
++                if (mSwipeActive || mSheetPulling) return true;
++                if (isUpwardSheetPull(event)) {
++                    beginSheetPull(event);
++                    return true;
++                }
+                 if (!isHorizontalDrag(event)) return false;
+                 beginSwipe(event);
+                 return true;
++            case MotionEvent.ACTION_UP:
++            case MotionEvent.ACTION_CANCEL:
++                // The button still owns this touch. Drop the tracker the down event started.
++                if (!mSheetPulling) recyclePullTracker();
++                return false;
+             default:
+                 return false;
+         }
+@@ -365,18 +390,34 @@ public class BottomBarView extends LinearLayout {
+         // Done via onTouchEvent instead of clickable="true" so TalkBack doesn't announce the
+         // entire bottom bar layout as a button.
+         //
+-        // A sideways drag that starts between the buttons reaches the bar here rather than
+-        // through onInterceptTouchEvent, so it is followed from this method as well.
++        // A drag that starts between the buttons reaches the bar here rather than through
++        // onInterceptTouchEvent, so it is followed from this method as well.
+         switch (event.getActionMasked()) {
+             case MotionEvent.ACTION_DOWN:
+                 onGestureDown(event);
+                 break;
+             case MotionEvent.ACTION_MOVE:
++                if (!mSheetPulling && !mSwipeActive && isUpwardSheetPull(event)) {
++                    beginSheetPull(event);
++                }
++                if (mSheetPulling) {
++                    updateSheetPull(event);
++                    break;
++                }
++                trackPull(event);
+                 if (!mSwipeActive && isHorizontalDrag(event)) beginSwipe(event);
+                 if (mSwipeActive) updateSwipe(event);
+                 break;
+             case MotionEvent.ACTION_UP:
+             case MotionEvent.ACTION_CANCEL:
++                if (mSheetPulling) {
++                    // The lift is part of the drag. The sheet should be where the finger left.
++                    if (event.getActionMasked() == MotionEvent.ACTION_UP) updateSheetPull(event);
++                    endSheetPull(
++                            event.getActionMasked() == MotionEvent.ACTION_UP ? event : null);
++                    break;
++                }
++                recyclePullTracker();
+                 if (mSwipeActive) {
+                     endSwipe(event.getActionMasked() == MotionEvent.ACTION_UP ? event : null);
+                 }
+@@ -392,8 +433,14 @@ public class BottomBarView extends LinearLayout {
+         mDownX = event.getX();
+         mDownY = event.getY();
+         mSwipeActive = false;
++        mSheetPulling = false;
+         mLongPressConsumed = false;
+         mSwipeAction = BareToolbarSwipeAction.OFF;
++        recyclePullTracker();
++        if (mSheetPull != null) {
++            mPullTracker = VelocityTracker.obtain();
++            trackPull(event);
++        }
+         if (mSwipeAdjuster == null) return;
+         @BareToolbarSwipeAction int action = BareToolbarSwipePrefs.getAction();
+         if (action != BareToolbarSwipeAction.OFF && mSwipeAdjuster.canAdjust(action)) {
+@@ -408,11 +455,12 @@ public class BottomBarView extends LinearLayout {
+      * Whether the finger has said it is going sideways.
+      *
+      * <p>Android's own slop is the distance below which a finger is considered still, so a tap is
+-     * a tap however unsteady the hand. Past that, the movement has to be more sideways than not:
+-     * the bar sits at the bottom of the screen where upward drags are how the phone is put away.
++     * a tap however unsteady the hand. Past that, the movement has to be more sideways than not.
++     * An upward drag is left for the sheet when that pull is armed, and otherwise for the gesture
++     * that leaves the app.
+      */
+     private boolean isHorizontalDrag(MotionEvent event) {
+-        if (mSwipeAction == BareToolbarSwipeAction.OFF) return false;
++        if (mSwipeAction == BareToolbarSwipeAction.OFF || mSheetPulling) return false;
+         // One touch, one thing. A hold that has already run something has spent this gesture, and
+         // sliding away from it afterwards would be a second answer to a question asked once.
+         if (mLongPressConsumed) return false;
+@@ -421,8 +469,82 @@ public class BottomBarView extends LinearLayout {
+         return Math.abs(dx) > mTouchSlop && Math.abs(dx) > Math.abs(dy);
+     }
+ 
++    /**
++     * Whether the finger has moved up past touch slop, and more up than sideways.
++     *
++     * <p>The sheet is only asked when it wants the drag. A hold that already ran is left alone.
++     */
++    private boolean isUpwardSheetPull(MotionEvent event) {
++        BareBottomBarSheetPull pull = mSheetPull;
++        if (pull == null || mLongPressConsumed || mSwipeActive || mSheetPulling) {
++            return false;
++        }
++        if (!pull.wantsPull()) return false;
++        float dx = event.getX() - mDownX;
++        float dy = event.getY() - mDownY;
++        return dy < 0f && Math.abs(dy) > mTouchSlop && Math.abs(dy) > Math.abs(dx);
++    }
++
++    /** Hands the drag to the sheet and records where 1:1 movement starts. */
++    private void beginSheetPull(MotionEvent event) {
++        BareBottomBarSheetPull pull = mSheetPull;
++        if (pull == null || mSheetPulling) return;
++        mSheetPulling = true;
++        mPullLockY = event.getY();
++        pull.beginPull();
++        pull.updatePull(0f);
++    }
++
++    /** Moves the sheet by how far the finger has gone up since the lock. */
++    private void updateSheetPull(MotionEvent event) {
++        trackPull(event);
++        BareBottomBarSheetPull pull = mSheetPull;
++        if (pull == null) return;
++        pull.updatePull(mPullLockY - event.getY());
++    }
++
++    /**
++     * Gives the release speed to the sheet. A cancelled touch passes 0.
++     *
++     * @param liftEvent The event that lifted the finger, or null if the touch was cancelled.
++     */
++    private void endSheetPull(@Nullable MotionEvent liftEvent) {
++        float velocityY = 0f;
++        if (liftEvent != null) {
++            trackPull(liftEvent);
++            if (mPullTracker != null) {
++                mPullTracker.computeCurrentVelocity(1000);
++                velocityY = mPullTracker.getYVelocity();
++            }
++        }
++        mSheetPulling = false;
++        recyclePullTracker();
++        BareBottomBarSheetPull pull = mSheetPull;
++        if (pull != null) pull.endPull(velocityY);
++    }
++
++    /** Records one sample. The same event can arrive from intercept and from onTouchEvent. */
++    private void trackPull(MotionEvent event) {
++        if (mPullTracker == null) return;
++        int action = event.getActionMasked();
++        if (mPullTrackedTime == event.getEventTime() && mPullTrackedAction == action) return;
++        mPullTrackedTime = event.getEventTime();
++        mPullTrackedAction = action;
++        mPullTracker.addMovement(event);
++    }
++
++    private void recyclePullTracker() {
++        if (mPullTracker != null) {
++            mPullTracker.recycle();
++            mPullTracker = null;
++        }
++        mPullTrackedTime = Long.MIN_VALUE;
++        mPullTrackedAction = -1;
++    }
++
+     /** Puts the slider where the buttons were. */
+     private void beginSwipe(MotionEvent event) {
++        recyclePullTracker();
+         if (mSwipeAdjuster == null) return;
+         mSwipeActive = true;
+         // A tab switch is one step taken when the finger lifts. The buttons stay where they
+-- 
+2.34.1
+
