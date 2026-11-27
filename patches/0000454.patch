@@ -1,0 +1,695 @@
+From f45a39cd1b309de2b69a7b66f4efc50cfc8a165e Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:04:56 +0000
+Subject: [PATCH] Bare: settle the bottom tab sheet with a spring from the
+ finger's speed
+
+The bottom-bar tab sheet settled with a fixed 320 ms animator that
+dropped the release velocity, and the page dim and scale stopped at
+half, so a fling to full felt forced.
+
+Releasing a drag now settles with a damped spring (stiffness 700,
+damping ratio 0.9) that starts from the finger's velocity. Tapping open,
+Back and close() use the same spring from rest. A new drag cancels the
+spring and continues 1:1 from the current progress. Shown progress is
+clamped to [0, 1] and the close restore runs once when the spring rests
+at 0.
+
+Page dim and scale follow progress past half: half looks as before
+(scale 0.95, scrim 0.35) and full goes further (scale 0.9375, scrim
+0.4375). The top-bar sheet and the side drawer keep their animator.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 349 +++++++++++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 122 ++++++
+ 2 files changed, 452 insertions(+), 19 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 5fa20cd79b..638606a69e 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -35,6 +35,8 @@ import android.text.TextUtils;
+ import android.text.TextWatcher;
+ import android.text.style.ForegroundColorSpan;
+ import android.util.TypedValue;
++import android.provider.Settings;
++import android.view.Choreographer;
+ import android.view.Gravity;
+ import android.view.HapticFeedbackConstants;
+ import android.view.MotionEvent;
+@@ -147,6 +149,9 @@ import java.util.function.Supplier;
+ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sheet {
+     private static final long DURATION_MS = 380;
+     private static final long SHEET_DURATION_MS = 320;
++    /** Bottom-sheet settle. Ratio 0.9 can overshoot; shown progress is clamped. */
++    private static final float SHEET_SPRING_STIFFNESS = 700f;
++    private static final float SHEET_SPRING_DAMPING = 0.9f;
+     private static final float SHEET_FULL_GAP_DP = 8f;
+     // Clearance under a bottom-bar sheet so its action row, and the 48dp touch
+     // target of every button in that row, stays clear of the toolbar. A top-bar
+@@ -158,9 +163,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final float MAX_WIDTH_DP = 400f;
+     private static final float PAGE_SHIFT_DP = 30f;
+     private static final float GLASS_SCRIM = 0.45f;
+-    // Bottom-sheet page card. 0 is closed, full at half-open, then held to full.
++    // Bottom-sheet page card. Dim 0 is closed. Dim 1 is half, which is today's look.
++    // Full adds PAGE_DIM_FULL_EXTRA, so scale and scrim keep moving past half.
+     private static final float PAGE_DIM_ALPHA = 0.35f;
+     private static final float PAGE_SCALE = 0.95f;
++    private static final float PAGE_DIM_FULL_EXTRA = 0.25f;
+     private static final float PAGE_CORNER_DP = 20f;
+     // From this window width on, the sheet stops filling the width and is centered (Material's
+     // bottom sheet guidance: at most 640dp wide).
+@@ -227,6 +234,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private @Nullable TabAdapter mAdapter;
+     private @Nullable OnBackPressedCallback mBackCallback;
+     private @Nullable ValueAnimator mAnimator;
++    /** Bottom-sheet settle. Null for the top sheet and the side drawer. */
++    private @Nullable SheetSpring mSheetSpring;
+     private @Nullable ValueAnimator mBackAnimator;
+     // How far the predictive back gesture has shrunk the sheet: 0 is not at all.
+     private float mBackProgress;
+@@ -697,6 +706,24 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (back != null) back.end();
+         ValueAnimator animator = mAnimator;
+         if (animator != null) animator.end();
++        SheetSpring spring = mSheetSpring;
++        if (spring != null) spring.end();
++    }
++
++    boolean sheetSpringRunningForTesting() {
++        return mSheetSpring != null;
++    }
++
++    /** Advances the bottom-sheet spring by {@code dtSeconds}. No-op when it is idle. */
++    void stepSheetSpringForTesting(float dtSeconds) {
++        SheetSpring spring = mSheetSpring;
++        if (spring == null || dtSeconds <= 0f) return;
++        spring.ensureStarted();
++        spring.step(dtSeconds);
++        if (mSheetSpring != spring) return;
++        applyProgress(spring.shown());
++        if (mSheetSpring != spring) return;
++        if (spring.atRest()) spring.end();
+     }
+ 
+     static void setGlassForTesting(@Nullable Boolean glass) {
+@@ -814,6 +841,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     public void close() {
++        closeAtVelocity(0f);
++    }
++
++    private void closeAtVelocity(float progressVelocity) {
+         if (!mOpen) return;
+         mOpen = false;
+         watchFocus(false);
+@@ -826,6 +857,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         setBackProgress(0f);
+         animateTo(
+                 0f,
++                progressVelocity,
+                 () -> {
+                     if (mOpen) return;
+                     // The last progress frame parked the morph on the bar. Drop it next frame,
+@@ -847,6 +879,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // jumped the sheet to the bar on the first frame and left only the dim
+         // moving. Park on the last frame, once progress has arrived.
+         return bottomBarMorph()
++                && mSheetSpring == null
+                 && !mToolbarPulling
+                 && !mOpen
+                 && mProgress <= 0.001f
+@@ -932,7 +965,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     public void destroy() {
+         mHandlingDismiss = true;
+         unregisterHostCallbacks();
+-        if (mAnimator != null) mAnimator.cancel();
++        cancelSettle();
+         if (mBackAnimator != null) mBackAnimator.cancel();
+         watchFocus(false);
+         watchDialogLayout(false);
+@@ -1198,7 +1231,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         try {
+             mOpen = false;
+             mProgress = 0f;
+-            if (mAnimator != null) mAnimator.cancel();
++            cancelSettle();
+             watchFocus(false);
+             watchDialogLayout(false);
+             clearSearch();
+@@ -3097,8 +3130,93 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     // Motion.
+ 
+-    private void animateTo(float target, @Nullable Runnable onEnd) {
++
++    /** Cancels a settle without snapping, so a new drag continues from this progress. */
++    private void cancelSettle() {
+         if (mAnimator != null) mAnimator.cancel();
++        SheetSpring spring = mSheetSpring;
++        if (spring != null) {
++            mSheetSpring = null;
++            spring.cancel();
++        }
++    }
++
++    private boolean settleIdle() {
++        return mAnimator == null && mSheetSpring == null;
++    }
++
++    /**
++     * Animator duration scale. 10 makes a settle take ten times as long, matching
++     * ValueAnimator. 0 means animations are off, so the caller jumps to the target.
++     */
++    private float animatorDurationScale() {
++        try {
++            float scale =
++                    Settings.Global.getFloat(
++                            mActivity.getContentResolver(),
++                            Settings.Global.ANIMATOR_DURATION_SCALE,
++                            1f);
++            if (scale < 0f) return 1f;
++            return scale;
++        } catch (RuntimeException ex) {
++            return 1f;
++        }
++    }
++
++    /**
++     * Bottom-sheet page dim. 0 is closed and 1 is today's half (scale 0.95, scrim 0.35).
++     * Full is {@code 1 + PAGE_DIM_FULL_EXTRA}, so the dim keeps moving past half.
++     */
++    private float pageDimForProgress(float progress) {
++        float half = BareTabSheetSnap.HALF_RATIO;
++        float clamped = Math.max(0f, Math.min(1f, progress));
++        if (half <= 0f) return clamped;
++        if (clamped <= half) return clamped / half;
++        return 1f + PAGE_DIM_FULL_EXTRA * ((clamped - half) / (1f - half));
++    }
++
++    /** {@code towardClosed} is px/s toward the closed stop. The result opens the sheet. */
++    private float progressVelocityFromScreen(float towardClosed) {
++        int range = Math.max(1, sheetRangeHeight());
++        return -towardClosed / (float) range;
++    }
++
++    private void startSheetSpring(float target, float velocity, @Nullable Runnable onEnd) {
++        float scale = animatorDurationScale();
++        boolean alreadyThere = Math.abs(target - mProgress) < 0.0008f && Math.abs(velocity) < 0.02f;
++        if (scale == 0f || alreadyThere) {
++            applyProgress(target);
++            if (onEnd != null) onEnd.run();
++            return;
++        }
++        SheetSpring spring = new SheetSpring();
++        Runnable settled =
++                () -> {
++                    if (mSheetSpring == spring) mSheetSpring = null;
++                    applyProgress(target);
++                    if (onEnd != null) onEnd.run();
++                };
++        spring.prepare(mProgress, velocity, target, scale, settled);
++        mSheetSpring = spring;
++        FrameLayout root = mRoot;
++        boolean delayOpen = mProgress <= 0.001f && target > mProgress && root != null;
++        if (delayOpen) {
++            spring.armDelayed(root);
++            return;
++        }
++        spring.start();
++    }
++
++    private void animateTo(float target, @Nullable Runnable onEnd) {
++        animateTo(target, 0f, onEnd);
++    }
++
++    private void animateTo(float target, float progressVelocity, @Nullable Runnable onEnd) {
++        cancelSettle();
++        if (bottomBarMorph()) {
++            startSheetSpring(target, progressVelocity, onEnd);
++            return;
++        }
+         ValueAnimator animator = ValueAnimator.ofFloat(mProgress, target);
+         float distance = Math.abs(target - mProgress);
+         float half = BareTabSheetSnap.HALF_RATIO + 0.001f;
+@@ -3183,9 +3301,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         Panel panel = mPanel;
+         if (scrim != null) {
+             if (isSheetChrome()) {
+-                // Dim the page from the first peek, and keep it dimmed from half onward.
++                // Top bar keeps the half plateau. Bottom half matches today; full goes on.
+                 float half = BareTabSheetSnap.HALF_RATIO;
+-                float dim = half <= 0f ? mProgress : Math.min(1f, mProgress / half);
++                float dim =
++                        sheetFromTop()
++                                ? (half <= 0f ? mProgress : Math.min(1f, mProgress / half))
++                                : pageDimForProgress(mProgress);
+                 if (sheetFromTop()) {
+                     // The address bar stays bright, and so does the status bar above it.
+                     // The page is dimmed and not scaled.
+@@ -3270,8 +3391,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /**
+      * Scales the page content under a bottom sheet and rounds it. {@code dim} is 0 when
+-     * closed and 1 from half-open up. The compositor view is the page; the sheet, the bottom
+-     * toolbar and the origin pill are not children of it, so they stay full size.
++     * closed, 1 at half (the previous full effect), and a bit more than 1 at full. The
++     * compositor view is the page; the sheet, the bottom toolbar and the origin pill are
++     * not children of it, so they stay full size.
+      */
+     private void applyPageCard(float dim) {
+         if (!pageCardWanted() || dim <= 0.001f) {
+@@ -3586,7 +3708,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         return;
+                     }
+                     float half = BareTabSheetSnap.HALF_RATIO;
+-                    float dim = half <= 0f ? mProgress : Math.min(1f, mProgress / half);
++                    float dim =
++                            sheetFromTop()
++                                    ? (half <= 0f
++                                            ? mProgress
++                                            : Math.min(1f, mProgress / half))
++                                    : pageDimForProgress(mProgress);
+                     applyPageCard(dim);
+                 });
+     }
+@@ -3855,7 +3982,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     }
+ 
+     private void dragTo(float dx) {
+-        if (mAnimator != null) mAnimator.cancel();
++        cancelSettle();
+         int width = mPanelWidth > 0 ? mPanelWidth : 1;
+         applyProgress(1f + Math.min(0f, dx * mSide) / width);
+     }
+@@ -4005,7 +4132,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     mSheetGestureMoved = true;
+                     mSheetDragStartY = ev.getRawY();
+                     mSheetDragStartProgress = mProgress;
+-                    if (mAnimator != null) mAnimator.cancel();
++                    cancelSettle();
+                     if (view.getParent() != null) {
+                         view.getParent().requestDisallowInterceptTouchEvent(true);
+                     }
+@@ -4052,7 +4179,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Moves the sheet {@code towardClosed} pixels toward its toolbar. */
+     private void dragSheetBy(float towardClosed) {
+-        if (mAnimator != null) mAnimator.cancel();
++        cancelSettle();
+         applyProgress(mProgress - towardClosed / sheetRangeHeight());
+     }
+ 
+@@ -4060,22 +4187,28 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private void finishSheetDrag(float velocityY) {
+         // The snap rules take positive as toward closed, which is upward for a dropped sheet.
+         float towardClosed = sheetFromTop() ? -velocityY : velocityY;
++        float progressVelocity = progressVelocityFromScreen(towardClosed);
+         BareTabSheetSnap.State next =
+                 BareTabSheetSnap.snap(mProgress, towardClosed, dp(SHEET_FLING_DP_PER_S));
+         if (next == BareTabSheetSnap.State.HIDDEN) {
+             // A drag is not a pill tap, and its finger-up must not land in the omnibox.
+             mDragClosedSheet = true;
+             cancelPendingOmniboxFocus();
+-            close();
++            closeAtVelocity(progressVelocity);
+         } else {
+-            settleSheet(next, /* announce= */ true);
++            settleSheet(next, progressVelocity, /* announce= */ true);
+         }
+     }
+ 
+     /** Moves the sheet to {@code state} and, once there, tells TalkBack if it changed. */
+     private void settleSheet(BareTabSheetSnap.State requested, boolean announce) {
++        settleSheet(requested, 0f, announce);
++    }
++
++    private void settleSheet(
++            BareTabSheetSnap.State requested, float progressVelocity, boolean announce) {
+         if (requested == BareTabSheetSnap.State.HIDDEN) {
+-            close();
++            closeAtVelocity(progressVelocity);
+             return;
+         }
+         BareTabSheetSnap.State state =
+@@ -4084,6 +4217,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         : requested;
+         animateTo(
+                 BareTabSheetSnap.progressOf(state),
++                progressVelocity,
+                 () -> {
+                     BareTabSheetSnap.State before = mSettledState;
+                     mSettledState = state;
+@@ -4245,7 +4379,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     @Override
+     public void beginToolbarPull() {
+         mToolbarPulling = true;
+-        if (mAnimator != null) mAnimator.cancel();
++        cancelSettle();
+         if (!mOpen) {
+             // A close cut short by this drag never let go of the tab model; let go now, so
+             // showing again does not watch it twice.
+@@ -4258,7 +4392,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     @Override
+     public void updateToolbarPull(float openingPx) {
+         if (!mOpen) return;
+-        if (mAnimator != null) mAnimator.cancel();
++        cancelSettle();
+         applyProgress(mSheetDragStartProgress + openingPx / sheetRangeHeight());
+     }
+ 
+@@ -6382,7 +6516,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (!mOpen || !isSheetChrome()) return false;
+         if (stop != BareTabSheetSnap.State.HALF && stop != BareTabSheetSnap.State.FULL) return false;
+         float target = BareTabSheetSnap.progressOf(stop);
+-        return !(stop == mSettledState && mAnimator == null && Math.abs(mProgress - target) < 0.001f);
++        return !(stop == mSettledState && settleIdle() && Math.abs(mProgress - target) < 0.001f);
+     }
+ 
+     private void restoreStopAfterSearch() {
+@@ -6391,7 +6525,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (!mOpen || !isSheetChrome()) return;
+         if (stop != BareTabSheetSnap.State.HALF && stop != BareTabSheetSnap.State.FULL) return;
+         float target = BareTabSheetSnap.progressOf(stop);
+-        if (stop == mSettledState && mAnimator == null && Math.abs(mProgress - target) < 0.001f) {
++        if (stop == mSettledState && settleIdle() && Math.abs(mProgress - target) < 0.001f) {
+             return;
+         }
+         settleSheet(stop, /* announce= */ true);
+@@ -8348,4 +8482,181 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             }
+         }
+     }
++
++    /**
++     * Underdamped settle for a bottom sheet. Stiffness 700 and damping 0.9 match
++     * androidx SpringForce (mass 1). Shown progress is clamped to 0..1. A close that
++     * dips below 0 stays just open until the spring is at rest, so the page card and
++     * the morph park once.
++     */
++    private final class SheetSpring implements Choreographer.FrameCallback {
++        private float mValue;
++        private float mVelocity;
++        private float mTarget;
++        private float mScale = 1f;
++        private float mSim;
++        private long mLastNanos;
++        private boolean mStarted;
++        private boolean mDiscarded;
++        private @Nullable Runnable mSettled;
++        private @Nullable Runnable mDelayed;
++        private @Nullable View mDelayHost;
++        private ViewTreeObserver.@Nullable OnPreDrawListener mPreDraw;
++
++        void prepare(float from, float velocity, float target, float scale, Runnable settled) {
++            mValue = from;
++            mVelocity = velocity;
++            mTarget = target;
++            mScale = scale <= 0f ? 1f : scale;
++            mSettled = settled;
++        }
++
++        void start() {
++            if (mDiscarded || mStarted) return;
++            mStarted = true;
++            clearDelay();
++            postFrame();
++        }
++
++        /** Lets a test step a spring that is still waiting for the first draw. */
++        void ensureStarted() {
++            mStarted = true;
++        }
++
++        void armDelayed(View host) {
++            mDelayHost = host;
++            Runnable delayed =
++                    () -> {
++                        if (mDiscarded || mStarted) return;
++                        start();
++                    };
++            mDelayed = delayed;
++            mPreDraw =
++                    new ViewTreeObserver.OnPreDrawListener() {
++                        @Override
++                        public boolean onPreDraw() {
++                            ViewTreeObserver observer = host.getViewTreeObserver();
++                            if (observer.isAlive()) observer.removeOnPreDrawListener(this);
++                            host.post(delayed);
++                            return true;
++                        }
++                    };
++            host.getViewTreeObserver().addOnPreDrawListener(mPreDraw);
++            host.invalidate();
++            host.postDelayed(delayed, 150);
++        }
++
++        void cancel() {
++            mDiscarded = true;
++            mSettled = null;
++            clearDelay();
++            removeFrame();
++        }
++
++        void end() {
++            if (mDiscarded) return;
++            mDiscarded = true;
++            clearDelay();
++            removeFrame();
++            Runnable settled = mSettled;
++            mSettled = null;
++            if (settled != null) settled.run();
++        }
++
++        boolean atRest() {
++            return Math.abs(mValue - mTarget) < 0.001f && Math.abs(mVelocity) < 0.05f;
++        }
++
++        float shown() {
++            float shown = mValue;
++            if (shown < 0f) shown = 0f;
++            if (shown > 1f) shown = 1f;
++            // Hold just above the park threshold until end() applies the real 0.
++            if (mTarget <= 0.001f && shown < 0.002f) shown = 0.002f;
++            return shown;
++        }
++
++        void step(float dt) {
++            if (dt <= 0f) return;
++            double wn = Math.sqrt(SHEET_SPRING_STIFFNESS);
++            double zeta = SHEET_SPRING_DAMPING;
++            double wd = wn * Math.sqrt(Math.max(0.0, 1.0 - zeta * zeta));
++            if (wd < 1e-4) {
++                mValue = mTarget;
++                mVelocity = 0f;
++                return;
++            }
++            double x0 = mValue - mTarget;
++            double v0 = mVelocity;
++            double exp = Math.exp(-zeta * wn * dt);
++            double cos = Math.cos(wd * dt);
++            double sin = Math.sin(wd * dt);
++            double cosCoeff = x0;
++            double sinCoeff = (v0 + zeta * wn * x0) / wd;
++            double offset = exp * (cosCoeff * cos + sinCoeff * sin);
++            double vel =
++                    exp
++                            * (-zeta * wn * (cosCoeff * cos + sinCoeff * sin)
++                                    + wd * (-cosCoeff * sin + sinCoeff * cos));
++            mValue = (float) (mTarget + offset);
++            mVelocity = (float) vel;
++        }
++
++        @Override
++        public void doFrame(long frameTimeNanos) {
++            if (mDiscarded || mSheetSpring != this) return;
++            float dtReal;
++            if (mLastNanos == 0L) {
++                dtReal = 0.016f;
++            } else {
++                dtReal = (frameTimeNanos - mLastNanos) / 1_000_000_000f;
++                if (dtReal < 0f) dtReal = 0f;
++                if (dtReal > 0.05f) dtReal = 0.05f;
++            }
++            mLastNanos = frameTimeNanos;
++            float dt = dtReal / mScale;
++            mSim += dt;
++            step(dt);
++            if (mDiscarded || mSheetSpring != this) return;
++            applyProgress(shown());
++            if (mDiscarded || mSheetSpring != this) return;
++            if (atRest() || mSim > 4f) {
++                end();
++                return;
++            }
++            postFrame();
++        }
++
++        private void postFrame() {
++            try {
++                Choreographer.getInstance().postFrameCallback(this);
++            } catch (RuntimeException ex) {
++                // Unit tests step the spring themselves.
++            }
++        }
++
++        private void removeFrame() {
++            try {
++                Choreographer.getInstance().removeFrameCallback(this);
++            } catch (RuntimeException ex) {
++                // No choreographer in this test.
++            }
++        }
++
++        private void clearDelay() {
++            View host = mDelayHost;
++            Runnable delayed = mDelayed;
++            ViewTreeObserver.OnPreDrawListener preDraw = mPreDraw;
++            if (host != null) {
++                if (delayed != null) host.removeCallbacks(delayed);
++                ViewTreeObserver observer = host.getViewTreeObserver();
++                if (preDraw != null && observer.isAlive()) {
++                    observer.removeOnPreDrawListener(preDraw);
++                }
++            }
++            mPreDraw = null;
++            mDelayed = null;
++        }
++    }
++
+ }
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 8a14e51b53..17d0bfe434 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -3607,4 +3607,126 @@ public class BareVerticalTabsDrawerUnitTest {
+             }
+         }
+     }
++
++    @Test
++    public void testSheetSpringReachesEachStopAndCloseRestoresThePage() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View page = attachPage();
++        page.measure(
++                View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(2000, View.MeasureSpec.EXACTLY));
++        page.layout(0, 0, 1080, 2000);
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.4f);
++        mDrawer.endToolbarPull(0f);
++        assertTrue(mDrawer.sheetSpringRunningForTesting());
++        settleSheetSpring();
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.001f);
++        assertEquals(0.95f, page.getScaleX(), 0.01f);
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++
++        mDrawer.finishSheetDragForTesting(-20_000f);
++        assertTrue(mDrawer.sheetSpringRunningForTesting());
++        settleSheetSpring();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++        assertTrue("full scale " + page.getScaleX(), page.getScaleX() < 0.945f);
++
++        mDrawer.applyProgressForTesting(0.35f);
++        mDrawer.finishSheetDragForTesting(0f);
++        settleSheetSpring();
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.001f);
++
++        mDrawer.close();
++        assertFalse(mDrawer.isOpen());
++        assertTrue(mDrawer.sheetSpringRunningForTesting());
++        mDrawer.stepSheetSpringForTesting(0.016f);
++        assertTrue("mid close scale " + page.getScaleX(), page.getScaleX() < 0.99f);
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        assertEquals(View.VISIBLE, root.getVisibility());
++        settleSheetSpring();
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++        assertEquals(1f, page.getScaleX(), 0.001f);
++        assertEquals(View.VISIBLE, root.getVisibility());
++        mDrawer.flushCloseHandoffForTesting();
++        assertEquals(View.GONE, root.getVisibility());
++        mDrawer.stepSheetSpringForTesting(0.05f);
++        assertEquals(0f, mDrawer.progressForTesting(), 0.001f);
++        assertEquals(1f, page.getScaleX(), 0.001f);
++    }
++
++    @Test
++    public void testSheetSpringVelocityCarriesAndADragCancelsIt() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.8f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.stepSheetSpringForTesting(0.05f);
++        float slow = mDrawer.progressForTesting();
++        mDrawer.beginToolbarPull();
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++        assertEquals(slow, mDrawer.progressForTesting(), 0.0001f);
++        mDrawer.updateToolbarPull(range * (0.8f - slow));
++        assertEquals(0.8f, mDrawer.progressForTesting(), 0.02f);
++        mDrawer.endToolbarPull(-10_000f);
++        mDrawer.stepSheetSpringForTesting(0.05f);
++        float fast = mDrawer.progressForTesting();
++        assertTrue("fast " + fast + " slow " + slow, fast > slow + 0.02f);
++        settleSheetSpring();
++        assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
++
++        mDrawer.beginToolbarPull();
++        mDrawer.updateToolbarPull(range * (0.3f - 1f));
++        assertEquals(0.3f, mDrawer.progressForTesting(), 0.02f);
++        mDrawer.endToolbarPull(0f);
++        assertTrue(mDrawer.sheetSpringRunningForTesting());
++        float before = mDrawer.progressForTesting();
++        mDrawer.stepSheetSpringForTesting(0.032f);
++        float mid = mDrawer.progressForTesting();
++        assertTrue("mid " + mid + " before " + before, mid > before);
++        mDrawer.beginToolbarPull();
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++        assertEquals(mid, mDrawer.progressForTesting(), 0.0001f);
++        mDrawer.updateToolbarPull(range * 0.1f);
++        assertEquals(mid + 0.1f, mDrawer.progressForTesting(), 0.02f);
++    }
++
++    @Test
++    public void testPageDimAtHalfMatchesTodayAndFullGoesFurther() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View page = attachPage();
++        int range = beginPullAndLayOut();
++        mDrawer.updateToolbarPull(range * 0.5f);
++        assertEquals(0.95f, page.getScaleX(), 0.01f);
++        float halfAlpha = sheetScrim().getAlpha();
++        assertTrue("half alpha " + halfAlpha, halfAlpha >= 0.3f && halfAlpha <= 0.4f);
++        mDrawer.updateToolbarPull(range * 1f);
++        assertTrue("full scale " + page.getScaleX(), page.getScaleX() < 0.945f);
++        assertTrue(
++                "full alpha " + sheetScrim().getAlpha(),
++                sheetScrim().getAlpha() > halfAlpha + 0.04f);
++    }
++
++    @Test
++    public void testTheTopSheetDoesNotUseTheBottomSpring() {
++        setAddressBarOnTop(true);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        mDrawer.open();
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++        mDrawer.finishAnimationForTesting();
++        assertEquals(BareTabSheetSnap.HALF_RATIO, mDrawer.progressForTesting(), 0.01f);
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++    }
++
++    private void settleSheetSpring() {
++        for (int i = 0; i < 300; i++) {
++            if (!mDrawer.sheetSpringRunningForTesting()) return;
++            mDrawer.stepSheetSpringForTesting(0.016f);
++        }
++        assertTrue("spring did not settle at " + mDrawer.progressForTesting(), false);
++    }
++
+ }
+-- 
+2.34.1
+
