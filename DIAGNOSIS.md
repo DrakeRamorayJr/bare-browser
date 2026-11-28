@@ -330,3 +330,85 @@ back up and a reopen clear the shift.
   from the real views relative to their bar, so the pill text is where the real text will be on the next frame.
 - While a close travels, up to 16 small icon views are drawn into software bitmaps each frame, as the
   hand-off already does for its 130 ms. The bitmaps are reused, and a view that cannot be drawn falls back.
+
+# Follow-up: the url text and favicon copy ended 8dp from where the real bar rests (patch `0000460`)
+
+A test of `0000459` on an emulator (light, back, 40x slow animations, measured at 360 px capture width, so one capture
+pixel is one dp) showed the icon size and position continuous across the hand-off start and the url text pop gone.
+One step was left. The pill's url text sat 7 to 8 px to the right of the settled real bar before the hand-off and
+through its fade, and the text and the favicon stepped about 8 px to the left, in one frame, when the real bar took
+over.
+
+## Root cause
+
+- The copies are laid onto the live real bar. From the first frame of the close to the end of the fade the pill's
+  text is walked onto the real first glyph (`alignMorphTextTowardsReal()`, `alignMorphText()`), the favicon copy is
+  placed at the real favicon's rect and the url bitmap at the real url view's rect, all read from the live views
+  each frame. A copy therefore ends wherever the real bar is laid out at that moment, and anything that moves the
+  real bar after the copies were laid onto it moves them, or leaves them where the real bar no longer is.
+- The real bar was not laid out where it rests. `setAddressSurfaceHidden()` hid the real status view
+  (`location_bar_status`) with `View.INVISIBLE`, as it hides the rest of the address bar, for as long as the
+  sheet was open. Chromium's `LocationBarLayout` observes that view's visibility
+  (`StatusView.getIsVisibleSupplier()`) and calls `updateStartPadding()`, which gives the location bar
+  `location_bar_icon_starting_padding` (8dp) of start padding while the status view is not visible and the back
+  button is not, and none while it is (`R.dimen.location_bar_icon_starting_padding` is 8dp, and the flag that
+  gates it, `ANDROID_PAGE_INFO_AS_APP_MENU_ITEM`, is on by default in 158). So with the sheet open the bar's
+  favicon, and the url text of a url that does not fit and is not centred, were laid out 8dp further in than they
+  rest, and the status view was shown again on the first frame of the hand-off, which took the padding off a layout
+  pass later. The copies had been laid onto the padded glyphs on the travel frames and on the park frame, so
+  they followed the bar the 8dp across when it relaid, and the real bar's own glyphs ended where the copies were
+  not.
+- This is the same 8 as the 8 px that `0000458` showed for two frames at the hand-off start and then 0: the pill's
+  text was at the resting inset (`mRestTextLead`, stored before the sheet opened) and the live bar's was 8dp
+  further in until it relaid. `0000459` made the text walk onto the live glyphs, so the 8 moved from the hand-off
+  frame to the layout pass after the reveal; it did not cause it.
+
+## Fix (patch `0000460`)
+
+Only the real status view's hiding changes, and only once the sheet is closing. The bar band, the `+` highlight, the
+page and top toolbar restore, the 130 ms fade, the url bitmap, the circular favicon copy and the icon size and text
+origin of the way down are as they were.
+
+- `setAddressSurfaceHidden(true)` hides the status view with `hideAddressStatus()`. While `mOpen` is set (the sheet
+  is open, a pull has not let go, a drag that turns back up has set it again) that is `hideAddressView()`, as
+  before. Once `mOpen` is clear (the start of `closeAtVelocity()`) the view keeps the visibility it had before
+  the sheet (`mSavedStatusVis`) and is hidden by alpha alone. The location bar is hidden around it, so nothing of it
+  shows. `LocationBarLayout` sees the status view visible again on the first frame of the close and gives the bar
+  its resting padding, many frames before the pill gets to it, so the travel frames, the park frame and the fade all
+  read the layout the bar rests in, and the hand-off moves nothing.
+- The reveal and the commit frames restore alpha and visibility as before (`restoreAddressView()`); the view is
+  already visible, so they change no layout.
+- A reopen sets `mOpen` and the next frame hides the status view by visibility again, as the way up always did.
+
+Tests (all in `BareVerticalTabsDrawerUnitTest`, with a status view that sets the bar's left padding as the real one
+does): the bar has its resting padding on every frame of the close, and the pill's text shift is the gap to the
+resting glyphs on the last travel frame and the same on the park frame, the reveal and the fade frames; while the
+sheet is open, and in a pull that goes back down with the finger on it, the view is hidden by visibility with the open
+padding; a close that turns back up hides it again; it is whole again once the close has finished.
+
+## Risks and things not confirmed
+
+- Not run on the drawer, as before. The cause is read from the Chromium 158 sources and the Bare patches (the
+  observer, the padding, the dimen and the flag default), not seen on a device, and the new tests were compiled
+  (with the same unresolved-type diagnostics as before, plus one more `org.chromium.chrome.R` line) but not run.
+  They model the coupling with a status view that sets the bar's padding on a visibility change.
+- It fits what was measured: 8dp is 8 capture px at that width, the favicon moves with the text (both are in the
+  clump the padding moves), and `0000458` showed the same 8 for two frames. It does not obviously fit a step that
+  happens only at the end of the fade at 40x (about 5 s): this cause relays the real bar a layout pass after the
+  status view is shown, a frame or two after the reveal. If the device still shows a step at the end of the fade
+  after this patch, it is something `finishCloseChrome()` or the glass window's dismissal does to the real bar
+  (the url view's focusable flags are set again there, and the window focus returns to the activity), and the
+  next thing to look at is the real url view's and the status view's rects in the last fade frame against the first
+  frame after the commit.
+- Other things that can still relay the real bar around the hand-off, and are not changed here: the toolbar
+  button container's scale is put back on the park frame, and `ToolbarPhone.keepUrlTextClearOfExtensions()` reads
+  its position (`getLocationInWindow()`, which includes the scale) to size the url view's end padding and the
+  site settings button's end margin. That moves the end of the bar, not the start, so it would not move the text of
+  a url that is not centred or the favicon.
+- A close short enough that the first frame of the close and the park frame are less than a layout pass apart (an
+  animation scale of 0, or a drag let go on the bar) still shows the real bar relaying on the hand-off, as before.
+- The status view is visible with alpha 0 under a hidden location bar for the length of a close. Chromium can set
+  the status view's alpha (`StatusViewBinder`); the per-frame pass and the pre-draw guard set it back to 0 on
+  every morph frame, as they did for the other address views, and the bar around it stays `INVISIBLE`.
+- A close that is turned back up (a drag that catches the sheet) shows the bar relaying twice, by 8dp, under the
+  hidden location bar. Nothing of it is visible, and the way up measures the bar's live layout as it always did.

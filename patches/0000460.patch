@@ -1,0 +1,249 @@
+From 64343b57a572f11181774f21cbd771a352f7cb6a Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 02:50:15 +0000
+Subject: [PATCH] Bare: keep the real status view in the layout while the tab
+ sheet closes
+
+During the close hand-off the pill's url text and favicon copy sat about 8dp
+to the right of where the real bar's text and favicon finally rest, and
+stepped that far to the left once the real bar took over. The copies follow
+the live real bar, so the real bar itself was being laid out 8dp in from its
+resting place for the whole sheet and the whole close travel, and moved at
+the hand-off.
+
+The sheet hides the real status view with View.INVISIBLE, as it hides the
+rest of the address bar. The location bar watches that view's visibility and
+sets its own start padding from it: none while the view is visible, the icon
+starting padding (8dp) while it is not. So for as long as the sheet was open
+the bar's favicon and url text were laid out 8dp further in than they rest.
+The hand-off restored the view on its first frame, which took the padding
+off again a layout pass later. The pill's copies had been laid onto the padded
+glyphs on the travel frames and on the park frame, so they followed the bar
+the 8dp across when it relaid, and the real bar's own glyphs ended where the
+copies were not.
+
+Once the sheet is closing (mOpen is cleared at the start of close, and a drag
+that turns back up sets it again) the status view keeps its real visibility
+and is hidden by alpha alone. The location bar is hidden around it, so
+nothing of the view shows. The bar has its resting padding from the first
+frame of the close, many frames before the pill reaches it, so the travel
+frames, the park frame and the fade all read the layout the bar rests in and
+the hand-off moves nothing. While the sheet is open, and during a pull that
+has not let go, the view is hidden by visibility as before, so the way up
+and a drag that turns back are unchanged. A reopen hides it again. The
+restore on the reveal and the commit frames puts alpha and visibility back
+as they were.
+
+The bar band, the + highlight, the page and toolbar restore, the 130 ms
+fade, the url bitmap, the circular favicon copy and the icon size and text
+origin of the way down are unchanged.
+
+Tests: the real bar keeps its resting padding on every close frame and the
+pill's text shift is the same on the last travel frame, the park frame, the
+reveal and the fade; the status view is hidden by visibility, with the open
+padding, for as long as the sheet is open and while a pull goes back down;
+a close that turns back up hides it again; it is whole again once the close
+has finished.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  |  24 ++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 142 ++++++++++++++++++
+ 2 files changed, 165 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 535731d235..b75763ccc8 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -5728,6 +5728,28 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (view.getVisibility() != View.INVISIBLE) view.setVisibility(View.INVISIBLE);
+     }
+ 
++    /**
++     * Hides the real status view. While the sheet is open that is the same as any other address
++     * view. Once it is closing the view keeps its real visibility and is hidden by alpha alone.
++     *
++     * <p>The location bar sets its own start padding from this view's visibility: none while it
++     * is visible, the icon starting padding while it is not. Hidden for as long as the sheet is
++     * open, the bar's glyphs and icons sit that padding in from where they rest, and showing the
++     * view again on the hand-off frame moved them, after the copies had been laid onto them. The
++     * copies followed the bar, so the url text and the favicon stepped by the padding. Put back as
++     * the close starts, the bar has settled long before the pill gets to it. The location bar is
++     * hidden around it, so nothing of the view shows.
++     */
++    private void hideAddressStatus(@Nullable View status) {
++        if (mOpen) {
++            hideAddressView(status);
++            return;
++        }
++        if (status == null || isInside(status, mRoot) || isInside(status, mOriginPill)) return;
++        if (status.getAlpha() != 0f) status.setAlpha(0f);
++        if (status.getVisibility() != mSavedStatusVis) status.setVisibility(mSavedStatusVis);
++    }
++
+     private void restoreAddressView(@Nullable View view, int visibility) {
+         if (view == null || isInside(view, mRoot) || isInside(view, mOriginPill)) return;
+         if (view.getAlpha() != 1f) view.setAlpha(1f);
+@@ -5760,7 +5782,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             hideAddressView(location);
+             hideAddressView(url);
+             hideAddressView(background);
+-            hideAddressView(status);
++            hideAddressStatus(status);
+             hideAddressView(favicon);
+             hideAddressView(siteButton);
+             return;
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 67f4a4dc64..8d9cfc6499 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -2424,6 +2424,148 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(lastFrame, copy.getTranslationX(), 0.05f);
+     }
+ 
++    /**
++     * A status view that does what the real one does to the location bar around it: the bar takes
++     * the icon starting padding on its start side while this view is not visible, and none while
++     * it is. The bar's glyphs and icons then sit that much further in.
++     */
++    private static final class PaddingCoupledStatus extends android.widget.ImageView {
++        private final View mBar;
++        private final int mRestingStart;
++        private final int mHiddenExtra;
++
++        PaddingCoupledStatus(android.content.Context context, View bar, int hiddenExtra) {
++            super(context);
++            mBar = bar;
++            mRestingStart = bar.getPaddingLeft();
++            mHiddenExtra = hiddenExtra;
++        }
++
++        @Override
++        protected void onVisibilityChanged(View changed, int visibility) {
++            super.onVisibilityChanged(changed, visibility);
++            if (changed != this || mBar == null) return;
++            int extra = visibility == View.VISIBLE ? 0 : mHiddenExtra;
++            mBar.setPadding(
++                    mRestingStart + extra,
++                    mBar.getPaddingTop(),
++                    mBar.getPaddingRight(),
++                    mBar.getPaddingBottom());
++        }
++    }
++
++    private PaddingCoupledStatus addCoupledStatus(TextView bar) {
++        PaddingCoupledStatus status = new PaddingCoupledStatus(mActivity, bar, px(8));
++        status.setId(org.chromium.chrome.R.id.location_bar_status);
++        content().addView(status, new FrameLayout.LayoutParams(px(24), px(24), Gravity.BOTTOM));
++        return status;
++    }
++
++    @Test
++    public void testTheRealBarKeepsItsRestingLayoutThroughTheCloseHandoff() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = barWithInsetText();
++        PaddingCoupledStatus status = addCoupledStatus(bar);
++        int resting = bar.getPaddingLeft();
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
++
++        // Open, the status view is hidden like the rest of the bar, and the bar takes its padding.
++        assertEquals(View.INVISIBLE, status.getVisibility());
++        assertEquals(resting + px(8), bar.getPaddingLeft());
++
++        startTheClose();
++        TextView copy = (TextView) findTag("morph_from_text");
++        assertNotNull(copy);
++        for (float progress : CLOSE_TRAVEL) {
++            mDrawer.applyProgressForTesting(progress);
++            // From the first frame of the close the view is back in the layout, hidden by alpha, so
++            // the bar has its resting padding long before the pill reaches it.
++            assertEquals("status at " + progress, View.VISIBLE, status.getVisibility());
++            assertEquals("status alpha at " + progress, 0f, status.getAlpha(), 0f);
++            assertEquals("padding at " + progress, resting, bar.getPaddingLeft());
++        }
++        assertEquals(View.INVISIBLE, bar.getVisibility());
++
++        // The pill's text sits where the resting glyphs are: the 30px inset of the real view
++        // against the 10px of the pill's own, with nothing of the open padding in it.
++        float gap = resting - ((View) copy.getParent()).getLeft() - copy.getLeft();
++        assertTrue("gap " + gap, gap > 15f);
++        float lastFrame = copy.getTranslationX();
++        assertEquals("shift on the bar", gap, Math.abs(lastFrame), 0.05f);
++
++        // Nothing the hand-off does moves the real bar, so nothing moves the text it follows.
++        mDrawer.endAnimationForTesting();
++        assertEquals(resting, bar.getPaddingLeft());
++        assertEquals(lastFrame, copy.getTranslationX(), 0.05f);
++        mDrawer.revealCloseHandoffForTesting();
++        assertEquals(View.VISIBLE, status.getVisibility());
++        assertEquals(1f, status.getAlpha(), 0f);
++        assertEquals(resting, bar.getPaddingLeft());
++        assertEquals(lastFrame, copy.getTranslationX(), 0.05f);
++        for (float fade : new float[] {0.25f, 0.5f}) {
++            mDrawer.setCloseHandoffFadeForTesting(fade);
++            assertEquals("padding at fade " + fade, resting, bar.getPaddingLeft());
++            assertEquals("shift at fade " + fade, lastFrame, copy.getTranslationX(), 0.05f);
++        }
++    }
++
++    @Test
++    public void testTheStatusViewIsHiddenByVisibilityForAsLongAsTheSheetIsOpen() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = barWithInsetText();
++        PaddingCoupledStatus status = addCoupledStatus(bar);
++        int resting = bar.getPaddingLeft();
++        // Up, then back down with the finger still on the bar: that is a pull, not a close.
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f, 0.3f, 0.1f);
++
++        assertEquals(View.INVISIBLE, status.getVisibility());
++        assertEquals(0f, status.getAlpha(), 0f);
++        assertEquals(resting + px(8), bar.getPaddingLeft());
++    }
++
++    @Test
++    public void testTurningTheCloseBackUpHidesTheStatusViewAgain() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = barWithInsetText();
++        PaddingCoupledStatus status = addCoupledStatus(bar);
++        int resting = bar.getPaddingLeft();
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
++        startTheClose();
++        mDrawer.applyProgressForTesting(0.1f);
++        assertEquals(View.VISIBLE, status.getVisibility());
++        assertEquals(resting, bar.getPaddingLeft());
++
++        // A drag that catches the sheet takes it back to an open one, with the open bar.
++        mDrawer.beginToolbarPull();
++        mDrawer.applyProgressForTesting(0.2f);
++        assertEquals(View.INVISIBLE, status.getVisibility());
++        assertEquals(0f, status.getAlpha(), 0f);
++        assertEquals(resting + px(8), bar.getPaddingLeft());
++    }
++
++    @Test
++    public void testTheStatusViewIsWholeAgainOnceTheCloseHasFinished() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = barWithInsetText();
++        PaddingCoupledStatus status = addCoupledStatus(bar);
++        int resting = bar.getPaddingLeft();
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
++        startTheClose();
++        mDrawer.applyProgressForTesting(0.1f);
++        assertEquals(0f, status.getAlpha(), 0f);
++
++        mDrawer.finishAnimationForTesting();
++        assertEquals(View.VISIBLE, status.getVisibility());
++        assertEquals(1f, status.getAlpha(), 0f);
++        assertEquals(resting, bar.getPaddingLeft());
++        assertEquals(View.VISIBLE, bar.getVisibility());
++        assertEquals(1f, bar.getAlpha(), 0f);
++    }
++
+     @Test
+     public void testClosingMorphTextKeepsTheRealUrlInsetAndWidthBeforeTheHandoff() {
+         setAddressBarOnTop(false);
+-- 
+2.34.1
+
