@@ -227,3 +227,82 @@ left for a separate patch.
   frame, the settled pill. A test for `destroy()` during the fade covers the teardown path.
 - Two unit tests need a canvas that keeps its translation, which Robolectric's native graphics mode does
   and its legacy mode does not. The scroll test skips itself where the canvas does not.
+
+# Follow-up: the icon copies dropped in size and the url text jumped when the hand-off started (patch `0000459`)
+
+A test of `0000458` on an emulator showed one url text and a round favicon copy. Two steps were left in the
+close, both on the frame the hand-off starts (the frame where the page shifts). Before it, the icon copies in
+the pill were about 1.4 times larger than the real toolbar icons and dropped to the real size in one frame.
+The url text jumped 4 to 10 px on that frame and then settled.
+
+## Root cause
+
+- Icon size. Before the hand-off an icon copy was the real view's drawable, set on an `ImageView` the size
+  of the whole padded box of the real view with `FIT_CENTER`. The real view draws the same drawable inside
+  its padding, so the glyph in the copy filled a box the real one only fills to its padding. From the
+  hand-off frame on, the copy is a bitmap of the real view (`0000457`), which has the padding, scale type
+  and badge, so the glyph is drawn at the real size. The drop in size is the change from one to the other.
+- Text position. Two things differed between the last frames of the travel and the hand-off.
+  - The pill's text inset. `applyMorphText()` used the stored resting glyph inset (`mRestTextLead`, the
+    real url view's left plus its own padding, less the bar's left) only on the first frame of an open, and
+    otherwise the inset of the url view itself (its left less the bar's left, without its padding). The
+    glyphs sit further in by the url view's padding, so the pill text and the point it ellipsizes at were
+    off by that padding for the whole travel and moved to the resting inset on the hand-off frame.
+  - The alignment. The hand-off frames move the pill's text views so the first glyph and the first
+    baseline are the real ones (`0000457`). The frames before it did not, so a difference in font padding
+    and baseline between the two views showed up as a step on the hand-off frame as well.
+
+## Fix (patch `0000459`)
+
+Only the frames of a close before the hand-off change. The bar band, the `+` highlight, the page and top
+toolbar restore, the open path, the 130 ms fade, the url bitmap and the circular favicon copy are as they were.
+
+- The drawer now knows which way the sheet is travelling. `applyProgress()` sets `mMorphClosing` when a frame
+  moves progress down by more than 0.0002 and clears it when one moves it up by that much, so a close, a drag
+  down and a pull back down all count and a drag that turns round flips it. `closeAtVelocity()` sets it and
+  `show()` clears it. The way up is untouched by everything below.
+- Icons. While closing, a copy of an icon whose view is laid out is the same bitmap of the real view the
+  hand-off uses (`drawIconSnapshot()`), at the size and place it already had. A view that is not laid out, or
+  that cannot be drawn into a bitmap, keeps the old drawable copy. The size and place of the copy are
+  unchanged, so the only change is what is drawn inside it.
+- Text inset. While closing, the resting inset is used the whole way down, not only on the first frame.
+- Text position. While closing and before the hand-off frames, `alignMorphTextTowardsReal()` shifts the pill's
+  two text views by `(1 - eased) * (real - own)`. `real` is the real first glyph and baseline relative to
+  the real bar, `own` the view's own relative to the pill, both measured in that frame (the pill is laid out
+  synchronously by `placePillOnRoot()`, so no value is predicted or cached). At the bar rect the factor is 1
+  and the shift is the whole alignment the hand-off makes, so its first frame moves nothing. At the small
+  pill the factor is 0 and the text is where it always was. A hand-off frame still uses `alignMorphText()`,
+  and a frame that is not closing, a reopen, and the teardown of the morph clear the shift.
+
+Tests (all in `BareVerticalTabsDrawerUnitTest`): the icon copy is a bitmap of the real icon's box in the frames
+before the hand-off; its size and place do not change across the hand-off frame; on the way up it is still
+the drawable copy; the first glyph and baseline of the text are on the real ones in the last frame before the
+hand-off and across it; the shift grows as the pill comes down and is nearly gone near the top; with a real
+`url_bar` the resting inset gives the real width and the real first glyph with no shift to make up for it;
+the way up is not shifted; a drag that turns back up and a reopen clear the shift.
+
+## Risks and things not confirmed
+
+- Not run on the drawer, as before. The drawer and its test class still cannot be built here. They compile
+  with the diagnostics they had before (unresolved Chromium types, plus more of the same
+  `org.chromium.chrome.R` kind in the new tests). What was run is the platform behaviour the fix rests on,
+  in a standalone Robolectric project on a model of the pill (a `LinearLayout` with the text stack, the pill
+  placed by translation, the same shift formula), in both graphics modes: the pill's first glyph and
+  baseline land on the real ones with a bar whose text sits 30 px inside the view (x, y exact at the bar
+  rect, with and without a different font padding), the shift is 14, 12.6, 7 and 1.4 px at the ease 0, 0.1,
+  0.5 and 0.9, and a `url_bar` inset and end padding give a text width of 198 px for both the copy and
+  the real view and need no shift. A view drawn with `View.draw()` ignores its own alpha, so the icon copy of
+  a source the pull has faded to 0 is not blank.
+- The first glyph and baseline are continuous. The look (letter spacing, typeface, ellipsis and the colour
+  spans) is matched by the hand-off frames only, as in `0000458`. The pill's text before the hand-off is
+  the string in one colour, so the colour of the host and the path still changes on the hand-off frame. The
+  real `UrlBar` has no letter spacing, and a bar that had would also move the glyphs by half of it.
+- The shift is measured from the real views each frame, the same views the hand-off reads. If the real bar
+  lays out again between the last travel frame and the hand-off frame (a status icon that appears, a url
+  view that changes its inset), what is left of the jump is that change.
+- The direction comes from progress, so a drag that reverses flips the geometry on that frame: the icons go
+  from bitmaps to drawables and the shift goes. The way up is meant to look as it did.
+- A close that does not read the live bar (a bar that is mid-slide at the hand-off) keeps the shift, measured
+  from the real views relative to their bar, so the pill text is where the real text will be on the next frame.
+- While a close travels, up to 16 small icon views are drawn into software bitmaps each frame, as the
+  hand-off already does for its 130 ms. The bitmaps are reused, and a view that cannot be drawn falls back.
