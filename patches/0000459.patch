@@ -1,4 +1,4 @@
-From ea5accd39c67725628a86f3979f8153743f29d17 Mon Sep 17 00:00:00 2001
+From 28ad817b2564a08235c972ac70577461bfbd8aa1 Mon Sep 17 00:00:00 2001
 From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
 Date: Sat, 28 Nov 2026 01:20:29 +0000
 Subject: [PATCH] Bare: make the tab sheet close morph travel into the real
@@ -33,20 +33,31 @@ moved the sheet (a close, a drag down or a pull back down), so the way up
 keeps the drawable copies, the pill's own inset and no shift. A reopen, a
 drag that turns back up and a teardown clear the shift.
 
+The pill's own first glyph is measured from the text view's parent and its
+layout place, not from the view's screen location with its translation taken
+off. That location is rounded to a pixel with the translation in it, so a text
+that had been shifted by a fraction measured as up to half a pixel away from
+where it would be unshifted, and the shift of the next frame carried that
+error. Both the frames before the hand-off and the hand-off's own alignment
+use it, so at the bar rect they are the same shift.
+
 The 130 ms fade, the url bitmap, the circular favicon copy, the bar band,
 the plus highlight, the page and top toolbar restore and the open path are
 unchanged. The unit tests cover the icon copy's bitmap, size and place
 across the hand-off frame, the drawable copy on the way up, the text's
 first glyph, baseline, width and inset before and across the hand-off, the
-shift fading out with the morph, and its removal on a turn back up and on a
-reopen.
+shift fading out with the morph, the shift at the bar rect being the
+hand-off's, to a hundredth of a pixel, and its removal on a turn back up and on
+a reopen. The tests that need a gap to shift give the bar a status icon, as the
+real bar has one: without it the pill keeps its lock in front of its text and
+the gap is two pixels.
 ---
- .../browser/bare/BareVerticalTabsDrawer.java  |  94 +++++-
- .../bare/BareVerticalTabsDrawerUnitTest.java  | 317 ++++++++++++++++++
- 2 files changed, 407 insertions(+), 4 deletions(-)
+ .../browser/bare/BareVerticalTabsDrawer.java  | 118 +++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 362 ++++++++++++++++++
+ 2 files changed, 470 insertions(+), 10 deletions(-)
 
 diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
-index d9a9b40645..009acaf539 100755
+index d9a9b40645..535731d235 100755
 --- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 @@ -200,6 +200,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
@@ -172,7 +183,38 @@ index d9a9b40645..009acaf539 100755
      /**
       * Screen x of the first glyph and screen y of the first baseline. A view's own translation
       * is part of its screen position; {@code withoutTranslation} takes it out.
-@@ -5617,6 +5686,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -5406,12 +5475,24 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             return false;
+         }
+         int[] at = new int[2];
+-        text.getLocationOnScreen(at);
+-        float x = at[0];
+-        float y = at[1];
+-        if (withoutTranslation) {
+-            x -= text.getTranslationX();
+-            y -= text.getTranslationY();
++        float x;
++        float y;
++        if (withoutTranslation && text.getParent() instanceof View parent) {
++            // From the parent and the view's own layout place. A location read from the view is
++            // rounded to a pixel with its translation in it, and taking that translation off
++            // again leaves the rounding in the result: a text that was shifted by a fraction
++            // measures as somewhere else than it would unshifted, up to half a pixel.
++            parent.getLocationOnScreen(at);
++            x = at[0] + text.getLeft() - parent.getScrollX();
++            y = at[1] + text.getTop() - parent.getScrollY();
++        } else {
++            text.getLocationOnScreen(at);
++            x = at[0];
++            y = at[1];
++            if (withoutTranslation) {
++                x -= text.getTranslationX();
++                y -= text.getTranslationY();
++            }
+         }
+         out[0] = x - text.getScrollX() + text.getCompoundPaddingLeft() + layout.getLineLeft(0);
+         out[1] = y - text.getScrollY() + text.getBaseline();
+@@ -5617,6 +5698,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
          }
          mOriginTextStyled = false;
          clearMorphTextMatch();
@@ -180,7 +222,7 @@ index d9a9b40645..009acaf539 100755
          if (mPillLock != null && mPillLock.getVisibility() != mPillLockVisibility) {
              mPillLock.setVisibility(mPillLockVisibility);
          }
-@@ -5958,6 +6028,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -5958,6 +6040,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
          // The hand-off reads every icon from its live view. The stored rects are from before
          // the sheet opened, and a view that has since gone has no place on the bar.
          boolean live = mHandoffLive && (mForceBarRect || mCloseReveal);
@@ -191,7 +233,7 @@ index d9a9b40645..009acaf539 100755
          for (int i = 0; i < n && used < 16; i++) {
              ImageView source = sources[i];
              if (live && !isLaidOutIcon(source)) continue;
-@@ -5999,7 +6073,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -5999,7 +6085,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
              int w = Math.max(1, Math.round(sourceW * extraScale));
              int h = Math.max(1, Math.round(sourceH * extraScale));
              ImageView ghost = morphGhost(used);
@@ -203,7 +245,7 @@ index d9a9b40645..009acaf539 100755
                  if (ghost.getScaleType() != ImageView.ScaleType.FIT_CENTER) {
                      ghost.setScaleType(ImageView.ScaleType.FIT_CENTER);
                  }
-@@ -6353,6 +6430,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6353,6 +6442,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
              background.setColor(fill);
          }
          applyMorphText(shrink, eased);
@@ -215,7 +257,7 @@ index d9a9b40645..009acaf539 100755
          applyBottomSheetFamilyColors();
          // Below half the list can overlap the handle row, so the pill rides the sheet top on
          // the root, above the cards, and is parked in the handle row only from half up.
-@@ -6393,7 +6475,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6393,7 +6487,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
                  setTextStackMargin(0);
              }
              placePillOnRoot(pill, root, width, height, left, top);
@@ -229,10 +271,10 @@ index d9a9b40645..009acaf539 100755
              syncMorphUrlSnapshot(live, left, top);
          }
 diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-index c7c966d230..f92eed01b8 100755
+index c7c966d230..67f4a4dc64 100755
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-@@ -2173,6 +2173,323 @@ public class BareVerticalTabsDrawerUnitTest {
+@@ -2173,6 +2173,368 @@ public class BareVerticalTabsDrawerUnitTest {
          assertEquals(1f, origin.getAlpha(), 0.001f);
      }
  
@@ -288,6 +330,17 @@ index c7c966d230..f92eed01b8 100755
 +        bar.setPadding(px(30), px(9), px(6), px(1));
 +        bar.setIncludeFontPadding(false);
 +        return bar;
++    }
++
++    /**
++     * A status icon on the bar's end, like the real bar's. It is a kept icon, so the pill copies
++     * it and leaves its own lock and text margin out; without one the pill's lock sits in front of
++     * its text and takes most of the gap between the pill's text and the bar's.
++     */
++    private android.widget.ImageView keptStatusIcon() {
++        android.widget.ImageView icon = new android.widget.ImageView(mActivity);
++        icon.setId(org.chromium.chrome.R.id.location_bar_site_favicon);
++        return icon;
 +    }
 +
 +    /** The frames of a close that is still on its way to the bar. */
@@ -386,7 +439,7 @@ index c7c966d230..f92eed01b8 100755
 +        setAddressBarOnTop(false);
 +        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
 +        TextView bar = barWithInsetText();
-+        pullOpenOnABar(bar, new android.widget.ImageView(mActivity), 0.004f, 0.2f, 0.45f);
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
 +        startTheClose();
 +        TextView copy = (TextView) findTag("morph_from_text");
 +        assertNotNull(copy);
@@ -396,6 +449,8 @@ index c7c966d230..f92eed01b8 100755
 +            mDrawer.applyProgressForTesting(progress);
 +        }
 +        assertEquals(View.VISIBLE, copy.getVisibility());
++        // The pill's text starts 10px in and the real glyphs 30px, so there is a shift to make.
++        assertTrue("shift " + copy.getTranslationX(), copy.getTranslationX() > 15f);
 +        float[] before = glyphOrigin(copy);
 +        assertEquals("x before the hand-off", real[0], before[0], 1f);
 +        assertEquals("baseline before the hand-off", real[1], before[1], 1f);
@@ -415,7 +470,7 @@ index c7c966d230..f92eed01b8 100755
 +        setAddressBarOnTop(false);
 +        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
 +        TextView bar = barWithInsetText();
-+        pullOpenOnABar(bar, new android.widget.ImageView(mActivity), 0.004f, 0.2f, 0.45f);
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
 +        startTheClose();
 +        TextView copy = (TextView) findTag("morph_from_text");
 +        TextView origin = (TextView) findTag("sheet_pill_origin");
@@ -432,14 +487,46 @@ index c7c966d230..f92eed01b8 100755
 +        mDrawer.applyProgressForTesting(0.002f);
 +        float onTheBar = Math.abs(copy.getTranslationX());
 +
-+        // The glyphs sit 30px inside the real view, so the shift is real at the bar rect. It
-+        // grows as the pill comes down, and is all but gone where the pill is the small pill.
-+        assertTrue("shift on the bar " + onTheBar, onTheBar > 5f);
++        // The glyphs sit 30px inside the real view and 10px inside the pill, so the shift at the
++        // bar rect is the whole 20px, to a hundredth of a pixel: the gap between where the pill's
++        // text is laid out and where the real glyphs are, with nothing left in it of the shift
++        // the frames before set. It grows as the pill comes down, and is all but gone where the
++        // pill is the small pill.
++        float gap = bar.getPaddingLeft() - ((View) copy.getParent()).getLeft() - copy.getLeft();
++        assertTrue("gap " + gap, gap > 15f);
++        assertEquals("shift on the bar", gap, onTheBar, 0.01f);
 +        assertTrue("shift " + aTenth + " vs " + onTheBar, aTenth < onTheBar);
 +        assertTrue("shift " + aQuarter + " vs " + aTenth, aQuarter < aTenth);
 +        assertTrue(
 +                "shift near the top " + nearTheTop + " vs " + onTheBar,
 +                nearTheTop < 0.25f * onTheBar);
++    }
++
++    @Test
++    public void testClosingMorphTextShiftOnTheBarIsTheHandoffAlignment() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = barWithInsetText();
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
++        startTheClose();
++        TextView copy = (TextView) findTag("morph_from_text");
++        assertNotNull(copy);
++
++        for (float progress : CLOSE_TRAVEL) {
++            mDrawer.applyProgressForTesting(progress);
++        }
++        float lastFrame = copy.getTranslationX();
++        assertTrue("shift " + lastFrame, lastFrame > 15f);
++
++        // The hand-off frame aligns the same text, from the same two measures. It does not move
++        // the text by anything more than the little the morph's ease still took off.
++        mDrawer.endAnimationForTesting();
++        assertEquals(lastFrame, copy.getTranslationX(), 0.05f);
++
++        // Nor does a fade frame, which measures the live bar again.
++        mDrawer.revealCloseHandoffForTesting();
++        mDrawer.setCloseHandoffFadeForTesting(0.5f);
++        assertEquals(lastFrame, copy.getTranslationX(), 0.05f);
 +    }
 +
 +    @Test
@@ -512,7 +599,7 @@ index c7c966d230..f92eed01b8 100755
 +        setAddressBarOnTop(false);
 +        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
 +        TextView bar = barWithInsetText();
-+        pullOpenOnABar(bar, new android.widget.ImageView(mActivity), 0.004f, 0.2f, 0.45f);
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
 +        startTheClose();
 +        TextView copy = (TextView) findTag("morph_from_text");
 +        TextView origin = (TextView) findTag("sheet_pill_origin");
@@ -535,7 +622,7 @@ index c7c966d230..f92eed01b8 100755
 +        setAddressBarOnTop(false);
 +        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
 +        TextView bar = barWithInsetText();
-+        pullOpenOnABar(bar, new android.widget.ImageView(mActivity), 0.004f, 0.2f, 0.45f);
++        pullOpenOnABar(bar, keptStatusIcon(), 0.004f, 0.2f, 0.45f);
 +        startTheClose();
 +        TextView copy = (TextView) findTag("morph_from_text");
 +        TextView origin = (TextView) findTag("sheet_pill_origin");

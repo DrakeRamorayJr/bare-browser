@@ -273,13 +273,30 @@ toolbar restore, the open path, the 130 ms fade, the url bitmap and the circular
   and the shift is the whole alignment the hand-off makes, so its first frame moves nothing. At the small
   pill the factor is 0 and the text is where it always was. A hand-off frame still uses `alignMorphText()`,
   and a frame that is not closing, a reopen, and the teardown of the morph clear the shift.
+- Measure. `glyphOrigin(view, true, ...)`, the pill text's own first glyph and baseline, is now read from the
+  text view's parent and the view's layout place. It used the view's own screen location with its
+  translation taken off, and `getLocationOnScreen()` rounds to a pixel with that translation in it. A text
+  that was shifted by a fraction measured as up to half a pixel from where it would be unshifted, and the
+  shift of the next frame carried that error, so a shift lagged the true gap by up to half a pixel. Both
+  the frames before the hand-off and the hand-off's own alignment use this function, so at the bar rect
+  they are the same shift.
+
+A first version of the shift test failed on the real tree (`shift on the bar 1.79`, where it expected more
+than 5). Two things were behind that. The test's bar had no status icon, so the pill kept its lock in front
+of its text (the test tab is https): the pill's text started at 10 + 16 + 6 = 32 px and the real glyphs at
+30, a true gap of 2 px, not the 20 or so the test assumed. The 1.79 was that gap read through the rounding
+above (the 2 px of the 0.1 frame, 1.792, comes back as the measured gap of the next frame, which is a pixel
+rounded away from it). On a device the real bar has a status icon, the lock is out of the row from the first
+frame, and the gap is the url view's own padding. The shift tests now give the bar a status icon, and the
+shift at the bar rect is compared with the gap read from the layout, to a hundredth of a pixel.
 
 Tests (all in `BareVerticalTabsDrawerUnitTest`): the icon copy is a bitmap of the real icon's box in the frames
 before the hand-off; its size and place do not change across the hand-off frame; on the way up it is still
 the drawable copy; the first glyph and baseline of the text are on the real ones in the last frame before the
 hand-off and across it; the shift grows as the pill comes down and is nearly gone near the top; with a real
 `url_bar` the resting inset gives the real width and the real first glyph with no shift to make up for it;
-the way up is not shifted; a drag that turns back up and a reopen clear the shift.
+the shift at the bar rect is the hand-off's, and a fade frame's; the way up is not shifted; a drag that turns
+back up and a reopen clear the shift.
 
 ## Risks and things not confirmed
 
@@ -289,9 +306,11 @@ the way up is not shifted; a drag that turns back up and a reopen clear the shif
   in a standalone Robolectric project on a model of the pill (a `LinearLayout` with the text stack, the pill
   placed by translation, the same shift formula), in both graphics modes: the pill's first glyph and
   baseline land on the real ones with a bar whose text sits 30 px inside the view (x, y exact at the bar
-  rect, with and without a different font padding), the shift is 14, 12.6, 7 and 1.4 px at the ease 0, 0.1,
+  rect, with and without a different font padding), the shift is 20, 17.9, 10 and 2.1 px at the ease 0, 0.1,
   0.5 and 0.9, and a `url_bar` inset and end padding give a text width of 198 px for both the copy and
-  the real view and need no shift. A view drawn with `View.draw()` ignores its own alpha, so the icon copy of
+  the real view and need no shift. Replaying the frames 0.4, 0.25, 0.1 and 0.002 in that model, the measure
+  that took the translation off the screen location read 19.955 px at the bar rect for the 20 px gap
+  (17.956 at the 0.1 frame for 17.92); the measure from the parent reads 19.999 and 17.92. A view drawn with `View.draw()` ignores its own alpha, so the icon copy of
   a source the pull has faded to 0 is not blank.
 - The first glyph and baseline are continuous. The look (letter spacing, typeface, ellipsis and the colour
   spans) is matched by the hand-off frames only, as in `0000458`. The pill's text before the hand-off is
@@ -299,7 +318,12 @@ the way up is not shifted; a drag that turns back up and a reopen clear the shif
   real `UrlBar` has no letter spacing, and a bar that had would also move the glyphs by half of it.
 - The shift is measured from the real views each frame, the same views the hand-off reads. If the real bar
   lays out again between the last travel frame and the hand-off frame (a status icon that appears, a url
-  view that changes its inset), what is left of the jump is that change.
+  view that changes its inset), what is left of the jump is that change. At the bar rect the ease is a
+  few hundred-thousandths, so the shift is the hand-off's to well under a hundredth of a pixel. The 8 px
+  jump seen on the device with `0000458` came from the pill's text starting at the url view's `left` and
+  not at its glyph origin until the hand-off; a status icon on the bar hides the pill's lock and text margin
+  from the first frame, so the pill's text starts at the resting inset in `0000459` and the shift the
+  device needs is the one the hand-off makes.
 - The direction comes from progress, so a drag that reverses flips the geometry on that frame: the icons go
   from bitmaps to drawables and the shift goes. The way up is meant to look as it did.
 - A close that does not read the live bar (a bar that is mid-slide at the hand-off) keeps the shift, measured
