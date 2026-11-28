@@ -1,4 +1,4 @@
-From f55b466f4f29eac076e29e3b6db6b46fa6e065b2 Mon Sep 17 00:00:00 2001
+From f0b2d2560c7f87db1e29d2c135691ae55376223d Mon Sep 17 00:00:00 2001
 From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
 Date: Sat, 28 Nov 2026 15:11:30 +0000
 Subject: [PATCH] Bare: let the open tab sheet use the bar-cover band
@@ -6,10 +6,12 @@ Subject: [PATCH] Bare: let the open tab sheet use the bar-cover band
 A settled full sheet reserved the bottom-bar cover under the action row, so that band stayed an empty strip of sheet colour down to the nav inset. Half open left the same cover in front of the row, which clipped it.
 
 The bottom seam is 12dp for the whole drag, so the panel reaches one seam above the nav inset and does not jump as it passes half or settles. The 8dp gap at the top stays. From half open on, while the sheet is still open, the cover is not drawn: the sheet already covers that slot. close() clears the open flag before the hand-off, so the cover is laid out again at the start of the close. The opening drag below half still paints the cover.
+
+At the hand-off itself progress is 0, so the panel margin is the 12dp seam plus the address-bar lift, the same margin the close had before this patch. The sheet does not jump when the close starts: that frame is still the plain 12dp seam.
 ---
  .../browser/bare/BareVerticalTabsDrawer.java  |  68 +++-----
- .../bare/BareVerticalTabsDrawerUnitTest.java  | 158 ++++++++++++++++--
- 2 files changed, 168 insertions(+), 58 deletions(-)
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 162 ++++++++++++++++--
+ 2 files changed, 172 insertions(+), 58 deletions(-)
 
 diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 index 4474c4c..8ee8ddf 100755
@@ -119,7 +121,7 @@ index 4474c4c..8ee8ddf 100755
      private @ColorInt int bottomBarCoverColor() {
          int base = liveBottomChromeColor();
 diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-index 3a77ead..7f78a83 100755
+index 3a77ead..87774c4 100755
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
 @@ -5444,25 +5444,24 @@ public class BareVerticalTabsDrawerUnitTest {
@@ -175,7 +177,7 @@ index 3a77ead..7f78a83 100755
              mDrawer.applyProgressForTesting(mDrawer.progressForTesting());
              assertEquals(1f, mDrawer.progressForTesting(), 0.01f);
              assertEquals(px(12), panelBottomMargin(panel));
-@@ -5527,11 +5527,137 @@ public class BareVerticalTabsDrawerUnitTest {
+@@ -5527,11 +5527,141 @@ public class BareVerticalTabsDrawerUnitTest {
              View cover = findTag("sheet_bottom_bar_cover");
              assertNotNull(cover);
              assertEquals(View.VISIBLE, cover.getVisibility());
@@ -184,7 +186,9 @@ index 3a77ead..7f78a83 100755
 +            Outline outline = new Outline();
 +            cover.getOutlineProvider().getOutline(cover, outline);
 +            assertEquals(0f, outline.getAlpha(), 0.001f);
-+            assertEquals(px(12), panelBottomMargin(panel));
++            // Progress is 0, so the address-bar lift is the whole 48dp bar again.
++            // The margin is that lift plus the 12dp seam, as on the previous patch.
++            assertEquals(px(48) + px(12), panelBottomMargin(panel));
 +        } finally {
 +            removeStackedBottomChrome();
 +        }
@@ -310,7 +314,9 @@ index 3a77ead..7f78a83 100755
              assertEquals(0f, outline.getAlpha(), 0.001f);
 -            assertTrue(panelBottomMargin(panel) < openMargin);
 +            View panel = (View) findTag("sheet_actions").getParent();
-+            assertEquals(px(12), panelBottomMargin(panel));
++            // Progress is 0, so the address-bar lift is the whole 48dp bar again.
++            // The margin is that lift plus the 12dp seam, as on the previous patch.
++            assertEquals(px(48) + px(12), panelBottomMargin(panel));
          } finally {
              removeStackedBottomChrome();
          }
