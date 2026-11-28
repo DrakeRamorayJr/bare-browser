@@ -1,0 +1,712 @@
+From 6c5ee57c5cbe589ca56cdc641d421af828b38f43 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 06:27:27 +0000
+Subject: [PATCH] Bare: ease the page, status bar and button row through the
+ tab sheet close
+
+Two things still changed in a single frame while the bottom tab sheet closes.
+
+At the hand-off the page card was restored at once: the page's translation
+snapped back from its parked offset, its clip, corner radius, scrim, shade and
+backdrop were cleared, the status bar colour was restored, and the compositor
+toolbar layer came back in the same pass, so the page and the top toolbar
+jumped. On the close path the parked page translation, scale, corner radius,
+scrim, shade and backdrop are now held at the values they had before the park
+and eased to the restored state over the existing hand-off fade. The status
+bar colour is eased the same way, and the compositor toolbar layer stays
+suppressed until the ease has finished, so the restored toolbar views are what
+cross-fade in.
+
+At the start of the close the five-button row, with the plus button and its
+tonal highlight, was gated behind the first part of the sheet's travel and then
+appeared at full strength in one frame. On the close path the row's travel is
+now latched when the close starts and eased from that value across the whole
+close, so it fades and slides in continuously. The open path, the settled bar,
+the cover and travel easing from the previous patch, and everything after the
+close chrome is finished are unchanged.
+
+The unit tests cover the page translation, backdrop and status bar being
+continuous across the hand-off and easing monotonically to the restored state,
+a reopen in the middle of the fade, the open path keeping its immediate page
+shift, and the button row fading in from the first frame of a close from half
+and from a partial pull, while opening keeps its threshold.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 172 +++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 320 ++++++++++++++++++
+ 2 files changed, 481 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index c193bba246..162e026e1e 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -393,6 +393,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private float mLastBottomBarTravel;
+     /** Bottom-bar travel held at the start of the close park, eased to 0 across the hand-off. */
+     private float mCloseBarTravelStart;
++    /** Progress and open-curve travel latched when a close begins, for continuous row fade-in. */
++    private float mCloseBarStartProgress;
++    private float mCloseBarStartGone;
+     /** Zero-alpha outline so the close bar cover keeps its Z order without casting a gray shadow. */
+     private static final ViewOutlineProvider NO_SHADOW_OUTLINE =
+             new ViewOutlineProvider() {
+@@ -556,6 +559,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private boolean mPageCardArmed;
+     private boolean mHaveSavedPageTranslation;
+     private float mSavedPageTranslationY;
++    /** Page-card state latched before the close park, eased to rest over the hand-off fade. */
++    private boolean mClosePageLatched;
++    private float mClosePageDimStart;
++    private float mClosePageTranslationStart;
+     // Ancestors clip the card, so a translation into the status bar never paints.
+     // Saved while the card is up and put back on close.
+     private boolean mPageClipCleared;
+@@ -785,6 +792,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     void setCloseHandoffFadeForTesting(float fade) {
+         mHandoffFade = Math.max(0f, Math.min(1f, fade));
+         layoutOriginPill();
++        if (pageCardHandoffWanted()) applyPageCardHandoff();
+     }
+ 
+     private View handoffHost() {
+@@ -881,6 +889,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mOpen = true;
+         mMorphClosing = false;
+         mCloseBarTravelStart = 0f;
++        mCloseBarStartProgress = 0f;
++        mCloseBarStartGone = 0f;
++        mClosePageLatched = false;
++        mClosePageDimStart = 0f;
++        mClosePageTranslationStart = 0f;
+         if (mCloseReveal) {
+             // A reopen during the hand-off fade: the morph is the open sheet's pill again.
+             cancelHandoffFade();
+@@ -944,6 +957,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     private void closeAtVelocity(float progressVelocity) {
+         if (!mOpen) return;
++        if (bottomBarMorph() && mProgress > 0.001f) {
++            mCloseBarStartProgress = mProgress;
++            mCloseBarStartGone = openButtonBarGone(mProgress);
++        } else {
++            mCloseBarStartProgress = 0f;
++            mCloseBarStartGone = 0f;
++        }
+         mOpen = false;
+         mMorphClosing = true;
+         watchFocus(false);
+@@ -1092,6 +1112,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         mHandoffFade = Math.max(0f, fade);
+         layoutOriginPill();
++        if (pageCardHandoffWanted()) applyPageCardHandoff();
+         postHandoffFade();
+     }
+ 
+@@ -1110,6 +1131,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         mHandoffFade = 0f;
+         mCloseBarTravelStart = 0f;
++        mCloseBarStartProgress = 0f;
++        mCloseBarStartGone = 0f;
++        mClosePageLatched = false;
++        mClosePageDimStart = 0f;
++        mClosePageTranslationStart = 0f;
+     }
+ 
+     /** Glass window, page card, and focus, after the last morph frame has been drawn. */
+@@ -1312,7 +1338,16 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private boolean pageCardWanted() {
+         return isSheetChrome()
+                 && !sheetFromTop()
+-                && mProgress > 0.001f
++                && (mProgress > 0.001f || ((mForceBarRect || mCloseReveal) && mClosePageLatched))
++                && sheetWindowPresent();
++    }
++
++    /** Keeps the page card active across the close park and 130 ms hand-off fade. */
++    private boolean pageCardHandoffWanted() {
++        return isSheetChrome()
++                && !sheetFromTop()
++                && (mForceBarRect || mCloseReveal)
++                && mClosePageLatched
+                 && sheetWindowPresent();
+     }
+ 
+@@ -1366,6 +1401,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             mPageTopInset = 0;
+             mPageDim = 0f;
+             mPageCardArmed = false;
++            mClosePageLatched = false;
++            mClosePageDimStart = 0f;
++            mClosePageTranslationStart = 0f;
+             mStatusBarIconLatched = false;
+             mStatusBarSampledDim = -1f;
+             hidePageBackdrop();
+@@ -2955,6 +2993,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return mLastBottomBarTravel;
+     }
+ 
++    boolean toolbarSceneSuppressedForTesting() {
++        return mToolbarSceneSuppressed;
++    }
++
+     /** Fills the gap under a bottom-bar sheet with the sheet surface. */
+     private void applySeamFill() {
+         View fill = mSeamFill;
+@@ -3476,6 +3518,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             mMorphClosing = true;
+         } else if (mProgress > previous + MORPH_DIRECTION_EPSILON) {
+             mMorphClosing = false;
++            mCloseBarStartProgress = 0f;
++            mCloseBarStartGone = 0f;
+         }
+         guardUrlBarFocus();
+         clearBlur();
+@@ -3502,6 +3546,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     placeSheetScrim(scrim, false);
+                     setStatusBarScrim(Color.TRANSPARENT);
+                     restorePageCard();
++                } else if (pageCardHandoffWanted()) {
++                    applyPageCardHandoff();
+                 } else if (pageCardWanted()) {
+                     // Opaque black so the view alpha is the dim. Same amount on the page
+                     // and on the band above the sheet, including through the status bar.
+@@ -3589,6 +3635,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         rememberStatusBar();
+         View page = mActivity.findViewById(R.id.compositor_view_holder);
++        float shift = mHaveSavedPageTranslation ? mSavedPageTranslationY : 0f;
+         if (page != null) {
+             float scale = 1f - dim * (1f - PAGE_SCALE);
+             if (!mHaveSavedPageTranslation) {
+@@ -3600,7 +3647,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             page.setPivotY(0f);
+             page.setScaleX(scale);
+             page.setScaleY(scale);
+-            float shift = placePageCardTop(page);
++            shift = placePageCardTop(page);
+             // The page view starts below the status bar. Without this, that
+             // translation is clipped and the top of the page disappears.
+             clearPageAncestorClip(page);
+@@ -3612,6 +3659,54 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             ensurePageBackdrop(page, dim);
+             placePageBackdrop(shift);
+         }
++        mClosePageLatched = true;
++        mClosePageDimStart = dim;
++        mClosePageTranslationStart = shift;
++        mPageDim = dim;
++        mPageCardArmed = true;
++        applyPageShade(mPageDim);
++        applyStatusBarForPageCard(true, mPageDim);
++        if (mGlass) flattenGlassDecor();
++    }
++
++    /**
++     * Eases the page translation, scale, backdrop, scrim and status bar colour back to rest
++     * across the close hand-off fade so the page and top strip never snap in one frame.
++     */
++    private void applyPageCardHandoff() {
++        if (!pageCardHandoffWanted()) {
++            restorePageCard();
++            return;
++        }
++        float handoff = morphHandoffAlpha();
++        float dim = mClosePageDimStart * handoff;
++        View scrim = mScrim;
++        if (scrim != null) {
++            scrim.setBackgroundColor(Color.BLACK);
++            scrim.setAlpha(dim * PAGE_DIM_ALPHA);
++            placeSheetScrim(scrim, false);
++        }
++        rememberStatusBar();
++        View page = mActivity.findViewById(R.id.compositor_view_holder);
++        if (page != null) {
++            float scale = 1f - dim * (1f - PAGE_SCALE);
++            float targetY = mHaveSavedPageTranslation ? mSavedPageTranslationY : 0f;
++            float shift = lerp(targetY, mClosePageTranslationStart, handoff);
++            page.setPivotX(page.getWidth() * 0.5f);
++            page.setPivotY(0f);
++            page.setScaleX(scale);
++            page.setScaleY(scale);
++            page.setTranslationY(shift);
++            clearPageAncestorClip(page);
++            mPageCornerRadius = dp(PAGE_CORNER_DP) * dim;
++            mPageTopInset = 0;
++            page.setOutlineProvider(mPageOutline);
++            page.setClipToOutline(true);
++            page.invalidateOutline();
++            ensurePageBackdrop(page, dim);
++            if (mPageBackdrop != null) mPageBackdrop.setAlpha(handoff);
++            placePageBackdrop(shift);
++        }
+         mPageDim = dim;
+         mPageCardArmed = true;
+         applyPageShade(mPageDim);
+@@ -3737,7 +3832,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             mBackdropClipB = -1;
+         }
+         boolean cover =
+-                isSheetChrome() && !sheetFromTop() && mProgress > 0.001f && mBottomInset > 0;
++                isSheetChrome()
++                        && !sheetFromTop()
++                        && (mProgress > 0.001f || pageCardHandoffWanted())
++                        && mBottomInset > 0;
+         if (!cover) {
+             if (mBackdropClipW != 0) {
+                 mBackdropClipW = 0;
+@@ -3894,6 +3992,10 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                         restorePageCard();
+                         return;
+                     }
++                    if (pageCardHandoffWanted()) {
++                        applyPageCardHandoff();
++                        return;
++                    }
+                     float half = BareTabSheetSnap.HALF_RATIO;
+                     float dim =
+                             sheetFromTop()
+@@ -3928,11 +4030,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         if (dimmed) {
+             rememberStatusBar();
+             setStatusBarScrim(Color.TRANSPARENT);
+-            if (window.getStatusBarColor() != Color.TRANSPARENT) {
+-                window.setStatusBarColor(Color.TRANSPARENT);
++            @ColorInt int wantColor = pageCardHandoffStatusBarColor();
++            if (window.getStatusBarColor() != wantColor) {
++                window.setStatusBarColor(wantColor);
++            }
++            if (pageCardHandoffWanted() && morphHandoffAlpha() <= 0.5f) {
++                if (mHaveSavedLightStatusBar
++                        && controller.isAppearanceLightStatusBars() != mSavedLightStatusBar) {
++                    controller.setAppearanceLightStatusBars(mSavedLightStatusBar);
++                }
++            } else {
++                applyLatchedStatusBarIcons(controller);
++                if (!pageCardHandoffWanted()) scheduleStatusBarSample();
+             }
+-            applyLatchedStatusBarIcons(controller);
+-            scheduleStatusBarSample();
+             armStatusBarGuard();
+             return;
+         }
+@@ -3950,6 +4060,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         disarmStatusBarGuard();
+     }
+ 
++    /** Status-bar colour while the page card is up: transparent until the close hand-off eases it back. */
++    private @ColorInt int pageCardHandoffStatusBarColor() {
++        if (!pageCardHandoffWanted()) return Color.TRANSPARENT;
++        float handoff = morphHandoffAlpha();
++        if (handoff >= 0.999f) return Color.TRANSPARENT;
++        @ColorInt int base =
++                mHaveSavedStatusBarColor
++                        ? mSavedStatusBarColor
++                        : ChromeColors.getDefaultThemeColor(mActivity, /* isIncognito= */ false);
++        if (handoff <= 0.001f) return base;
++        return ColorUtils.setAlphaComponent(
++                base, Math.round(Color.alpha(base) * (1f - handoff)));
++    }
++
+     /** Puts the latched icon appearance back if the status-bar controller replaced it. */
+     private void applyLatchedStatusBarIcons(WindowInsetsControllerCompat controller) {
+         if (!mStatusBarIconLatched) return;
+@@ -6422,6 +6546,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             mForceBarRect = false;
+             mCloseReveal = false;
+             mCloseBarTravelStart = 0f;
++            mCloseBarStartProgress = 0f;
++            mCloseBarStartGone = 0f;
+             if (mPanel != null && mPanel.getAlpha() != 1f) mPanel.setAlpha(1f);
+             suppressToolbarSceneLayer(false);
+             View settledBar = mActivity.findViewById(R.id.location_bar);
+@@ -6551,7 +6677,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // The pre-draw guard rewrote visibility every frame and kept layout running.
+         disarmMorphGuard();
+         if (mCloseReveal) {
+-            suppressToolbarSceneLayer(false);
++            mGhostCoverFrames = 0;
++            if (morphHandoffAlpha() <= 0.001f) {
++                suppressToolbarSceneLayer(false);
++            } else {
++                suppressToolbarSceneLayer(true);
++                dropToolbarSceneBitmap();
++            }
+         } else {
+             suppressToolbarSceneLayer(true);
+             dropToolbarSceneBitmap();
+@@ -6751,12 +6883,28 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** Fades the real address bar so its URL and side buttons are not left under the pill. */
+ 
++    /** Open-path curve: clears the five-button row over the first 35% of opening. */
++    private static float openButtonBarGone(float progress) {
++        float shrink = Math.min(1f, Math.max(0f, progress) / BareTabSheetSnap.HALF_RATIO);
++        float linear = shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
++        return morphEase(linear);
++    }
++
+     /** 0 when the five-button row is at rest, 1 once the sheet has faded it out. */
+     private float buttonBarGone() {
+         if (!bottomBarMorph()) return 0f;
+-        float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
+-        float linear = shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
+-        return morphEase(linear);
++        if (isCloseButtonBarFadePath()) {
++            return mCloseBarStartGone * unitRange(mProgress / mCloseBarStartProgress);
++        }
++        return openButtonBarGone(mProgress);
++    }
++
++    private boolean isCloseButtonBarFadePath() {
++        return !mOpen
++                && mMorphClosing
++                && !mForceBarRect
++                && !mCloseReveal
++                && mCloseBarStartProgress > 0.001f;
+     }
+ 
+     /** How far the five-button row has slid down, in pixels. */
+@@ -6825,6 +6973,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** Puts the five-button row back. Top-bar sheets and the side drawer call this. */
+     private void restoreBottomButtonBar() {
+         mCloseBarTravelStart = 0f;
++        mCloseBarStartProgress = 0f;
++        mCloseBarStartGone = 0f;
+         setBottomBarTravel(0f);
+         View buttons = bottomButtonBar();
+         if (buttons == null) {
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 754472b91d..f9277c8864 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -5039,6 +5039,326 @@ public class BareVerticalTabsDrawerUnitTest {
+         assertEquals(0f, buttons.getAlpha(), 0.001f);
+     }
+ 
++    private View attachPageWithTopMargin(int topMarginPx) {
++        View existing = mActivity.findViewById(org.chromium.chrome.R.id.compositor_view_holder);
++        if (existing != null && existing.getParent() instanceof ViewGroup parent) {
++            parent.removeView(existing);
++        }
++        View page = new View(mActivity);
++        page.setId(org.chromium.chrome.R.id.compositor_view_holder);
++        FrameLayout.LayoutParams params =
++                new FrameLayout.LayoutParams(
++                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
++        params.topMargin = topMarginPx;
++        content().addView(page, params);
++        return page;
++    }
++
++    private float expectedPageShift(int topMarginPx) {
++        int statusBarRes =
++                mActivity.getResources().getIdentifier("status_bar_height", "dimen", "android");
++        int cap =
++                statusBarRes > 0
++                        ? mActivity.getResources().getDimensionPixelSize(statusBarRes)
++                        : px(48);
++        if (cap <= 0) cap = px(48);
++        return -Math.min(topMarginPx, cap);
++    }
++
++    private View attachBottomBar(int heightPx) {
++        View buttons = new View(mActivity);
++        buttons.setId(BareVerticalTabsDrawer.bottomBarIdForTesting());
++        buttons.setAlpha(1f);
++        buttons.setVisibility(View.VISIBLE);
++        content().addView(buttons, new FrameLayout.LayoutParams(px(400), heightPx, Gravity.BOTTOM));
++        return buttons;
++    }
++
++    @Test
++    public void testCloseHandoffPageTranslationBackdropAndStatusBarEaseContinuously() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View page = attachPageWithTopMargin(px(32));
++        WindowInsetsControllerCompat icons =
++                new WindowInsetsControllerCompat(
++                        mActivity.getWindow(), mActivity.getWindow().getDecorView());
++        icons.setAppearanceLightStatusBars(true);
++        mActivity.getWindow().setStatusBarColor(0xFF112233);
++
++        TextView bar = new TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/");
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        pullOpenOnABar(bar, shield, 0.004f, 0.45f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++
++        float expectedShift = expectedPageShift(px(32));
++        assertTrue("expectedShift=" + expectedShift, expectedShift < -1f);
++        assertEquals(expectedShift, page.getTranslationY(), 1f);
++        assertEquals(
++                android.graphics.Color.TRANSPARENT, mActivity.getWindow().getStatusBarColor());
++        View backdrop = content().findViewWithTag("page_card_backdrop");
++        assertNotNull(backdrop);
++        assertEquals(1f, backdrop.getAlpha(), 0.001f);
++
++        mDrawer.close();
++        for (int i = 0;
++                i < 60
++                        && mDrawer.sheetSpringRunningForTesting()
++                        && mDrawer.progressForTesting() >= 0.02f;
++                i++) {
++            mDrawer.stepSheetSpringForTesting(0.016f);
++        }
++        assertTrue(mDrawer.sheetSpringRunningForTesting());
++        assertTrue("progress=" + mDrawer.progressForTesting(), mDrawer.progressForTesting() < 0.02f);
++
++        float beforeY = page.getTranslationY();
++        float beforeBackdropAlpha = backdrop.getAlpha();
++        int beforeStatus = mActivity.getWindow().getStatusBarColor();
++
++        mDrawer.endAnimationForTesting();
++        assertEquals(beforeY, page.getTranslationY(), 0.001f);
++        assertEquals(beforeBackdropAlpha, backdrop.getAlpha(), 0.001f);
++        assertEquals(beforeStatus, mActivity.getWindow().getStatusBarColor());
++        assertTrue(mDrawer.toolbarSceneSuppressedForTesting());
++
++        mDrawer.revealCloseHandoffForTesting();
++        assertEquals(beforeY, page.getTranslationY(), 0.001f);
++        assertEquals(beforeBackdropAlpha, backdrop.getAlpha(), 0.001f);
++        assertEquals(beforeStatus, mActivity.getWindow().getStatusBarColor());
++        assertTrue(mDrawer.toolbarSceneSuppressedForTesting());
++
++        float prevY = beforeY;
++        float prevBackdropAlpha = beforeBackdropAlpha;
++        int prevStatusAlpha = android.graphics.Color.alpha(beforeStatus);
++        for (float fade : new float[] {0.25f, 0.5f, 0.75f, 1f}) {
++            mDrawer.setCloseHandoffFadeForTesting(fade);
++            float y = page.getTranslationY();
++            float backdropAlpha = backdrop.getAlpha();
++            int statusAlpha =
++                    android.graphics.Color.alpha(mActivity.getWindow().getStatusBarColor());
++            assertTrue("fade=" + fade + " y=" + y + " prev=" + prevY, y > prevY);
++            assertTrue(
++                    "fade=" + fade + " backdrop=" + backdropAlpha + " prev=" + prevBackdropAlpha,
++                    backdropAlpha < prevBackdropAlpha);
++            assertTrue(
++                    "fade=" + fade + " statusAlpha=" + statusAlpha + " prev=" + prevStatusAlpha,
++                    statusAlpha > prevStatusAlpha);
++            assertEquals(fade < 1f, mDrawer.toolbarSceneSuppressedForTesting());
++            prevY = y;
++            prevBackdropAlpha = backdropAlpha;
++            prevStatusAlpha = statusAlpha;
++        }
++        assertEquals(0f, page.getTranslationY(), 0.01f);
++        assertEquals(0f, backdrop.getAlpha(), 0.01f);
++        assertEquals(0xFF112233, mActivity.getWindow().getStatusBarColor());
++        assertFalse(mDrawer.toolbarSceneSuppressedForTesting());
++
++        mDrawer.flushCloseHandoffForTesting();
++        assertEquals(0f, page.getTranslationY(), 0.001f);
++        assertEquals(1f, page.getScaleX(), 0.001f);
++        assertEquals(1f, page.getScaleY(), 0.001f);
++        assertFalse(page.getClipToOutline());
++        assertTrue(backdrop.getVisibility() != View.VISIBLE || backdrop.getAlpha() == 0f);
++        assertEquals(0xFF112233, mActivity.getWindow().getStatusBarColor());
++        assertTrue(icons.isAppearanceLightStatusBars());
++        assertFalse(mDrawer.toolbarSceneSuppressedForTesting());
++    }
++
++    @Test
++    public void testCloseHandoffPageAndToolbarReopenDuringFadeRestoresOpenState() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View page = attachPageWithTopMargin(px(32));
++        WindowInsetsControllerCompat icons =
++                new WindowInsetsControllerCompat(
++                        mActivity.getWindow(), mActivity.getWindow().getDecorView());
++        icons.setAppearanceLightStatusBars(true);
++        mActivity.getWindow().setStatusBarColor(0xFF112233);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkTheCloseMorph(bar, shield);
++
++        float expectedShift = expectedPageShift(px(32));
++        mDrawer.revealCloseHandoffForTesting();
++        mDrawer.setCloseHandoffFadeForTesting(0.5f);
++        assertTrue(
++                "mid y=" + page.getTranslationY() + " shift=" + expectedShift,
++                page.getTranslationY() < -1f && page.getTranslationY() > expectedShift + 1f);
++        int midStatusAlpha =
++                android.graphics.Color.alpha(mActivity.getWindow().getStatusBarColor());
++        assertTrue("midStatusAlpha=" + midStatusAlpha, midStatusAlpha > 0 && midStatusAlpha < 255);
++        assertTrue(mDrawer.toolbarSceneSuppressedForTesting());
++
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++        assertTrue(mDrawer.isOpen());
++        assertEquals(expectedShift, page.getTranslationY(), 1f);
++        assertTrue(page.getClipToOutline());
++        View backdrop = content().findViewWithTag("page_card_backdrop");
++        assertNotNull(backdrop);
++        assertEquals(1f, backdrop.getAlpha(), 0.001f);
++        assertEquals(
++                android.graphics.Color.TRANSPARENT, mActivity.getWindow().getStatusBarColor());
++        assertTrue(mDrawer.toolbarSceneSuppressedForTesting());
++
++        mDrawer.close();
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++        assertFalse(mDrawer.isOpen());
++        assertEquals(0f, page.getTranslationY(), 0.001f);
++        assertFalse(page.getClipToOutline());
++        assertEquals(0xFF112233, mActivity.getWindow().getStatusBarColor());
++        assertFalse(mDrawer.toolbarSceneSuppressedForTesting());
++    }
++
++    @Test
++    public void testOpeningSheetDoesNotUsePageCardHandoffFadePath() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View page = attachPageWithTopMargin(px(32));
++        WindowInsetsControllerCompat icons =
++                new WindowInsetsControllerCompat(
++                        mActivity.getWindow(), mActivity.getWindow().getDecorView());
++        icons.setAppearanceLightStatusBars(true);
++        mActivity.getWindow().setStatusBarColor(0xFF112233);
++        TextView bar = new TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/");
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        pullOpenOnABar(bar, shield, 0.004f, 0.2f);
++
++        float expectedShift = expectedPageShift(px(32));
++        assertEquals(expectedShift, page.getTranslationY(), 1f);
++        View backdrop = content().findViewWithTag("page_card_backdrop");
++        assertNotNull(backdrop);
++        assertEquals(1f, backdrop.getAlpha(), 0.001f);
++        assertEquals(
++                android.graphics.Color.TRANSPARENT, mActivity.getWindow().getStatusBarColor());
++        assertTrue(page.getClipToOutline());
++        assertTrue(mDrawer.toolbarSceneSuppressedForTesting());
++    }
++
++    @Test
++    public void testCloseBottomBarFadesInContinuouslyFromStartWithoutThresholdPop() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View buttons = attachBottomBar(px(56));
++        TextView bar = new TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/");
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        pullOpenOnABar(bar, shield, 0.004f, 0.5f);
++        mDrawer.endToolbarPull(0f);
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++
++        assertEquals(0.5f, mDrawer.progressForTesting(), 0.01f);
++        assertTrue(mDrawer.isOpen());
++        assertEquals(0f, buttons.getAlpha(), 0.001f);
++        assertEquals(View.INVISIBLE, buttons.getVisibility());
++        assertEquals(1f, mDrawer.bottomBarTravelForTesting(), 0.001f);
++
++        mDrawer.close();
++        float prevAlpha = buttons.getAlpha();
++        float prevTravel = mDrawer.bottomBarTravelForTesting();
++        float prevSlide = buttons.getTranslationY();
++        int steps = 0;
++        for (int i = 0; i < 300 && mDrawer.sheetSpringRunningForTesting(); i++) {
++            mDrawer.stepSheetSpringForTesting(0.016f);
++            steps++;
++            float alpha = buttons.getAlpha();
++            float travel = mDrawer.bottomBarTravelForTesting();
++            float slide = buttons.getTranslationY();
++            if (steps == 1) {
++                assertTrue(
++                        "progress=" + mDrawer.progressForTesting(),
++                        mDrawer.progressForTesting() > 0.175f);
++                assertTrue("first step alpha=" + alpha, alpha > 0f && alpha < 0.25f);
++                assertTrue("first step travel=" + travel, travel < 1f && travel > 0.75f);
++            }
++            assertTrue(
++                    "step=" + steps + " alpha=" + alpha + " prev=" + prevAlpha,
++                    alpha >= prevAlpha - 0.001f);
++            assertTrue(
++                    "step=" + steps + " alpha jump=" + (alpha - prevAlpha),
++                    alpha - prevAlpha < 0.25f);
++            assertTrue(
++                    "step=" + steps + " travel=" + travel + " prev=" + prevTravel,
++                    travel <= prevTravel + 0.001f);
++            assertTrue(
++                    "step=" + steps + " slide=" + slide + " prev=" + prevSlide,
++                    slide <= prevSlide + 1f);
++            prevAlpha = alpha;
++            prevTravel = travel;
++            prevSlide = slide;
++        }
++        assertTrue(steps > 0);
++        assertFalse(mDrawer.sheetSpringRunningForTesting());
++
++        mDrawer.flushCloseHandoffForTesting();
++        assertEquals(1f, buttons.getAlpha(), 0.001f);
++        assertEquals(0f, mDrawer.bottomBarTravelForTesting(), 0.001f);
++        assertEquals(0f, buttons.getTranslationY(), 0.001f);
++        assertEquals(View.VISIBLE, buttons.getVisibility());
++    }
++
++    @Test
++    public void testCloseBottomBarFromPartialPullIsContinuousWithFrameBeforeClose() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View buttons = attachBottomBar(px(56));
++        TextView bar = new TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/");
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        pullOpenOnABar(bar, shield, 0.004f, 0.10f);
++
++        float beforeAlpha = buttons.getAlpha();
++        float beforeTravel = mDrawer.bottomBarTravelForTesting();
++        assertTrue("beforeAlpha=" + beforeAlpha, beforeAlpha > 0.1f && beforeAlpha < 0.9f);
++
++        mDrawer.endToolbarPull(0f);
++        mDrawer.close();
++        mDrawer.stepSheetSpringForTesting(0.002f);
++        assertTrue(
++                "alpha=" + buttons.getAlpha() + " before=" + beforeAlpha,
++                buttons.getAlpha() >= beforeAlpha - 0.001f);
++        assertTrue(
++                "alpha jump=" + (buttons.getAlpha() - beforeAlpha),
++                buttons.getAlpha() - beforeAlpha < 0.08f);
++        assertTrue(
++                "travel drop=" + (beforeTravel - mDrawer.bottomBarTravelForTesting()),
++                beforeTravel - mDrawer.bottomBarTravelForTesting() < 0.08f);
++
++        mDrawer.finishAnimationForTesting();
++        ShadowLooper.idleMainLooper();
++        assertEquals(1f, buttons.getAlpha(), 0.001f);
++        assertEquals(0f, mDrawer.bottomBarTravelForTesting(), 0.001f);
++        assertEquals(0f, buttons.getTranslationY(), 0.001f);
++        assertEquals(View.VISIBLE, buttons.getVisibility());
++    }
++
++    @Test
++    public void testOpeningSheetKeepsOpenBottomBarThresholdUnchanged() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        View buttons = attachBottomBar(px(56));
++        TextView bar = new TextView(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        bar.setText("https://example.com/");
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        pullOpenOnABar(bar, shield, 0.004f, 0.20f);
++
++        assertEquals(0.20f, mDrawer.progressForTesting(), 0.01f);
++        assertEquals(1f, mDrawer.bottomBarTravelForTesting(), 0.001f);
++        assertEquals(0f, buttons.getAlpha(), 0.001f);
++        assertEquals(View.INVISIBLE, buttons.getVisibility());
++    }
++
+     private void settleSheetSpring() {
+         for (int i = 0; i < 300; i++) {
+             if (!mDrawer.sheetSpringRunningForTesting()) return;
+-- 
+2.34.1
+
