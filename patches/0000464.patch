@@ -1,0 +1,319 @@
+From f55b466f4f29eac076e29e3b6db6b46fa6e065b2 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:11:30 +0000
+Subject: [PATCH] Bare: let the open tab sheet use the bar-cover band
+
+A settled full sheet reserved the bottom-bar cover under the action row, so that band stayed an empty strip of sheet colour down to the nav inset. Half open left the same cover in front of the row, which clipped it.
+
+The bottom seam is 12dp for the whole drag, so the panel reaches one seam above the nav inset and does not jump as it passes half or settles. The 8dp gap at the top stays. From half open on, while the sheet is still open, the cover is not drawn: the sheet already covers that slot. close() clears the open flag before the hand-off, so the cover is laid out again at the start of the close. The opening drag below half still paints the cover.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  |  68 +++-----
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 158 ++++++++++++++++--
+ 2 files changed, 168 insertions(+), 58 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index 4474c4c..8ee8ddf 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -2432,8 +2432,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     // real pill outside the sheet window. Measure the location bar too.
+                     // The window includes that pill for the whole morph. Lift holds the
+                     // panel on the old edge and returns to 0 once the slot is yielded, so
+-                    // a settled sheet still keeps the 12dp seam. A full open also reserves
+-                    // the bar cover under that seam (see settledOpenCoverReserve).
++                    // a settled sheet still keeps the 12dp seam. From half open on, the
++                    // bar cover yields to the sheet (see openBottomBarCoverYieldsToSheet).
+                     float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
+                     float fade =
+                             shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
+@@ -4352,7 +4352,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         // On the keyboard the search row sits on the keys. The seam would be a gap of page.
+         if (isSheetChrome() && !sheetFromTop() && keyboardBottomInset(mOverlayTop) > 0) return 0;
+         if (!(isSheetChrome() && !sheetFromTop())) return 0;
+-        return dp(SHEET_BOTTOM_SEAM_DP) + settledOpenCoverReserve();
++        return dp(SHEET_BOTTOM_SEAM_DP);
+     }
+ 
+     /**
+@@ -4367,45 +4367,6 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                 && buttonBarGone() >= 0.999f;
+     }
+ 
+-    /**
+-     * Extra seam, only while a bottom-bar sheet is settled fully open, so the action row ends
+-     * one seam above the bar cover. By then the five-button row has slid off, the window has
+-     * followed it down to the nav inset, and the cover paints from the address bar to that
+-     * edge. The plain 12dp seam is measured from the window bottom, which puts the row under
+-     * the cover. Half, the opening drag, a top-bar sheet and the close hand-off keep none.
+-     */
+-    private int settledOpenCoverReserve() {
+-        if (!settledFullBottomSheet()) return 0;
+-        FrameLayout root = mRoot;
+-        View bar = mActivity.findViewById(R.id.location_bar);
+-        View buttons = bottomButtonBar();
+-        if (root == null || bar == null || buttons == null) return 0;
+-        if (root.getHeight() <= 0 || bar.getHeight() <= 0 || buttons.getHeight() <= 0) return 0;
+-        if (!root.isAttachedToWindow()
+-                || !bar.isAttachedToWindow()
+-                || !buttons.isAttachedToWindow()) {
+-            return 0;
+-        }
+-        if (isInside(bar, root) || isInside(buttons, root)) return 0;
+-        int[] barAt = new int[2];
+-        int[] buttonAt = new int[2];
+-        int[] rootAt = new int[2];
+-        bar.getLocationOnScreen(barAt);
+-        buttons.getLocationOnScreen(buttonAt);
+-        root.getLocationOnScreen(rootAt);
+-        int barTop = barAt[1] - Math.round(bar.getTranslationY());
+-        int barBottom = barTop + bar.getHeight();
+-        int buttonTop = buttonAt[1] - Math.round(buttons.getTranslationY());
+-        // Overlapping bottom edges are one slot, not a row the cover paints over.
+-        if (barBottom > buttonTop + dp(1)) return 0;
+-        int coverTop = barTop - rootAt[1];
+-        // Bottom chrome only. A bar in the upper half is not this cover.
+-        if (coverTop <= 0 || coverTop * 2 < root.getHeight() || coverTop >= root.getHeight()) {
+-            return 0;
+-        }
+-        return root.getHeight() - coverTop;
+-    }
+-
+     /**
+      * Makes the sheet only as tall as its current progress and sits it on the
+      * toolbar it opens from: the bottom, or the top when the address bar is there.
+@@ -7126,6 +7087,15 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     new FrameLayout.LayoutParams(
+                             root.getWidth(), mBarHeightPx, Gravity.TOP | Gravity.START));
+         }
++        // From half open on, the sheet covers the bar slot. The cover left in front
++        // is the blank band under a full sheet and the clip on the half-open row.
++        // close() clears mOpen before it lays this out, so the hand-off still paints it.
++        if (openBottomBarCoverYieldsToSheet()) {
++            if (cover.getVisibility() != View.GONE) cover.setVisibility(View.GONE);
++            hideBottomButtonCover();
++            tickGhostCover(root);
++            return;
++        }
+         // Cover from the live location-bar top to the bottom of the sheet window.
+         // Elevation stays under the pill and above the scrim, so the compositor
+         // pill cannot show through for the frames after it is set invisible.
+@@ -7186,6 +7156,20 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         return mMorphClosing || mForceBarRect || mCloseReveal;
+     }
+ 
++    /**
++     * The opening drag below half still paints the bar cover, which hides the compositor
++     * pill while the five-button row slides off. At half and full the sheet covers that
++     * slot, so the cover would only clip the action row or leave a blank band under it.
++     * close() clears the open flag before the hand-off, which paints the cover again.
++     */
++    private boolean openBottomBarCoverYieldsToSheet() {
++        // mMorphClosing is also set while an open sheet is dragged down. That drag
++        // is not the hand-off. The hand-off runs with the sheet already closed.
++        if (!mOpen || mForceBarRect || mCloseReveal) return false;
++        if (mProgress < BareTabSheetSnap.HALF_RATIO) return false;
++        return buttonBarGone() >= 0.999f;
++    }
++
+     /** Cover fill: sheet surface until reveal, then eases into the real bar surface over the fade. */
+     private @ColorInt int bottomBarCoverColor() {
+         int base = liveBottomChromeColor();
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 3a77ead..7f78a83 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -5444,25 +5444,24 @@ public class BareVerticalTabsDrawerUnitTest {
+                 View panel = (View) actions.getParent();
+                 View cover = findTag("sheet_bottom_bar_cover");
+                 assertNotNull(cover);
+-                assertEquals(View.VISIBLE, cover.getVisibility());
++                // The sheet fills the old cover band. The cover is gone until the close.
++                assertEquals(View.GONE, cover.getVisibility());
+                 assertTrue(actions.getHeight() > px(48));
+                 assertEquals(1f, mDrawer.progressForTesting(), 0.001f);
+                 // The 8dp strip at the top of a full sheet stays put.
+                 assertEquals(px(8), panel.getTop(), 2f);
+ 
+                 int actionsBottom = panel.getTop() + actions.getBottom();
+-                int toolbarTop = toolbarTopInRoot(root);
+-                int coverTop = cover.getTop() + Math.round(cover.getTranslationY());
+                 assertTrue(
+-                        "dp=" + buttonDp + " actions " + actionsBottom + " toolbar " + toolbarTop,
+-                        actionsBottom + px(12) <= toolbarTop + 1);
+-                // Ghost frames start the cover one bar higher. Its resting top is the address bar.
+-                if (coverTop >= toolbarTop - 1) {
+-                    assertTrue(
+-                            "dp=" + buttonDp + " actions " + actionsBottom + " cover " + coverTop,
+-                            actionsBottom + px(12) <= coverTop + 1);
+-                }
+-                assertTrue(panelBottomMargin(panel) > px(12));
++                        "dp="
++                                + buttonDp
++                                + " actions "
++                                + actionsBottom
++                                + " root "
++                                + root.getHeight(),
++                        actionsBottom + px(12) <= root.getHeight() + 1);
++                assertEquals(px(12), panelBottomMargin(panel));
++                assertTrue(root.getHeight() - panel.getBottom() <= px(12) + 2);
+             }
+         } finally {
+             removeStackedBottomChrome();
+@@ -5513,11 +5512,12 @@ public class BareVerticalTabsDrawerUnitTest {
+         try {
+             layOutStackedBottomBar(37, 1f);
+             View panel = (View) findTag("sheet_actions").getParent();
+-            int openMargin = panelBottomMargin(panel);
+-            assertTrue("open margin " + openMargin, openMargin > px(12));
++            // Full open keeps the plain 12dp seam. The cover is not in front of the row.
++            assertEquals(px(12), panelBottomMargin(panel));
++            assertEquals(View.GONE, findTag("sheet_bottom_bar_cover").getVisibility());
+ 
+             startTheClose();
+-            // Still at the full progress, but the close has started. The reserve is open-only.
++            // The close has started. The seam stays 12dp and the cover is back.
+             mDrawer.applyProgressForTesting(mDrawer.progressForTesting());
+             assertEquals(1f, mDrawer.progressForTesting(), 0.01f);
+             assertEquals(px(12), panelBottomMargin(panel));
+@@ -5527,11 +5527,137 @@ public class BareVerticalTabsDrawerUnitTest {
+             View cover = findTag("sheet_bottom_bar_cover");
+             assertNotNull(cover);
+             assertEquals(View.VISIBLE, cover.getVisibility());
++            assertEquals(px(20), cover.getElevation(), 0.5f);
++            assertNotEquals(ViewOutlineProvider.BACKGROUND, cover.getOutlineProvider());
++            Outline outline = new Outline();
++            cover.getOutlineProvider().getOutline(cover, outline);
++            assertEquals(0f, outline.getAlpha(), 0.001f);
++            assertEquals(px(12), panelBottomMargin(panel));
++        } finally {
++            removeStackedBottomChrome();
++        }
++    }
++
++    @Test
++    public void testFullOpenSheetFillsDownToTheNavSeam() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            View root = layOutStackedBottomBar(37, 0.05f);
++            mDrawer.applyProgressForTesting(1f);
++            layoutOverlay(root, px(400), px(800));
++            mDrawer.applyProgressForTesting(1f);
++            layoutOverlay(root, px(400), px(800));
++
++            View actions = findTag("sheet_actions");
++            View panel = (View) actions.getParent();
++            View cover = findTag("sheet_bottom_bar_cover");
++            View fill = mDrawer.seamFillForTesting();
++            assertNotNull(cover);
++            assertNotNull(fill);
++            assertEquals(View.GONE, cover.getVisibility());
++            assertEquals(View.VISIBLE, fill.getVisibility());
++            assertEquals(px(12), ((FrameLayout.LayoutParams) fill.getLayoutParams()).height);
++            assertEquals(px(8), panel.getTop(), 2f);
++            assertEquals(px(12), panelBottomMargin(panel));
++            assertTrue(root.getHeight() - panel.getBottom() <= px(12) + 2);
++            int actionsBottom = panel.getTop() + actions.getBottom();
++            assertTrue(
++                    "actions " + actionsBottom + " root " + root.getHeight(),
++                    actionsBottom + px(12) <= root.getHeight() + 1);
++            assertTrue(actions.getHeight() > px(48));
++        } finally {
++            removeStackedBottomChrome();
++        }
++    }
++
++    @Test
++    public void testHalfOpenActionRowClearsTheCover() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            View root = layOutStackedBottomBar(37, BareTabSheetSnap.HALF_RATIO);
++            View actions = findTag("sheet_actions");
++            View panel = (View) actions.getParent();
++            View cover = findTag("sheet_bottom_bar_cover");
++            assertNotNull(cover);
++            assertEquals(View.GONE, cover.getVisibility());
++            assertTrue(actions.getHeight() > px(48));
++            assertEquals(0f, actions.getTranslationY(), 0f);
++            assertEquals(px(12), panelBottomMargin(panel));
++            assertEquals(
++                    Math.round(
++                            BareTabSheetSnap.HALF_RATIO
++                                    * (root.getHeight() - sheetGap() - px(12))),
++                    ((FrameLayout.LayoutParams) panel.getLayoutParams()).height);
++            int actionsBottom = panel.getTop() + actions.getBottom();
++            assertTrue(actions.getBottom() <= panel.getHeight());
++            assertTrue(
++                    "actions " + actionsBottom + " root " + root.getHeight(),
++                    actionsBottom + px(12) <= root.getHeight() + 1);
++        } finally {
++            removeStackedBottomChrome();
++        }
++    }
++
++    @Test
++    public void testOpeningSeamDoesNotJumpWhenTheCoverYields() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            View root = layOutStackedBottomBar(37, 0.2f);
++            View panel = (View) findTag("sheet_actions").getParent();
++            View cover = findTag("sheet_bottom_bar_cover");
++            assertNotNull(cover);
++            assertEquals(px(12), panelBottomMargin(panel));
++            assertEquals(View.VISIBLE, cover.getVisibility());
++            assertEquals(px(20), cover.getElevation(), 0.5f);
++
++            for (float progress : new float[] {0.5f, 0.75f, 1f}) {
++                mDrawer.applyProgressForTesting(progress);
++                layoutOverlay(root, px(400), px(800));
++                mDrawer.applyProgressForTesting(progress);
++                layoutOverlay(root, px(400), px(800));
++                assertEquals(
++                        "progress " + progress, px(12), panelBottomMargin(panel));
++                assertEquals(
++                        "progress " + progress, View.GONE, cover.getVisibility());
++            }
++            assertEquals(px(8), panel.getTop(), 2f);
++        } finally {
++            removeStackedBottomChrome();
++        }
++    }
++
++    @Test
++    public void testCloseHandoffShowsTheCoverAfterTheSheetYieldsIt() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        try {
++            View root = layOutStackedBottomBar(37, 0.05f);
++            mDrawer.applyProgressForTesting(1f);
++            layoutOverlay(root, px(400), px(800));
++            mDrawer.applyProgressForTesting(1f);
++            layoutOverlay(root, px(400), px(800));
++            View cover = findTag("sheet_bottom_bar_cover");
++            assertNotNull(cover);
++            assertEquals(View.GONE, cover.getVisibility());
++
++            startTheClose();
++            mDrawer.applyProgressForTesting(mDrawer.progressForTesting());
++            layoutOverlay(root, px(400), px(800));
++            assertEquals(View.VISIBLE, cover.getVisibility());
++            assertEquals(px(20), cover.getElevation(), 0.5f);
++
++            mDrawer.endAnimationForTesting();
++            mDrawer.revealCloseHandoffForTesting();
++            assertEquals(View.VISIBLE, cover.getVisibility());
+             assertNotEquals(ViewOutlineProvider.BACKGROUND, cover.getOutlineProvider());
+             Outline outline = new Outline();
+             cover.getOutlineProvider().getOutline(cover, outline);
+             assertEquals(0f, outline.getAlpha(), 0.001f);
+-            assertTrue(panelBottomMargin(panel) < openMargin);
++            View panel = (View) findTag("sheet_actions").getParent();
++            assertEquals(px(12), panelBottomMargin(panel));
+         } finally {
+             removeStackedBottomChrome();
+         }
+-- 
+2.43.0
+
