@@ -1,4 +1,4 @@
-From 301fa4feb5daa3ba58405c2b9fe108c119f69b20 Mon Sep 17 00:00:00 2001
+From 68b0ece17d850956405033c928d19f1abdf2ceaa Mon Sep 17 00:00:00 2001
 From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
 Date: Sat, 28 Nov 2026 07:07:50 +0000
 Subject: [PATCH] Bare: keep the full tab sheet action row above the bottom bar
@@ -15,16 +15,23 @@ the action row ends one seam above it. The 8dp gap at the top of a full
 sheet stays. Half open, the drag up, a top-bar sheet, the side drawer
 and the close hand-off keep the previous seam.
 
+Jumping straight to full used to be the morph's first drawn frame. That
+frame anchors the pill on the address bar and pins the panel to the pill,
+so the sheet's top sat on the bar instead of leaving the 8dp gap. A
+settled full sheet is not that frame: the open-path anchor and the
+travelling-pill pin stay off. The close hand-off still anchors on the bar.
+
 The unit tests check a fully open sheet at two button-row heights, that
 half open and a top-bar sheet keep their geometry, and that the close
-hand-off does not keep the reserve.
+hand-off does not keep the reserve. The full-open test steps through a
+short frame first, the way a drag does, then settles at full.
 ---
- .../browser/bare/BareVerticalTabsDrawer.java  |  47 ++++-
- .../bare/BareVerticalTabsDrawerUnitTest.java  | 176 ++++++++++++++++++
- 2 files changed, 221 insertions(+), 2 deletions(-)
+ .../browser/bare/BareVerticalTabsDrawer.java  |  69 ++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 178 ++++++++++++++++++
+ 2 files changed, 243 insertions(+), 4 deletions(-)
 
 diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
-index 162e026..7917ddb 100755
+index 162e026..4474c4c 100755
 --- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 @@ -2432,7 +2432,8 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
@@ -37,13 +44,25 @@ index 162e026..7917ddb 100755
                      float shrink = Math.min(1f, mProgress / BareTabSheetSnap.HALF_RATIO);
                      float fade =
                              shrink <= 0f ? 0f : Math.min(1f, shrink / TOOLBAR_FADE_SHRINK);
-@@ -4350,7 +4351,49 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -4350,7 +4351,59 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
      private int sheetBottomSeam() {
          // On the keyboard the search row sits on the keys. The seam would be a gap of page.
          if (isSheetChrome() && !sheetFromTop() && keyboardBottomInset(mOverlayTop) > 0) return 0;
 -        return isSheetChrome() && !sheetFromTop() ? dp(SHEET_BOTTOM_SEAM_DP) : 0;
 +        if (!(isSheetChrome() && !sheetFromTop())) return 0;
 +        return dp(SHEET_BOTTOM_SEAM_DP) + settledOpenCoverReserve();
++    }
++
++    /**
++     * A bottom-bar sheet that has settled fully open, and is not on the close hand-off.
++     * Half, the opening drag, a top-bar sheet and the close keep this false.
++     */
++    private boolean settledFullBottomSheet() {
++        return mOpen
++                && !isCloseBarHandoffPath()
++                && mProgress >= 0.999f
++                && bottomBarMorph()
++                && buttonBarGone() >= 0.999f;
 +    }
 +
 +    /**
@@ -54,9 +73,7 @@ index 162e026..7917ddb 100755
 +     * the cover. Half, the opening drag, a top-bar sheet and the close hand-off keep none.
 +     */
 +    private int settledOpenCoverReserve() {
-+        if (!mOpen || isCloseBarHandoffPath()) return 0;
-+        if (mProgress < 0.999f) return 0;
-+        if (!bottomBarMorph() || buttonBarGone() < 0.999f) return 0;
++        if (!settledFullBottomSheet()) return 0;
 +        FrameLayout root = mRoot;
 +        View bar = mActivity.findViewById(R.id.location_bar);
 +        View buttons = bottomButtonBar();
@@ -88,11 +105,37 @@ index 162e026..7917ddb 100755
      }
  
      /**
+@@ -4367,6 +4420,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      */
+     private void pinPanelTopToTravellingPill(Panel panel) {
+         if (!bottomBarMorph() || mProgress <= 0.001f) return;
++        // Settled full open keeps the 8dp gap from layoutSheetPanel. The morph's first
++        // frame still sits on the bar; following that pill would drop the sheet onto it.
++        if (settledFullBottomSheet()) return;
+         LinearLayout pill = mOriginPill;
+         FrameLayout root = mRoot;
+         if (pill == null || root == null || root.getHeight() <= 0) return;
+@@ -6588,8 +6644,13 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         readBarChrome(location);
+         // The first frame the morph is drawn is the real bar, pixel for pixel.
+         // Progress may already be a few percent by the time the window covers it.
+-        // A close parks on that same rect for one frame, then the texture returns.
+-        boolean anchor = mForceBarRect || mCloseReveal || (!mMorphAnchored && mBarWidthPx > 0);
++        // A sheet that is already fully open is not that frame: anchoring it would
++        // pin the panel to the bar and lose the 8dp gap. A close still parks on the
++        // bar for one frame, then the texture returns.
++        boolean anchor =
++                mForceBarRect
++                        || mCloseReveal
++                        || (!settledFullBottomSheet() && !mMorphAnchored && mBarWidthPx > 0);
+         if (anchor) {
+             shrink = 0f;
+             eased = 0f;
 diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-index f9277c8..1b26e71 100755
+index f9277c8..3a77ead 100755
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-@@ -5359,6 +5359,182 @@ public class BareVerticalTabsDrawerUnitTest {
+@@ -5359,6 +5359,184 @@ public class BareVerticalTabsDrawerUnitTest {
          assertEquals(View.INVISIBLE, buttons.getVisibility());
      }
  
@@ -169,8 +212,10 @@ index f9277c8..1b26e71 100755
 +        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
 +        try {
 +            for (int buttonDp : new int[] {29, 37}) {
-+                View root = layOutStackedBottomBar(buttonDp, 1f);
-+                ShadowLooper.idleMainLooper();
++                // A short frame first, as a drag does. The morph's first drawn frame sits
++                // on the bar; full open is the settled frame after that, with the 8dp gap.
++                View root = layOutStackedBottomBar(buttonDp, 0.05f);
++                mDrawer.applyProgressForTesting(1f);
 +                layoutOverlay(root, px(400), px(800));
 +                mDrawer.applyProgressForTesting(1f);
 +                layoutOverlay(root, px(400), px(800));
