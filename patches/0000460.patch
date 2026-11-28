@@ -1,4 +1,4 @@
-From 64343b57a572f11181774f21cbd771a352f7cb6a Mon Sep 17 00:00:00 2001
+From 53343ce5c6d89d4fd45bdabcd7275ccf08dc17d6 Mon Sep 17 00:00:00 2001
 From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
 Date: Sat, 28 Nov 2026 02:50:15 +0000
 Subject: [PATCH] Bare: keep the real status view in the layout while the tab
@@ -46,8 +46,8 @@ a close that turns back up hides it again; it is whole again once the close
 has finished.
 ---
  .../browser/bare/BareVerticalTabsDrawer.java  |  24 ++-
- .../bare/BareVerticalTabsDrawerUnitTest.java  | 142 ++++++++++++++++++
- 2 files changed, 165 insertions(+), 1 deletion(-)
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 150 ++++++++++++++++++
+ 2 files changed, 173 insertions(+), 1 deletion(-)
 
 diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 index 535731d235..b75763ccc8 100755
@@ -92,17 +92,20 @@ index 535731d235..b75763ccc8 100755
              hideAddressView(siteButton);
              return;
 diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-index 67f4a4dc64..8d9cfc6499 100755
+index 67f4a4dc64..229fac5f19 100755
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-@@ -2424,6 +2424,148 @@ public class BareVerticalTabsDrawerUnitTest {
+@@ -2424,6 +2424,156 @@ public class BareVerticalTabsDrawerUnitTest {
          assertEquals(lastFrame, copy.getTranslationX(), 0.05f);
      }
  
 +    /**
 +     * A status view that does what the real one does to the location bar around it: the bar takes
 +     * the icon starting padding on its start side while this view is not visible, and none while
-+     * it is. The bar's glyphs and icons then sit that much further in.
++     * it is. The bar's glyphs and icons then sit that much further in. The bar is a text view
++     * here, and a text view drops its text layout when its padding changes and has none until it
++     * is measured, so the bar is measured again at once, as the traversal that follows a frame on a
++     * device does. Without that the live bar has no text to read and the pill's shift is none.
 +     */
 +    private static final class PaddingCoupledStatus extends android.widget.ImageView {
 +        private final View mBar;
@@ -120,12 +123,17 @@ index 67f4a4dc64..8d9cfc6499 100755
 +        protected void onVisibilityChanged(View changed, int visibility) {
 +            super.onVisibilityChanged(changed, visibility);
 +            if (changed != this || mBar == null) return;
-+            int extra = visibility == View.VISIBLE ? 0 : mHiddenExtra;
++            int left = mRestingStart + (visibility == View.VISIBLE ? 0 : mHiddenExtra);
++            if (mBar.getPaddingLeft() == left) return;
 +            mBar.setPadding(
-+                    mRestingStart + extra,
-+                    mBar.getPaddingTop(),
-+                    mBar.getPaddingRight(),
-+                    mBar.getPaddingBottom());
++                    left, mBar.getPaddingTop(), mBar.getPaddingRight(), mBar.getPaddingBottom());
++            if (mBar.getMeasuredWidth() > 0 && mBar.getMeasuredHeight() > 0) {
++                mBar.measure(
++                        View.MeasureSpec.makeMeasureSpec(
++                                mBar.getMeasuredWidth(), View.MeasureSpec.EXACTLY),
++                        View.MeasureSpec.makeMeasureSpec(
++                                mBar.getMeasuredHeight(), View.MeasureSpec.EXACTLY));
++            }
 +        }
 +    }
 +

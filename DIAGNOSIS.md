@@ -386,20 +386,34 @@ resting glyphs on the last travel frame and the same on the park frame, the reve
 sheet is open, and in a pull that goes back down with the finger on it, the view is hidden by visibility with the open
 padding; a close that turns back up hides it again; it is whole again once the close has finished.
 
+A first version of the shift test failed on the real tree (`shift on the bar expected:<20.0> but was:<0.0>`), and
+every assertion before it passed, so the drawer was applying the status view's change and the padding as intended.
+The cause was in the test. Its status view set the bar's padding through `TextView.setPadding()`, and the bar there
+is itself the text view the pill is walked onto. A `TextView` drops its text layout when its padding changes and has
+none until it is next measured (a layout pass alone does not give it one), and the test runs no traversal between
+frames. `liveBarText()` needs a text layout, so from the second close frame there was no live text to read, and
+`alignMorphTextTowardsReal()` did what it does when there is none and put the shift back to 0. On a device the real
+bar is the `LocationBarLayout` around the url view, whose padding change relays the url view without dropping its
+layout, and a traversal runs between frames in any case. The test's status view now measures the bar again as soon as
+it has changed its padding, which is what that traversal does, and the shift tests read the same live text they read
+without it. Nothing in the drawer changed.
+
 ## Risks and things not confirmed
 
 - Not run on the drawer, as before. The cause is read from the Chromium 158 sources and the Bare patches (the
   observer, the padding, the dimen and the flag default), not seen on a device, and the new tests were compiled
-  (with the same unresolved-type diagnostics as before, plus one more `org.chromium.chrome.R` line) but not run.
-  They model the coupling with a status view that sets the bar's padding on a visibility change.
+  (with the same unresolved-type diagnostics as before, plus one more `org.chromium.chrome.R` line). On the real tree
+  the first version of one of them failed for the reason given above and the rest passed; the corrected stand-in
+  was run in a standalone Robolectric project in both graphics modes (the bar keeps a text layout and its first
+  glyph moves 30, 38, 30 px as the status view is shown, hidden and shown), not in the drawer's test class. They model
+  the coupling with a status view that sets the bar's padding on a visibility change.
 - It fits what was measured: 8dp is 8 capture px at that width, the favicon moves with the text (both are in the
-  clump the padding moves), and `0000458` showed the same 8 for two frames. It does not obviously fit a step that
-  happens only at the end of the fade at 40x (about 5 s): this cause relays the real bar a layout pass after the
-  status view is shown, a frame or two after the reveal. If the device still shows a step at the end of the fade
-  after this patch, it is something `finishCloseChrome()` or the glass window's dismissal does to the real bar
-  (the url view's focusable flags are set again there, and the window focus returns to the activity), and the
-  next thing to look at is the real url view's and the status view's rects in the last fade frame against the first
-  frame after the commit.
+  clump the padding moves), and `0000458` showed the same 8 for two frames. A per-frame measurement of the `0000459`
+  clip against a settled reference then put the step, text and favicon, at J2 + 3 and nothing after it, not at the
+  end of the fade at 40x (about 5 s). That is what this cause predicts: the real bar relays a layout pass after the
+  status view is shown, a frame or two after the reveal. If a step is still there after this patch, it is not this
+  padding, and the next thing to look at is the real url view's and the status view's rects on the frames either side
+  of it.
 - Other things that can still relay the real bar around the hand-off, and are not changed here: the toolbar
   button container's scale is put back on the park frame, and `ToolbarPhone.keepUrlTextClearOfExtensions()` reads
   its position (`getLocationInWindow()`, which includes the scale) to size the url view's end padding and the
