@@ -1,4 +1,4 @@
-From 769cee62ac0d03386dc6960b8ff248151cfd5003 Mon Sep 17 00:00:00 2001
+From 72c5261d0534308daa5173f3600e7e7dc86ad89a Mon Sep 17 00:00:00 2001
 From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
 Date: Sat, 28 Nov 2026 00:09:02 +0000
 Subject: [PATCH] Bare: copy the real url view and the favicon clip into the
@@ -24,26 +24,31 @@ the hand-off alpha. The canvas is shifted by the view's scroll first, as
 its parent does, so a scrolled url bar is copied as it is shown. The
 pill's own text is drawn at alpha 0 while that bitmap is up and stays as
 the fallback if no copy could be made. The bitmap is hidden and freed
-when the fade ends or the sheet opens again. An icon copy now takes the
-clip of its real view (the real provider, asked on the copy so a circle
-stays a circle, with no outline alpha so the copy casts no shadow), and
-drops it when it is reused for an icon that has none. A copy that cannot
-be drawn into a bitmap falls back on any RuntimeException.
+when the fade ends or the sheet opens again. Taking it down in a layout
+frame needs nothing more, because the pill's text is given its alphas
+every frame before the bitmap clears them. A teardown with no frame of
+its own (the sheet being destroyed) gives the label its alpha back where
+the bitmap is cleared away. An icon copy now takes the clip of its real
+view (the real provider, asked on the copy so a circle stays a circle,
+with no outline alpha so the copy casts no shadow), and drops it when it
+is reused for an icon that has none. A copy that cannot be drawn into a
+bitmap falls back on any RuntimeException.
 
 The 130 ms fade, the bar band, the page and top toolbar restore, the
 open path, the spring and the copies' sizes before the hand-off are
 unchanged. The unit tests cover the url bitmap's size, place, end and
-fade, its scroll, its removal at the end of the fade and on a reopen,
-the fallback when the live bar is not read, and the circular clip of the
-favicon copy in the hand-off, while the pill travels, and when the copy
-is reused.
+fade, its scroll, its removal at the end of the fade, on a reopen (the
+first frame after it is the bar itself, the next is the settled pill)
+and on a teardown, the fallback when the live bar is not read, and the
+circular clip of the favicon copy in the hand-off, while the pill
+travels, and when the copy is reused.
 ---
- .../browser/bare/BareVerticalTabsDrawer.java  | 148 ++++++++-
- .../bare/BareVerticalTabsDrawerUnitTest.java  | 305 ++++++++++++++++++
- 2 files changed, 446 insertions(+), 7 deletions(-)
+ .../browser/bare/BareVerticalTabsDrawer.java  | 162 ++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 343 ++++++++++++++++++
+ 2 files changed, 498 insertions(+), 7 deletions(-)
 
 diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
-index cc61cdd2bf..911dc6feed 100755
+index cc61cdd2bf..d9a9b40645 100755
 --- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
 @@ -197,6 +197,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
@@ -56,25 +61,32 @@ index cc61cdd2bf..911dc6feed 100755
      // Posts while waiting for window focus before showing a keyboard or focusing the
      // omnibox. The focus listener is the real signal; these cover a missed event.
      private static final int FOCUS_IME_ATTEMPTS = 8;
-@@ -361,6 +364,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -361,6 +364,11 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
      /** Hand-off icon copies draw a bitmap of their real view, padding and scale type included. */
      private final java.util.HashMap<ImageView, GhostSnapshot> mGhostSnapshots =
              new java.util.HashMap<>();
 +    /** The real url view, as one bitmap, while a close hand-off fades. Null until first used. */
 +    private @Nullable ImageView mMorphUrlSnapshot;
++    /** Whether the url bitmap is up and the pill's own text views have been cleared under it. */
++    private boolean mUrlSnapshotCoversText;
 +    private final Outline mGhostClipProbe = new Outline();
      /** Icons outside the location bar, hidden while their copies ride the morph. */
      private final java.util.ArrayList<View> mFadedBarIcons = new java.util.ArrayList<>();
      private final java.util.ArrayList<Float> mFadedBarIconAlpha = new java.util.ArrayList<>();
-@@ -5782,6 +5788,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -5782,6 +5790,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
          }
          mMorphExtraCount = 0;
          releaseGhostSnapshots();
++        boolean urlBitmapWasUp = mUrlSnapshotCoversText;
 +        hideMorphUrlSnapshot();
++        // Nothing lays the pill out again after this, so the label the bitmap stood in for is
++        // given back here, at the alpha a settled pill has.
++        TextView label = mPillOrigin;
++        if (urlBitmapWasUp && label != null && label.getAlpha() != 1f) label.setAlpha(1f);
          TextView fromView = mMorphFromText;
          if (fromView != null) {
              if (fromView.getAlpha() != 0f) fromView.setAlpha(0f);
-@@ -5791,21 +5798,44 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -5791,21 +5805,44 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
  
      /** The bitmap one hand-off icon copy shows, and the real view it was drawn from. */
      private static final class GhostSnapshot {
@@ -121,7 +133,7 @@ index cc61cdd2bf..911dc6feed 100755
          ghost.setScaleType(ImageView.ScaleType.FIT_CENTER);
          ghost.setClickable(false);
          ghost.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-@@ -5978,6 +6008,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -5978,6 +6015,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
                      ghost.setImageDrawable(copy);
                  }
              }
@@ -129,7 +141,7 @@ index cc61cdd2bf..911dc6feed 100755
              placeMorphFloat(ghost, root, w, h, x, y, ghostAlpha);
              if (ghost.getParent() != root) continue;
              fadeSourceIcon(source);
-@@ -6016,10 +6047,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6016,10 +6054,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
       * keeps the icon's drawable instead.
       */
      private boolean drawIconSnapshot(ImageView ghost, ImageView source) {
@@ -151,7 +163,7 @@ index cc61cdd2bf..911dc6feed 100755
          GhostSnapshot held = mGhostSnapshots.get(ghost);
          if (held != null
                  && held.mSource == source
-@@ -6037,9 +6077,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6037,9 +6084,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
              mGhostSnapshots.put(ghost, held);
          }
          try {
@@ -169,7 +181,7 @@ index cc61cdd2bf..911dc6feed 100755
              mGhostSnapshots.remove(ghost);
              return false;
          }
-@@ -6063,6 +6108,88 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6063,6 +6115,95 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
          mGhostSnapshots.clear();
      }
  
@@ -244,9 +256,16 @@ index cc61cdd2bf..911dc6feed 100755
 +        if (origin != null && origin.getAlpha() != 0f) origin.setAlpha(0f);
 +        TextView from = mMorphFromText;
 +        if (from != null && from.getAlpha() != 0f) from.setAlpha(0f);
++        mUrlSnapshotCoversText = true;
 +    }
 +
++    /**
++     * Takes the url bitmap down. A layout frame that does this has already given the pill's
++     * text its alphas back, because applyMorphText runs before it every frame. A teardown with
++     * no frame of its own has to do that itself, see {@link #clearMorphFloats}.
++     */
 +    private void hideMorphUrlSnapshot() {
++        mUrlSnapshotCoversText = false;
 +        ImageView ghost = mMorphUrlSnapshot;
 +        if (ghost == null || ghost.getVisibility() == View.GONE) return;
 +        if (ghost.getAlpha() != 0f) ghost.setAlpha(0f);
@@ -258,7 +277,7 @@ index cc61cdd2bf..911dc6feed 100755
      private void placeMorphFloat(
              View view, FrameLayout root, int width, int height, float left, float top, float alpha) {
          if (view.getParent() != root) {
-@@ -6254,6 +6381,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6254,6 +6395,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
              placePillOnRoot(pill, root, width, height, left, top);
              if (live) alignMorphText(liveBarText());
              syncMorphIcons(anchor, eased, left, top, width, height);
@@ -266,7 +285,7 @@ index cc61cdd2bf..911dc6feed 100755
          }
          fadeToolbarChrome(shrink);
          // Reveal lets the real bar be captured under the morph. Every other morph
-@@ -6280,6 +6408,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+@@ -6280,6 +6422,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
              ImageView ghost = mMorphExtraIcons.get(i);
              if (ghost.getParent() == root) ghost.bringToFront();
          }
@@ -280,10 +299,10 @@ index cc61cdd2bf..911dc6feed 100755
          if (pill.getAlpha() != pillAlpha) pill.setAlpha(pillAlpha);
          if (pill.getVisibility() != View.VISIBLE) pill.setVisibility(View.VISIBLE);
 diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-index 54dfc01b97..2d1bbeb225 100755
+index 54dfc01b97..c7c966d230 100755
 --- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
 +++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
-@@ -1959,6 +1959,311 @@ public class BareVerticalTabsDrawerUnitTest {
+@@ -1959,6 +1959,349 @@ public class BareVerticalTabsDrawerUnitTest {
          }
      }
  
@@ -460,6 +479,44 @@ index 54dfc01b97..2d1bbeb225 100755
 +        assertTrue(mDrawer.isOpen());
 +        assertTrue(url.getVisibility() != View.VISIBLE || url.getAlpha() < 0.01f);
 +        assertNull(url.getDrawable());
++
++        // The one frame the sheet jumps to is the first morph frame after a reopen, which is
++        // the bar itself: the url is the from-view's and the label is still clear, as it is on
++        // any open. Either way the pill's text is up, and not left under the bitmap.
++        TextView from = (TextView) findTag("morph_from_text");
++        assertNotNull(from);
++        assertTrue(
++                "origin " + origin.getAlpha() + ", from " + from.getAlpha(),
++                origin.getAlpha() > 0.99f
++                        || (from.getVisibility() == View.VISIBLE && from.getAlpha() > 0.99f));
++
++        // The next frame is the settled pill: the label is whole and the from-view is gone.
++        mDrawer.applyProgressForTesting(mDrawer.progressForTesting());
++        assertEquals(View.VISIBLE, origin.getVisibility());
++        assertEquals(1f, origin.getAlpha(), 0.001f);
++        assertTrue(from.getVisibility() != View.VISIBLE || from.getAlpha() < 0.02f);
++        assertTrue(url.getVisibility() != View.VISIBLE || url.getAlpha() < 0.01f);
++    }
++
++    @Test
++    public void testTearingTheSheetDownDuringTheCloseFadeGivesThePillTextBack() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkOnALongUrlBar(bar, shield);
++        TextView origin = (TextView) findTag("sheet_pill_origin");
++        mDrawer.revealCloseHandoffForTesting();
++        mDrawer.setCloseHandoffFadeForTesting(0.5f);
++        android.widget.ImageView url = (android.widget.ImageView) findTag("morph_url_snapshot");
++        assertNotNull(url);
++        assertEquals(View.VISIBLE, url.getVisibility());
++        assertEquals(0f, origin.getAlpha(), 0.001f);
++
++        mDrawer.destroy();
++        assertTrue(url.getVisibility() != View.VISIBLE || url.getAlpha() < 0.01f);
++        assertNull(url.getDrawable());
++        assertEquals(View.VISIBLE, origin.getVisibility());
 +        assertEquals(1f, origin.getAlpha(), 0.001f);
 +    }
 +

@@ -187,6 +187,12 @@ open path and the 130 ms fade are as they were.
   travels as well, so the favicon is round before the hand-off too.
 - A failed copy now falls back on any `RuntimeException`, not only `IllegalStateException`, so a view that
   cannot be drawn into a software canvas can never fail a close.
+- The url bitmap now records that it has cleared the pill's text. Taking it down in a layout frame needs
+  nothing else, since `applyMorphText()` runs before it in every frame and gives the text its alphas back,
+  so a frame that finds the live bar gone or the copy failed shows the text again. A teardown with no
+  frame of its own is `clearMorphFloats()`, which the settle, the reset paths and `destroy()` all end in:
+  it now gives the label alpha 1 back when the bitmap had cleared it, as a settled pill has. The bitmap
+  code never changes the label's or the copy's visibility, so there is none to restore.
 
 Not done: the optional change to draw the icon copies at their final size before the hand-off. Before the
 hand-off a copy is the real drawable scaled to the whole padded box (the first ~1.4x jump at the start of
@@ -211,5 +217,13 @@ left for a separate patch.
   software draw of a one-line text view. If the real url changes during the 130 ms the copy follows a
   frame later, and at the first frame of the hand-off the pill's text (from the string the bar showed
   before the sheet opened) is replaced by the real view's current text.
+- Reopening in the middle of the fade does not leave the label hidden, although the first version of the
+  test for it reported that it did. `show()` drops the hand-off flags and lays out once at progress 0, which resets the morph's
+  anchor. The next frame is then the first morph frame of any open: the pill is the bar itself, the url
+  is in the from-view and the label is at alpha 0 by design. A test that jumps from 0 to the half detent
+  in one step ends on that frame, so the label is at 0 there with or without the url bitmap, which is
+  already down by then (a frame after `show()` is never a live hand-off frame). The test now checks that
+  the text is up on that frame, in the label or the from-view, and that the label is whole on the next
+  frame, the settled pill. A test for `destroy()` during the fade covers the teardown path.
 - Two unit tests need a canvas that keeps its translation, which Robolectric's native graphics mode does
   and its legacy mode does not. The scroll test skips itself where the canvas does not.
