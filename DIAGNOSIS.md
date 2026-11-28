@@ -138,3 +138,78 @@ spring are unchanged.
   the old drawable copies are used, and the mismatch can return. Raise
   `HANDOFF_RECAPTURE_TOLERANCE_DP` if that is the case.
 
+# Follow-up: the url text still doubled and the favicon copy was square (patch `0000458`)
+
+A test of `0000457` on an emulator with 40x slower animations showed the doubled icons were fixed, and two
+things were left in the pill during the close cross-fade. The url text still read as doubled toward the end
+of the fade ("wiki//Android_(("), although its first glyph and baseline lined up. The favicon copy was a
+square where the real favicon is a circle.
+
+## Root cause
+
+- Url text. `0000457` still drew the text from the pill's own `TextView`s and moved them so the first glyph
+  and the baseline met the real ones. Nothing else about the two layouts was shared. The pill's text view is
+  a `match_parent` box in a stack inside the pill, with its own end padding, no horizontal scroll, no fading
+  edge and an ellipsis on its own width, while the real `UrlBar` has its own width and end, its scroll
+  offset, its fading edge and its own ellipsis. Two layouts of one string that start at the same pixel end
+  at different ones, so the drift grows along the line and the two copies read as one word printed twice.
+  Matching more properties (spacing, scale, ellipsis) narrows it and cannot close it.
+- Favicon. The real favicon is not square because of its drawable. `StatusView` gives the view an oval
+  outline and `setClipToOutline(true)`, so whatever bitmap arrives is cut to a circle. A clip to an outline
+  is applied only when the compositor draws the view. `0000457` copies an icon by drawing the real view into
+  a software bitmap with `View.draw()`, which does not apply that clip, so the bitmap keeps its square
+  corners. In a Robolectric run with native graphics, an `ImageView` with an oval outline and a clip drawn
+  this way has an opaque pixel in its corner.
+
+## Fix (patch `0000458`)
+
+Only the hand-off copies change. The bar band, the `+` highlight, the page and top toolbar restore, the
+open path and the 130 ms fade are as they were.
+
+- The real url view is copied as one bitmap, `drawViewSnapshot()`, shown by a new floating view
+  (`morph_url_snapshot`) at the real view's own size and place, with the hand-off's alpha. The text,
+  its end, the ellipsis, the fading edge, the spacing and the colour spans are the real view's because the
+  real view draws them. The canvas is shifted by `-scrollX, -scrollY` first, the shift a parent applies
+  before it draws a child, so a url bar that is scrolled to its host is copied from where it is scrolled.
+  The icon copies use the same function, `drawIconSnapshot()` now calls it.
+- It runs only on a hand-off that read the live bar (`mHandoffLive`), so the existing recapture tolerance
+  applies as it did to the icons. While the bitmap is up the pill's own text views are drawn at alpha 0
+  and are otherwise untouched, so `0000457`'s alignment stays as the fallback for a bar that was not read,
+  a view too big to copy or one that cannot be drawn into a software bitmap. When the fade ends or the
+  sheet opens again, `clearMorphFloats()` hides the bitmap and frees it, and the pill text is back.
+- An icon copy now clips like its real view. Every ghost gets a `GhostClip` outline provider. Each frame
+  `matchGhostClip()` asks the real view for its outline and, if it clips to one the platform can clip to,
+  gives the copy `clipToOutline` and the real view's provider, asked on the copy so the shape follows the
+  copy's own size (a circle stays a circle). A copy that moves on to an icon without a clip loses it. The
+  outline carries alpha 0, because the copy sits at the morph's elevation and would otherwise cast a
+  shadow in that shape. A provider that gives an empty outline on the copy (a clip by background) gets the
+  copy's full rect, as an empty outline would clip the copy away. It applies to the copies while the pill
+  travels as well, so the favicon is round before the hand-off too.
+- A failed copy now falls back on any `RuntimeException`, not only `IllegalStateException`, so a view that
+  cannot be drawn into a software canvas can never fail a close.
+
+Not done: the optional change to draw the icon copies at their final size before the hand-off. Before the
+hand-off a copy is the real drawable scaled to the whole padded box (the first ~1.4x jump at the start of
+the hand-off). Fixing it means reading the real view's padding, scale type and tint into the copy, or
+taking the bitmap for every frame of the pull, from stale rest rects and at the changing scale of the
+pull. That touches the whole open and close path and an existing test pins the copy's scale type, so it is
+left for a separate patch.
+
+## Risks and things not confirmed
+
+- The drawer and its test class still cannot be built here. They compile with the diagnostics they had
+  before (the unresolved Chromium types, plus three more of the same `org.chromium.chrome.R` kind in the
+  new tests). The platform behaviour the fix rests on was run in a standalone Robolectric project, on copies
+  of the new helpers, not on the drawer: a snapshot with the scroll shift is pixel-identical to the real
+  parent-driven draw of a scrolled, spaced, bold, span-coloured, fading-edge text (0 differing pixels at
+  scroll 0, 37 and 120, about 2500 without the shift), and the clip provider gives a circle at the copy's
+  size, alpha 0, and none for an icon without a clip.
+- Not confirmed on a device: that the compositor clips the copy to the circle, and that the alpha-0 outline
+  casts no shadow at the morph's elevation (hwui skips the shadow for an outline of alpha 0). A faint ring
+  round the favicon copy would mean it does.
+- The url bitmap is redrawn from the real view every frame of the fade, up to 1200dp by 160dp. It is a
+  software draw of a one-line text view. If the real url changes during the 130 ms the copy follows a
+  frame later, and at the first frame of the hand-off the pill's text (from the string the bar showed
+  before the sheet opened) is replaced by the real view's current text.
+- Two unit tests need a canvas that keeps its translation, which Robolectric's native graphics mode does
+  and its legacy mode does not. The scroll test skips itself where the canvas does not.

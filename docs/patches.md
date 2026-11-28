@@ -1,6 +1,6 @@
 # The patch series
 
-The series in [`patches/`](../patches) is 403 files, `0000001.patch` to `0000457.patch`, numbered
+The series in [`patches/`](../patches) is 404 files, `0000001.patch` to `0000458.patch`, numbered
 in the order they apply. The files up to `0000428.patch` carry no descriptions. From `0000429.patch` on, each file
 has a mail header with a subject and a description.
 

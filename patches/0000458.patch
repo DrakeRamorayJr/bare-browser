@@ -1,0 +1,600 @@
+From 769cee62ac0d03386dc6960b8ff248151cfd5003 Mon Sep 17 00:00:00 2001
+From: DrakeRamorayJr <179530612+DrakeRamorayJr@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 00:09:02 +0000
+Subject: [PATCH] Bare: copy the real url view and the favicon clip into the
+ tab sheet close hand-off
+
+During the closing cross-fade the url text in the pill still doubled
+toward the end (the first glyph and baseline lined up, the rest drifted a
+couple of pixels), and the favicon copy was a square where the real
+favicon is a circle.
+
+The text copy was laid out again by the pill's own text views and moved
+to meet the first glyph and baseline of the real url text. Its width,
+end, ellipsis, fading edge and scroll are not the real view's, so two
+layouts of one string that start at the same pixel end at different
+ones. The favicon is a circle because its view clips to an oval outline,
+and a clip to an outline is applied only when the compositor draws the
+view. The icon copy is a bitmap drawn with View.draw into a software
+canvas, which does not apply it, so the copy kept its square corners.
+
+On a hand-off that read the live bar, the real url view is now copied as
+one bitmap and shown over the real one, at its size and place and with
+the hand-off alpha. The canvas is shifted by the view's scroll first, as
+its parent does, so a scrolled url bar is copied as it is shown. The
+pill's own text is drawn at alpha 0 while that bitmap is up and stays as
+the fallback if no copy could be made. The bitmap is hidden and freed
+when the fade ends or the sheet opens again. An icon copy now takes the
+clip of its real view (the real provider, asked on the copy so a circle
+stays a circle, with no outline alpha so the copy casts no shadow), and
+drops it when it is reused for an icon that has none. A copy that cannot
+be drawn into a bitmap falls back on any RuntimeException.
+
+The 130 ms fade, the bar band, the page and top toolbar restore, the
+open path, the spring and the copies' sizes before the hand-off are
+unchanged. The unit tests cover the url bitmap's size, place, end and
+fade, its scroll, its removal at the end of the fade and on a reopen,
+the fallback when the live bar is not read, and the circular clip of the
+favicon copy in the hand-off, while the pill travels, and when the copy
+is reused.
+---
+ .../browser/bare/BareVerticalTabsDrawer.java  | 148 ++++++++-
+ .../bare/BareVerticalTabsDrawerUnitTest.java  | 305 ++++++++++++++++++
+ 2 files changed, 446 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+index cc61cdd2bf..911dc6feed 100755
+--- a/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawer.java
+@@ -197,6 +197,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     private static final int HANDOFF_RECAPTURE_TOLERANCE_DP = 16;
+     /** An icon copy is drawn from a bitmap of its real view up to this size. */
+     private static final int ICON_SNAPSHOT_MAX_DP = 120;
++    /** The real url view is copied as a bitmap up to this size. A larger one keeps the text copy. */
++    private static final int URL_SNAPSHOT_MAX_WIDTH_DP = 1200;
++    private static final int URL_SNAPSHOT_MAX_HEIGHT_DP = 160;
+     // Posts while waiting for window focus before showing a keyboard or focusing the
+     // omnibox. The focus listener is the real signal; these cover a missed event.
+     private static final int FOCUS_IME_ATTEMPTS = 8;
+@@ -361,6 +364,9 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+     /** Hand-off icon copies draw a bitmap of their real view, padding and scale type included. */
+     private final java.util.HashMap<ImageView, GhostSnapshot> mGhostSnapshots =
+             new java.util.HashMap<>();
++    /** The real url view, as one bitmap, while a close hand-off fades. Null until first used. */
++    private @Nullable ImageView mMorphUrlSnapshot;
++    private final Outline mGhostClipProbe = new Outline();
+     /** Icons outside the location bar, hidden while their copies ride the morph. */
+     private final java.util.ArrayList<View> mFadedBarIcons = new java.util.ArrayList<>();
+     private final java.util.ArrayList<Float> mFadedBarIconAlpha = new java.util.ArrayList<>();
+@@ -5782,6 +5788,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         }
+         mMorphExtraCount = 0;
+         releaseGhostSnapshots();
++        hideMorphUrlSnapshot();
+         TextView fromView = mMorphFromText;
+         if (fromView != null) {
+             if (fromView.getAlpha() != 0f) fromView.setAlpha(0f);
+@@ -5791,21 +5798,44 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+ 
+     /** The bitmap one hand-off icon copy shows, and the real view it was drawn from. */
+     private static final class GhostSnapshot {
+-        final ImageView mSource;
++        final View mSource;
+         final Bitmap mBitmap;
+         final Drawable mDrawable;
+ 
+-        GhostSnapshot(ImageView source, Bitmap bitmap, Drawable drawable) {
++        GhostSnapshot(View source, Bitmap bitmap, Drawable drawable) {
+             mSource = source;
+             mBitmap = bitmap;
+             mDrawable = drawable;
+         }
+     }
+ 
++    /**
++     * The outline a hand-off copy clips to. A view that clips to its outline is cut to it only
++     * by the compositor, so a bitmap drawn from that view keeps the corners the clip removes
++     * and the copy has to clip again. The real view's own provider is asked, on the copy, so
++     * the shape is whatever the real one is. The outline carries no alpha: a copy that is up
++     * on the morph's elevation would otherwise cast a shadow in that shape.
++     */
++    private static final class GhostClip extends ViewOutlineProvider {
++        @Nullable ViewOutlineProvider mReal;
++
++        @Override
++        public void getOutline(View view, Outline outline) {
++            if (mReal != null) {
++                mReal.getOutline(view, outline);
++                // An empty outline clips everything away. The provider of a view that is
++                // clipped by its background has nothing to give a copy that has none.
++                if (outline.isEmpty()) outline.setRect(0, 0, view.getWidth(), view.getHeight());
++            }
++            outline.setAlpha(0f);
++        }
++    }
++
+     private ImageView morphGhost(int index) {
+         if (index < mMorphExtraIcons.size()) return mMorphExtraIcons.get(index);
+         ImageView ghost = new ImageView(mActivity);
+         ghost.setTag("morph_extra_icon");
++        ghost.setOutlineProvider(new GhostClip());
+         ghost.setScaleType(ImageView.ScaleType.FIT_CENTER);
+         ghost.setClickable(false);
+         ghost.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+@@ -5978,6 +6008,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+                     ghost.setImageDrawable(copy);
+                 }
+             }
++            matchGhostClip(ghost, source);
+             placeMorphFloat(ghost, root, w, h, x, y, ghostAlpha);
+             if (ghost.getParent() != root) continue;
+             fadeSourceIcon(source);
+@@ -6016,10 +6047,19 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+      * keeps the icon's drawable instead.
+      */
+     private boolean drawIconSnapshot(ImageView ghost, ImageView source) {
++        int limit = dp(ICON_SNAPSHOT_MAX_DP);
++        return drawViewSnapshot(ghost, source, limit, limit);
++    }
++
++    /**
++     * Draws any view into the bitmap {@code ghost} shows, at the view's own size and with the
++     * view's own scroll. Text, ellipsis, fading edges and spacing come out as the view lays
++     * them, because the view is what draws them.
++     */
++    private boolean drawViewSnapshot(ImageView ghost, View source, int maxWidth, int maxHeight) {
+         int w = source.getWidth();
+         int h = source.getHeight();
+-        int limit = dp(ICON_SNAPSHOT_MAX_DP);
+-        if (w <= 0 || h <= 0 || w > limit || h > limit) return false;
++        if (w <= 0 || h <= 0 || w > maxWidth || h > maxHeight) return false;
+         GhostSnapshot held = mGhostSnapshots.get(ghost);
+         if (held != null
+                 && held.mSource == source
+@@ -6037,9 +6077,14 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             mGhostSnapshots.put(ghost, held);
+         }
+         try {
+-            source.draw(new Canvas(held.mBitmap));
+-        } catch (IllegalStateException e) {
+-            // A hardware bitmap in the icon cannot be drawn into a software canvas.
++            Canvas canvas = new Canvas(held.mBitmap);
++            // A view draws as if its parent had shifted the canvas by its scroll. A url bar
++            // that is scrolled to its host would otherwise be copied from its start.
++            canvas.translate(-source.getScrollX(), -source.getScrollY());
++            source.draw(canvas);
++        } catch (RuntimeException e) {
++            // A hardware bitmap or a render node in the view cannot be drawn into a software
++            // canvas. The copy keeps what it showed before; a close must never fail on this.
+             mGhostSnapshots.remove(ghost);
+             return false;
+         }
+@@ -6063,6 +6108,88 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+         mGhostSnapshots.clear();
+     }
+ 
++    /**
++     * Clips the copy the way the real view is clipped. Only a view whose clip the platform
++     * would apply is mirrored: one that clips to an outline it can clip to. Every frame sets
++     * it, so a copy that moves on to another icon does not keep the last one's shape.
++     */
++    private void matchGhostClip(ImageView ghost, View source) {
++        if (!(ghost.getOutlineProvider() instanceof GhostClip clip)) return;
++        ViewOutlineProvider real = source.getClipToOutline() ? source.getOutlineProvider() : null;
++        if (real != null) {
++            Outline probe = mGhostClipProbe;
++            probe.setEmpty();
++            real.getOutline(source, probe);
++            if (probe.isEmpty() || !probe.canClip()) real = null;
++        }
++        if (clip.mReal != real) {
++            clip.mReal = real;
++            ghost.invalidateOutline();
++        }
++        boolean clips = real != null;
++        if (ghost.getClipToOutline() != clips) ghost.setClipToOutline(clips);
++    }
++
++    private ImageView urlSnapshotView() {
++        ImageView ghost = mMorphUrlSnapshot;
++        if (ghost != null) return ghost;
++        ghost = new ImageView(mActivity);
++        ghost.setTag("morph_url_snapshot");
++        ghost.setScaleType(ImageView.ScaleType.FIT_XY);
++        ghost.setClickable(false);
++        ghost.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        mMorphUrlSnapshot = ghost;
++        return ghost;
++    }
++
++    /**
++     * Draws the real url view as one bitmap over the real one, in place of the pill's own text.
++     * That text is laid out again from the string, and a different width, end, ellipsis, fade
++     * or scroll puts glyphs a pixel or two off the real ones, and the two read as a doubled
++     * word while they cross-fade. A bitmap of the real view is the real layout. Only a
++     * hand-off that read the live bar does this, so it is bound by the same tolerance. The
++     * pill's text stays as the fallback when no copy could be made.
++     */
++    private void syncMorphUrlSnapshot(boolean live, float pillLeft, float pillTop) {
++        FrameLayout root = mRoot;
++        TextView real = live ? liveBarText() : null;
++        if (root == null || real == null) {
++            hideMorphUrlSnapshot();
++            return;
++        }
++        ImageView ghost = urlSnapshotView();
++        if (!drawViewSnapshot(
++                ghost,
++                real,
++                dp(URL_SNAPSHOT_MAX_WIDTH_DP),
++                dp(URL_SNAPSHOT_MAX_HEIGHT_DP))) {
++            hideMorphUrlSnapshot();
++            return;
++        }
++        int[] at = new int[2];
++        real.getLocationOnScreen(at);
++        float x = pillLeft + (at[0] - mBarOnScreen[0]);
++        float y = pillTop + (at[1] - mBarOnScreen[1]);
++        placeMorphFloat(ghost, root, real.getWidth(), real.getHeight(), x, y, morphHandoffAlpha());
++        if (ghost.getParent() != root) {
++            hideMorphUrlSnapshot();
++            return;
++        }
++        TextView origin = mPillOrigin;
++        if (origin != null && origin.getAlpha() != 0f) origin.setAlpha(0f);
++        TextView from = mMorphFromText;
++        if (from != null && from.getAlpha() != 0f) from.setAlpha(0f);
++    }
++
++    private void hideMorphUrlSnapshot() {
++        ImageView ghost = mMorphUrlSnapshot;
++        if (ghost == null || ghost.getVisibility() == View.GONE) return;
++        if (ghost.getAlpha() != 0f) ghost.setAlpha(0f);
++        ghost.setVisibility(View.GONE);
++        GhostSnapshot held = mGhostSnapshots.remove(ghost);
++        if (held != null && ghost.getDrawable() == held.mDrawable) ghost.setImageDrawable(null);
++    }
++
+     private void placeMorphFloat(
+             View view, FrameLayout root, int width, int height, float left, float top, float alpha) {
+         if (view.getParent() != root) {
+@@ -6254,6 +6381,7 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             placePillOnRoot(pill, root, width, height, left, top);
+             if (live) alignMorphText(liveBarText());
+             syncMorphIcons(anchor, eased, left, top, width, height);
++            syncMorphUrlSnapshot(live, left, top);
+         }
+         fadeToolbarChrome(shrink);
+         // Reveal lets the real bar be captured under the morph. Every other morph
+@@ -6280,6 +6408,12 @@ public final class BareVerticalTabsDrawer implements BareTabSheetToolbarSwipe.Sh
+             ImageView ghost = mMorphExtraIcons.get(i);
+             if (ghost.getParent() == root) ghost.bringToFront();
+         }
++        ImageView urlSnapshot = mMorphUrlSnapshot;
++        if (urlSnapshot != null
++                && urlSnapshot.getParent() == root
++                && urlSnapshot.getVisibility() == View.VISIBLE) {
++            urlSnapshot.bringToFront();
++        }
+         float pillAlpha = morphHandoffAlpha();
+         if (pill.getAlpha() != pillAlpha) pill.setAlpha(pillAlpha);
+         if (pill.getVisibility() != View.VISIBLE) pill.setVisibility(View.VISIBLE);
+diff --git a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+index 54dfc01b97..2d1bbeb225 100755
+--- a/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
++++ b/chrome/android/junit/src/org/chromium/chrome/browser/bare/BareVerticalTabsDrawerUnitTest.java
+@@ -1959,6 +1959,311 @@ public class BareVerticalTabsDrawerUnitTest {
+         }
+     }
+ 
++    /** Records the clip the url view is drawn under, which is where its scroll shows. */
++    private static final class RecordingText extends TextView {
++        android.graphics.Rect mClipSeen;
++
++        RecordingText(android.content.Context context) {
++            super(context);
++        }
++
++        @Override
++        public void draw(android.graphics.Canvas canvas) {
++            mClipSeen = canvas.getClipBounds();
++            super.draw(canvas);
++        }
++    }
++
++    /** Parks a close on a bar whose url is longer than the bar, inset and spaced. */
++    private void parkOnALongUrlBar(TextView bar, android.widget.ImageView shield) {
++        bar.setText("https://en.wikipedia.org/wiki/Android_(operating_system)#History_and_development");
++        bar.setSingleLine(true);
++        bar.setEllipsize(TextUtils.TruncateAt.END);
++        bar.setPadding(px(18), px(9), px(30), px(1));
++        bar.setLetterSpacing(0.03f);
++        parkTheCloseMorph(bar, shield);
++    }
++
++    private static void clipToACircle(View view) {
++        view.setOutlineProvider(
++                new ViewOutlineProvider() {
++                    @Override
++                    public void getOutline(View v, Outline outline) {
++                        outline.setOval(0, 0, v.getWidth(), v.getHeight());
++                    }
++                });
++        view.setClipToOutline(true);
++    }
++
++    /** The copy clips to a circle as big as itself, and casts no shadow in that shape. */
++    private static void assertClipsToACircle(android.widget.ImageView ghost) {
++        assertTrue(ghost.getClipToOutline());
++        int size = ghost.getLayoutParams().width;
++        assertTrue(size > 0);
++        assertEquals(size, ghost.getLayoutParams().height);
++        ghost.layout(0, 0, size, size);
++        Outline outline = new Outline();
++        ghost.getOutlineProvider().getOutline(ghost, outline);
++        assertFalse(outline.isEmpty());
++        assertTrue(outline.canClip());
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            android.graphics.Rect rect = new android.graphics.Rect();
++            assertTrue(outline.getRect(rect));
++            assertEquals(size, rect.width());
++            assertEquals(size, rect.height());
++            assertEquals(size / 2f, outline.getRadius(), 0.5f);
++            assertEquals(0f, outline.getAlpha(), 0.001f);
++        }
++    }
++
++    @Test
++    public void testCloseHandoffUrlTextIsABitmapOfTheRealUrlBarWithTheSameEnds() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkOnALongUrlBar(bar, shield);
++        View pill = originPill();
++        TextView copy = (TextView) findTag("morph_from_text");
++        TextView origin = (TextView) findTag("sheet_pill_origin");
++        assertNotNull(copy);
++        assertNotNull(origin);
++
++        for (float fade : new float[] {0f, 0.3f, 0.7f}) {
++            if (fade == 0f) {
++                mDrawer.revealCloseHandoffForTesting();
++            } else {
++                mDrawer.setCloseHandoffFadeForTesting(fade);
++            }
++            android.widget.ImageView url =
++                    (android.widget.ImageView) findTag("morph_url_snapshot");
++            assertNotNull("url bitmap at " + fade, url);
++            assertEquals(View.VISIBLE, url.getVisibility());
++            assertEquals(android.widget.ImageView.ScaleType.FIT_XY, url.getScaleType());
++            assertTrue(url.getDrawable() instanceof android.graphics.drawable.BitmapDrawable);
++            Bitmap shown = ((android.graphics.drawable.BitmapDrawable) url.getDrawable()).getBitmap();
++            assertEquals(bar.getWidth(), shown.getWidth());
++            assertEquals(bar.getHeight(), shown.getHeight());
++
++            assertEquals("width at " + fade, bar.getWidth(), url.getLayoutParams().width);
++            assertEquals("height at " + fade, bar.getHeight(), url.getLayoutParams().height);
++            assertSameScreenPosition(bar, url);
++            int[] barAt = new int[2];
++            int[] urlAt = new int[2];
++            bar.getLocationOnScreen(barAt);
++            url.getLocationOnScreen(urlAt);
++            assertEquals(
++                    "end x at " + fade,
++                    barAt[0] + bar.getWidth(),
++                    urlAt[0] + url.getLayoutParams().width,
++                    1f);
++            assertEquals(
++                    "end y at " + fade,
++                    barAt[1] + bar.getHeight(),
++                    urlAt[1] + url.getLayoutParams().height,
++                    1f);
++
++            assertEquals("fades with the pill at " + fade, pill.getAlpha(), url.getAlpha(), 0.01f);
++            assertEquals("pill text is not drawn under it at " + fade, 0f, copy.getAlpha(), 0.001f);
++            assertEquals(0f, origin.getAlpha(), 0.001f);
++        }
++    }
++
++    @Test
++    public void testCloseHandoffUrlBitmapIsDrawnFromTheScrollOfTheRealUrlBar() {
++        android.graphics.Canvas probe =
++                new android.graphics.Canvas(Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888));
++        probe.translate(-3f, 0f);
++        // A canvas that does not keep its translation cannot show where a view was drawn from.
++        org.junit.Assume.assumeTrue(probe.getClipBounds().left == 3);
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        RecordingText bar = new RecordingText(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkOnALongUrlBar(bar, shield);
++
++        bar.scrollTo(px(37), 0);
++        bar.mClipSeen = null;
++        mDrawer.revealCloseHandoffForTesting();
++        assertNotNull(bar.mClipSeen);
++        assertEquals(px(37), bar.getScrollX());
++        assertEquals(bar.getScrollX(), bar.mClipSeen.left);
++        assertEquals(bar.getScrollY(), bar.mClipSeen.top);
++        assertEquals(bar.getWidth(), bar.mClipSeen.width());
++        assertEquals(bar.getHeight(), bar.mClipSeen.height());
++    }
++
++    @Test
++    public void testCloseHandoffUrlBitmapIsGoneAndThePillTextIsBackWhenTheFadeEnds() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkOnALongUrlBar(bar, shield);
++        TextView origin = (TextView) findTag("sheet_pill_origin");
++        mDrawer.revealCloseHandoffForTesting();
++        android.widget.ImageView url = (android.widget.ImageView) findTag("morph_url_snapshot");
++        assertNotNull(url);
++        assertEquals(View.VISIBLE, url.getVisibility());
++        assertEquals(0f, origin.getAlpha(), 0.001f);
++
++        mDrawer.flushCloseHandoffForTesting();
++        assertTrue(url.getVisibility() != View.VISIBLE || url.getAlpha() < 0.01f);
++        assertNull(url.getDrawable());
++        assertEquals(1f, origin.getAlpha(), 0.001f);
++    }
++
++    @Test
++    public void testOpeningDuringTheCloseFadeTakesTheUrlBitmapDown() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkOnALongUrlBar(bar, shield);
++        TextView origin = (TextView) findTag("sheet_pill_origin");
++        mDrawer.revealCloseHandoffForTesting();
++        mDrawer.setCloseHandoffFadeForTesting(0.5f);
++        android.widget.ImageView url = (android.widget.ImageView) findTag("morph_url_snapshot");
++        assertNotNull(url);
++        assertEquals(View.VISIBLE, url.getVisibility());
++
++        mDrawer.open();
++        mDrawer.finishAnimationForTesting();
++        assertTrue(mDrawer.isOpen());
++        assertTrue(url.getVisibility() != View.VISIBLE || url.getAlpha() < 0.01f);
++        assertNull(url.getDrawable());
++        assertEquals(1f, origin.getAlpha(), 0.001f);
++    }
++
++    @Test
++    public void testCloseHandoffKeepsThePillTextWhenTheLiveBarIsNotRead() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        bar.setText("https://example.com/");
++        parkTheCloseMorph(bar, shield);
++        TextView copy = (TextView) findTag("morph_from_text");
++        assertNotNull(copy);
++
++        // A bar that is mid-slide is not read as the live bar, so neither is its url text. The
++        // pill's own text stays up, as it did before the url was copied.
++        bar.setTranslationY(px(10));
++        mDrawer.revealCloseHandoffForTesting();
++        android.widget.ImageView url = (android.widget.ImageView) findTag("morph_url_snapshot");
++        assertTrue(url == null || url.getVisibility() != View.VISIBLE);
++        assertEquals(View.VISIBLE, copy.getVisibility());
++        assertEquals(1f, copy.getAlpha(), 0.001f);
++    }
++
++    @Test
++    public void testCloseHandoffFaviconCopyIsCircularLikeTheRealFavicon() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView favicon = new android.widget.ImageView(mActivity);
++        favicon.setId(org.chromium.chrome.R.id.location_bar_site_favicon);
++        clipToACircle(favicon);
++        parkTheCloseMorph(bar, favicon);
++        android.widget.ImageView ghost = (android.widget.ImageView) findTag("morph_extra_icon");
++        assertNotNull(ghost);
++
++        mDrawer.revealCloseHandoffForTesting();
++        assertEquals(View.VISIBLE, ghost.getVisibility());
++        assertClipsToACircle(ghost);
++
++        mDrawer.setCloseHandoffFadeForTesting(0.5f);
++        assertClipsToACircle(ghost);
++    }
++
++    @Test
++    public void testCloseHandoffIconCopyOfAnUnclippedIconIsNotClipped() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView shield = new android.widget.ImageView(mActivity);
++        parkTheCloseMorph(bar, shield);
++        android.widget.ImageView ghost = (android.widget.ImageView) findTag("morph_extra_icon");
++        assertNotNull(ghost);
++
++        mDrawer.revealCloseHandoffForTesting();
++        assertEquals(View.VISIBLE, ghost.getVisibility());
++        assertFalse(ghost.getClipToOutline());
++        mDrawer.setCloseHandoffFadeForTesting(0.5f);
++        assertFalse(ghost.getClipToOutline());
++    }
++
++    @Test
++    public void testIconCopyClipFollowsTheClipOfItsRealIconFromFrameToFrame() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        TextView bar = new TextView(mActivity);
++        android.widget.ImageView icon = new android.widget.ImageView(mActivity);
++        clipToACircle(icon);
++        parkTheCloseMorph(bar, icon);
++        android.widget.ImageView ghost = (android.widget.ImageView) findTag("morph_extra_icon");
++        assertNotNull(ghost);
++
++        mDrawer.revealCloseHandoffForTesting();
++        assertClipsToACircle(ghost);
++
++        // The copy is reused for whatever icon comes next. It takes that icon's clip, or none.
++        icon.setClipToOutline(false);
++        mDrawer.setCloseHandoffFadeForTesting(0.3f);
++        assertFalse(ghost.getClipToOutline());
++        icon.setClipToOutline(true);
++        mDrawer.setCloseHandoffFadeForTesting(0.6f);
++        assertClipsToACircle(ghost);
++    }
++
++    @Test
++    public void testFaviconCopyIsCircularWhileThePillTravelsToo() {
++        setAddressBarOnTop(false);
++        BareTabsStyle.setStyle(BareTabsStyle.SHEET);
++        FrameLayout bar = new FrameLayout(mActivity);
++        bar.setId(org.chromium.chrome.R.id.location_bar);
++        android.graphics.drawable.GradientDrawable barBackground =
++                new android.graphics.drawable.GradientDrawable();
++        barBackground.setColor(0xFF123456);
++        barBackground.setCornerRadius(px(12));
++        bar.setBackground(barBackground);
++        FrameLayout.LayoutParams barParams =
++                new FrameLayout.LayoutParams(px(280), px(48), Gravity.BOTTOM);
++        barParams.leftMargin = px(40);
++        barParams.bottomMargin = px(64);
++        content().addView(bar, barParams);
++
++        android.widget.ImageView favicon = new android.widget.ImageView(mActivity);
++        favicon.setId(org.chromium.chrome.R.id.location_bar_site_favicon);
++        favicon.setImageDrawable(new android.graphics.drawable.ColorDrawable(0xFFFF0000));
++        clipToACircle(favicon);
++        FrameLayout.LayoutParams faviconParams =
++                new FrameLayout.LayoutParams(px(20), px(20), Gravity.BOTTOM);
++        faviconParams.leftMargin = px(60);
++        faviconParams.bottomMargin = px(78);
++        content().addView(favicon, faviconParams);
++
++        mDrawer.beginToolbarPull();
++        View root = (View) findTag("sheet_actions").getParent().getParent();
++        content().measure(
++                View.MeasureSpec.makeMeasureSpec(px(400), View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(px(800), View.MeasureSpec.EXACTLY));
++        content().layout(0, 0, px(400), px(800));
++        layoutOverlay(root, px(400), px(800));
++        favicon.layout(
++                bar.getLeft() + px(12),
++                bar.getTop() + px(14),
++                bar.getLeft() + px(32),
++                bar.getTop() + px(34));
++        int range = root.getHeight() - sheetGap();
++        mDrawer.updateToolbarPull(range * 0.004f);
++
++        android.widget.ImageView ghost = (android.widget.ImageView) findTag("morph_extra_icon");
++        assertNotNull(ghost);
++        assertEquals(View.VISIBLE, ghost.getVisibility());
++        assertClipsToACircle(ghost);
++    }
++
+     @Test
+     public void testClosePaintsTheRestingNavColourWhileTheSheetIsStillMoving() {
+         View bar = new View(mActivity);
+-- 
+2.34.1
+
